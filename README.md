@@ -20,9 +20,11 @@ When a deletion is observed:
 
 The live monitor uses `FileSystemWatcher` to capture the affected item's fully qualified path. Windows exposes that path through `FileSystemEventArgs.FullPath`, including the deleted filename and its parent directory.
 
-A second NTFS USN-journal layer is also enabled for catch-up. Each USN delete record contains the deleted filename and the parent directory's NTFS file identifier. The app opens that parent directory by file ID and resolves its final filesystem path. This allows the app to reconstruct the deleted directory even though the deleted file itself no longer exists.
+Windows Recycle Bin operations are handled separately because a normal Delete-to-Recycle-Bin operation can be represented as a move/rename rather than a permanent filesystem delete. A small Recycle Bin monitor polls the Shell contents and records newly appeared items using the original location, filename, deleted date, and size.
 
-USN journal operations require administrator privileges on Windows. If the app is not elevated, the live `FileSystemWatcher` monitoring remains available, while USN catch-up reports a permission warning in the app status area.
+A second NTFS USN-journal layer is enabled for catch-up. Each USN delete record contains the deleted filename and the parent directory's NTFS file identifier. The app opens that parent directory by file ID and resolves its final filesystem path. This allows the app to reconstruct the deleted directory even though the deleted file itself no longer exists.
+
+USN journal operations require administrator privileges on Windows. If the app is not elevated, the live `FileSystemWatcher` and Recycle Bin monitoring remain available, while USN catch-up reports a permission warning in the app status area.
 
 ## Recovery Center
 
