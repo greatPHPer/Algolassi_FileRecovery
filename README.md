@@ -41,7 +41,7 @@ Items still present in the Windows Recycle Bin are shown as a strong recovery si
 
 ### NTFS deleted-file candidate scan
 
-The Recovery Center now includes **Scan NTFS Deleted Files**. On an NTFS source volume, the scanner uses `FSCTL_ENUM_USN_DATA` to enumerate MFT/USN metadata and identifies records carrying `USN_REASON_FILE_DELETE`. Microsoft documents `FSCTL_ENUM_USN_DATA` as an MFT-record enumeration mechanism for NTFS volumes. citeturn282315search1turn282315search0
+The Recovery Center now includes **Scan NTFS Deleted Files**. On an NTFS source volume, the scanner uses `FSCTL_ENUM_USN_DATA` to enumerate MFT/USN metadata and identifies records carrying `USN_REASON_FILE_DELETE`. Microsoft documents `FSCTL_ENUM_USN_DATA` as an MFT-record enumeration mechanism for NTFS volumes.
 
 The scanner resolves the deleted record's parent directory by its NTFS file reference when possible. Results are candidates only: no deleted file bytes are reconstructed by this branch, and the source volume is not written to.
 
