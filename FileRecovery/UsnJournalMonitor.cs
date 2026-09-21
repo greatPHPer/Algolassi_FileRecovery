@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
