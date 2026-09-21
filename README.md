@@ -4,7 +4,7 @@ Windows file-recovery utility written in C# / .NET 9 WinForms.
 
 ## Current branch
 
-`0.3-recovery-engine-foundation`
+`0.4-ntfs-volume-inspection`
 
 ## Background monitor
 
@@ -39,6 +39,12 @@ The main window can be opened from the tray icon and shows:
 
 Items still present in the Windows Recycle Bin are shown as a strong recovery signal because Windows can restore them directly. A deletion that is no longer represented in the Recycle Bin is currently shown as a weak signal; this is only an estimate and is not a guarantee about raw-disk recoverability.
 
+### NTFS volume inspection
+
+The recovery foundation now includes a safe NTFS volume inspector using `FSCTL_GET_NTFS_VOLUME_DATA`. Windows exposes the volume's sector size, cluster size, file-record segment size, total/free clusters, MFT valid length, and MFT start/mirror locations through `NTFS_VOLUME_DATA_BUFFER`.
+
+This stage only reads filesystem metadata. It does not read deleted-file clusters and does not write anything to the source volume.
+
 ### NTFS deleted-file candidate scan
 
 The Recovery Center now includes **Scan NTFS Deleted Files**. On an NTFS source volume, the scanner uses `FSCTL_ENUM_USN_DATA` to enumerate MFT/USN metadata and identifies records carrying `USN_REASON_FILE_DELETE`. Microsoft documents `FSCTL_ENUM_USN_DATA` as an MFT-record enumeration mechanism for NTFS volumes.
@@ -70,9 +76,10 @@ FileRecovery\bin\Release\net9.0-windows\win-x64\publish\
 3. NTFS USN-journal catch-up
 4. Safe NTFS metadata inspection
 5. NTFS deleted-file discovery
-6. NTFS candidate-to-cluster mapping
-7. Deep file-signature scanning
-8. Preview and recover-to-another-drive workflow
-9. Code signing and public release packaging
+6. NTFS volume/record inspection
+7. NTFS candidate-to-cluster mapping
+8. Deep file-signature scanning
+9. Preview and recover-to-another-drive workflow
+10. Code signing and public release packaging
 
 Recovery software cannot guarantee recovery of every deleted file. SSD TRIM and overwritten data can make deleted data unrecoverable.
