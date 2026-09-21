@@ -19,6 +19,7 @@ partial class Form1
     private DataGridViewTextBoxColumn colDeleted = null!;
     private DataGridViewTextBoxColumn colSize = null!;
     private DataGridViewTextBoxColumn colStrength = null!;
+    private DataGridViewTextBoxColumn colEvidence = null!;
     private Button btnRecover = null!;
     private Label lblStatus = null!;
 
@@ -49,6 +50,7 @@ partial class Form1
         colDeleted = new DataGridViewTextBoxColumn();
         colSize = new DataGridViewTextBoxColumn();
         colStrength = new DataGridViewTextBoxColumn();
+        colEvidence = new DataGridViewTextBoxColumn();
         btnRecover = new Button();
         lblStatus = new Label();
 
@@ -121,7 +123,7 @@ partial class Form1
         dgvResults.AutoGenerateColumns = false;
         dgvResults.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         dgvResults.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
-        dgvResults.Columns.AddRange(new DataGridViewColumn[] { colName, colDeleted, colSize, colStrength });
+        dgvResults.Columns.AddRange(new DataGridViewColumn[] { colName, colDeleted, colSize, colStrength, colEvidence });
         dgvResults.Location = new Point(344, 199);
         dgvResults.MultiSelect = true;
         dgvResults.Name = "dgvResults";
@@ -149,7 +151,12 @@ partial class Form1
         colStrength.DataPropertyName = "RecoveryStrength";
         colStrength.HeaderText = "Recovery strength";
         colStrength.MinimumWidth = 130;
-        colStrength.FillWeight = 20F;
+        colStrength.FillWeight = 16F;
+
+        colEvidence.DataPropertyName = "Evidence";
+        colEvidence.HeaderText = "Evidence";
+        colEvidence.MinimumWidth = 220;
+        colEvidence.FillWeight = 30F;
 
         btnRecover.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         btnRecover.Enabled = false;
