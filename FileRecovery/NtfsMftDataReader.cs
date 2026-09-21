@@ -60,9 +60,16 @@ public sealed class NtfsMftDataReader
         ApplyUpdateSequenceFixups(record, checked((int)volumeInfo.BytesPerSector));
 
         var recordSequence = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(16, 2));
+        var recordFlags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
+
         if (sequenceNumber != 0 && recordSequence != sequenceNumber)
         {
             return NotFound("The MFT segment sequence number no longer matches the deleted file reference.");
+        }
+
+        if ((recordFlags & 0x0001) != 0)
+        {
+            return NotFound("The MFT segment is currently marked in use, so the historical deletion reference may have been reused.");
         }
 
         var firstAttributeOffset = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(20, 2));
@@ -92,9 +99,15 @@ public sealed class NtfsMftDataReader
             var nameLength = record[offset + 9];
             var nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(offset + 10, 2));
 
-            var isUnnamed = nameLength == 0 ||
-                            nameOffset == 0 ||
-                            offset + nameOffset + (nameLength * 2) > record.Length;
+            var isUnnamed = nameLength == 0;
+
+            if (nameLength > 0 &&
+                (nameOffset == 0 ||
+                 offset + nameOffset + (nameLength * 2) > record.Length))
+            {
+                offset += checked((int)recordLength);
+                continue;
+            }
 
             if (type == NtfsAttributeData && isUnnamed)
             {
