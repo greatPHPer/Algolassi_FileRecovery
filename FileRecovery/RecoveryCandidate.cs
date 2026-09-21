@@ -15,6 +15,9 @@ public sealed class RecoveryCandidate
     public long FileSizeBytes { get; init; }
     public long ValidDataLengthBytes { get; init; }
     public IReadOnlyList<NtfsDataExtent> DataExtents { get; init; } = [];
+    public IReadOnlyList<NtfsExtentAllocation> ExtentAllocations { get; init; } = [];
+    public long FreeDataClusterCount { get; init; }
+    public long AllocatedDataClusterCount { get; init; }
     public string DataEvidence { get; init; } = string.Empty;
 
     public string FullPath =>
