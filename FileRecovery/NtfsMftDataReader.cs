@@ -36,8 +36,11 @@ public sealed class NtfsMftDataReader
             volumeInfo.MftStartLcn * (long)volumeInfo.BytesPerCluster +
             (long)segmentNumber * volumeInfo.BytesPerFileRecordSegment);
 
-        if (recordOffset < 0 ||
-            recordOffset + volumeInfo.BytesPerFileRecordSegment > volumeInfo.MftValidDataLength)
+        var relativeMftOffset = checked(
+            (long)segmentNumber * volumeInfo.BytesPerFileRecordSegment);
+
+        if (relativeMftOffset < 0 ||
+            relativeMftOffset + volumeInfo.BytesPerFileRecordSegment > volumeInfo.MftValidDataLength)
         {
             return NotFound("The deleted file's MFT segment is outside the current valid MFT range.");
         }
