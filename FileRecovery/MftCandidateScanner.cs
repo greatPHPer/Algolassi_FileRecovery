@@ -115,15 +115,23 @@ public sealed class MftCandidateScanner
                         {
                         }
 
+                        var directoryPath = NtfsParentPathResolver.Resolve(
+                            volumeHandle,
+                            parentReference) ?? string.Empty;
+
                         results.Add(new RecoveryCandidate
                         {
                             FileReferenceNumber = fileReference,
                             ParentFileReferenceNumber = parentReference,
                             Name = name,
-                            DirectoryPath = string.Empty,
+                            DirectoryPath = directoryPath,
                             LastUsnTimestampUtc = timestampUtc,
-                            Strength = RecoveryStrength.Weak,
-                            Evidence = "NTFS MFT/USN metadata shows a file-delete record; file contents have not yet been verified."
+                            Strength = string.IsNullOrWhiteSpace(directoryPath)
+                                ? RecoveryStrength.Weak
+                                : RecoveryStrength.Medium,
+                            Evidence = string.IsNullOrWhiteSpace(directoryPath)
+                                ? "NTFS MFT/USN metadata shows a file-delete record, but its parent directory could not be resolved."
+                                : "NTFS MFT/USN metadata shows a file-delete record and the parent directory was resolved; file contents have not yet been verified."
                         });
 
                         foundRecords++;
