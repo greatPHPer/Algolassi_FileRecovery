@@ -1,3 +1,5 @@
+#nullable enable
+
 namespace FileRecovery;
 
 partial class Form1
