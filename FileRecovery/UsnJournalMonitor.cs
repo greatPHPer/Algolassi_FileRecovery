@@ -456,8 +456,10 @@ public sealed class UsnJournalMonitor : IDisposable
         return path;
     }
 
-    private static IEnumerable<DriveInfo> GetNtfsFixedDrives()
+    private static IReadOnlyList<DriveInfo> GetNtfsFixedDrives()
     {
+        var drives = new List<DriveInfo>();
+
         foreach (var drive in DriveInfo.GetDrives())
         {
             try
@@ -466,7 +468,7 @@ public sealed class UsnJournalMonitor : IDisposable
                     drive.DriveType == DriveType.Fixed &&
                     string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase))
                 {
-                    yield return drive;
+                    drives.Add(drive);
                 }
             }
             catch
@@ -474,6 +476,8 @@ public sealed class UsnJournalMonitor : IDisposable
                 // Drive availability can change during enumeration.
             }
         }
+
+        return drives;
     }
 
     private static byte[] StructureToBytes<T>(T value) where T : struct
