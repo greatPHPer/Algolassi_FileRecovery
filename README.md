@@ -4,7 +4,7 @@ Windows file-recovery utility written in C# / .NET 9 WinForms.
 
 ## Current branch
 
-`0.5-ntfs-data-run-analysis`
+`0.6-ntfs-cluster-safety`
 
 ## Background monitor
 
@@ -52,6 +52,12 @@ The Recovery Center now includes **Scan NTFS Deleted Files**. On an NTFS source 
 The scanner resolves the deleted record's parent directory by its NTFS file reference when possible. The current recovery foundation now also reads the retained MFT record for the candidate and inspects the unnamed `$DATA` attribute. A resident stream is kept inside the MFT record; a nonresident stream contains VCN-to-LCN mapping-pairs that describe former cluster locations.
 
 Results are still candidates only: this stage does not claim the former clusters are intact, and it does not reconstruct or write recovered files.
+
+### Current cluster safety check
+
+For nonresident candidates, the app now queries the NTFS volume bitmap for the LCN ranges referenced by the retained `$DATA` runlist. The bitmap distinguishes allocated clusters (bit = 1) from free clusters (bit = 0). This is a snapshot of current allocation state, not proof that old deleted bytes remain intact. `FSCTL_GET_VOLUME_BITMAP` is the documented Windows control code for retrieving occupied/free cluster state.
+
+The app therefore stays conservative: all currently free former clusters can support a `Medium` evidence level; any currently allocated former clusters downgrade the candidate to `Weak`. Recycle Bin items remain `Strong` only because Windows still exposes a direct restore operation.
 
 Recovery output is intentionally designed around a different destination volume. The destination policy rejects a recovery target on the same drive as the source, which reduces the risk of overwriting clusters that might still contain recoverable data.
 
