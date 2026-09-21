@@ -155,8 +155,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         if (_mainForm is not null && !_mainForm.IsDisposed)
         {
-            _mainForm.AllowClose = true;
-            _mainForm.Close();
+            _mainForm.CloseFromApplication();
         }
 
         _trayIcon.Visible = false;
