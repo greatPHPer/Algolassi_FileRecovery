@@ -10,6 +10,7 @@ partial class Form1
     private Label lblDirectories = null!;
     private ListBox lstDirectories = null!;
     private Button btnScanDirectory = null!;
+    private Button btnScanNtfs = null!;
     private Button btnShowHistory = null!;
     private Button btnClearHistory = null!;
     private Label lblFiles = null!;
@@ -39,6 +40,7 @@ partial class Form1
         lblDirectories = new Label();
         lstDirectories = new ListBox();
         btnScanDirectory = new Button();
+        btnScanNtfs = new Button();
         btnShowHistory = new Button();
         btnClearHistory = new Button();
         lblFiles = new Label();
@@ -88,6 +90,12 @@ partial class Form1
         btnScanDirectory.UseVisualStyleBackColor = true;
         btnScanDirectory.Click += btnScanDirectory_Click;
 
+        btnScanNtfs.Location = new Point(344, 122);
+        btnScanNtfs.Size = new Size(190, 36);
+        btnScanNtfs.Text = "Scan NTFS Deleted Files";
+        btnScanNtfs.UseVisualStyleBackColor = true;
+        btnScanNtfs.Click += btnScanNtfs_Click;
+
         btnShowHistory.Location = new Point(546, 82);
         btnShowHistory.Size = new Size(170, 36);
         btnShowHistory.Text = "Show Delete History";
@@ -102,7 +110,7 @@ partial class Form1
 
         lblFiles.AutoSize = true;
         lblFiles.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
-        lblFiles.Location = new Point(344, 133);
+        lblFiles.Location = new Point(344, 171);
         lblFiles.Size = new Size(113, 19);
         lblFiles.Text = "Deleted files";
 
@@ -114,7 +122,7 @@ partial class Form1
         dgvResults.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         dgvResults.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
         dgvResults.Columns.AddRange(new DataGridViewColumn[] { colName, colDeleted, colSize, colStrength });
-        dgvResults.Location = new Point(344, 161);
+        dgvResults.Location = new Point(344, 199);
         dgvResults.MultiSelect = true;
         dgvResults.Name = "dgvResults";
         dgvResults.ReadOnly = true;
@@ -167,6 +175,7 @@ partial class Form1
         Controls.Add(lblFiles);
         Controls.Add(btnClearHistory);
         Controls.Add(btnShowHistory);
+        Controls.Add(btnScanNtfs);
         Controls.Add(btnScanDirectory);
         Controls.Add(lstDirectories);
         Controls.Add(lblDirectories);

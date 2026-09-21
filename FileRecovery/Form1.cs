@@ -4,6 +4,7 @@ public partial class Form1 : Form
 {
     private readonly DeletionHistoryStore _history;
     private readonly RecycleBinService _recycleBinService;
+    private readonly MftCandidateScanner _mftCandidateScanner = new();
     private bool _allowClose;
 
     public void CloseFromApplication()
@@ -173,6 +174,98 @@ public partial class Form1 : Form
         }
     }
 
+
+
+    private async void btnScanNtfs_Click(object? sender, EventArgs e)
+    {
+        var selectedDirectory = GetSelectedDirectory();
+        var root = selectedDirectory is null
+            ? GetDefaultNtfsRoot()
+            : Path.GetPathRoot(selectedDirectory);
+
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            MessageBox.Show(
+                this,
+                "Select a recent deletion directory first, or record a deletion so the source volume can be identified.",
+                "NTFS Scan",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        var answer = MessageBox.Show(
+            this,
+            $"Scan the NTFS volume {root} for deleted-file metadata candidates? This reads filesystem metadata only and does not write to the source volume.",
+            "NTFS Deleted-File Scan",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+
+        if (answer != DialogResult.Yes)
+        {
+            return;
+        }
+
+        SetBusy(true, $"Scanning NTFS deleted-file metadata on {root}...");
+        try
+        {
+            var candidates = await Task.Run(() => _mftCandidateScanner.Scan(root));
+
+            var filtered = candidates
+                .Where(candidate =>
+                    selectedDirectory is null ||
+                    string.IsNullOrWhiteSpace(candidate.DirectoryPath) ||
+                    IsDirectoryMatch(candidate.DirectoryPath, selectedDirectory))
+                .Select(candidate => new RecoveryDisplayRow
+                {
+                    Name = candidate.Name,
+                    DeletedOn = candidate.LastUsnTimestampUtc.ToLocalTime().ToString("g"),
+                    FileSize = "Not yet known",
+                    RecoveryStrength = candidate.Strength.ToString(),
+                })
+                .ToList();
+
+            dgvResults.DataSource = filtered;
+            lblFiles.Text = $"NTFS candidates ({filtered.Count:N0})";
+            lblStatus.Text = filtered.Count == 0
+                ? "No deleted-file metadata candidates were returned for this volume."
+                : $"Found {filtered.Count:N0} deleted-file metadata candidate(s). No file contents were recovered yet.";
+        }
+        catch (UnauthorizedAccessException)
+        {
+            MessageBox.Show(
+                this,
+                "NTFS deleted-file enumeration requires administrator privileges on this system. Run AlgoLassi File Recovery as Administrator for this scan.",
+                "Administrator Access Required",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            lblStatus.Text = "NTFS scan requires administrator privileges.";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                this,
+                ex.Message,
+                "NTFS Scan Failed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            lblStatus.Text = "NTFS scan failed.";
+        }
+        finally
+        {
+            SetBusy(false);
+            UpdateRecoverButton();
+        }
+    }
+
+    private string? GetDefaultNtfsRoot()
+    {
+        var firstDirectory = _history.GetRecentDirectories().FirstOrDefault();
+        return string.IsNullOrWhiteSpace(firstDirectory)
+            ? null
+            : Path.GetPathRoot(firstDirectory);
+    }
+
     private void btnRecover_Click(object? sender, EventArgs e)
     {
         var selected = dgvResults.SelectedRows
@@ -280,6 +373,7 @@ public partial class Form1 : Form
         btnScanDirectory.Enabled = !busy;
         btnShowHistory.Enabled = !busy;
         btnClearHistory.Enabled = !busy;
+        btnScanNtfs.Enabled = !busy;
         dgvResults.Enabled = !busy;
         btnRecover.Enabled = !busy && btnRecover.Enabled;
         UseWaitCursor = busy;
