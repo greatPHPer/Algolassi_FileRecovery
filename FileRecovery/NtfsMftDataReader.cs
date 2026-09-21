@@ -142,7 +142,7 @@ public sealed class NtfsMftDataReader
             return NotFound("The resident $DATA value is outside its attribute record.");
         }
 
-        var data = new byte[valueLength];
+        var data = new byte[checked((int)valueLength)];
         record.AsSpan(attributeOffset + valueOffset, checked((int)valueLength)).CopyTo(data);
 
         return new NtfsDataStreamInfo
@@ -266,7 +266,7 @@ public sealed class NtfsMftDataReader
                 (uint)buffer.Length,
                 out var bytesRead,
                 IntPtr.Zero) ||
-            bytesRead != buffer.Length)
+            bytesRead != (uint)buffer.Length)
         {
             throw new Win32Exception(
                 Marshal.GetLastWin32Error(),
