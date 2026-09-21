@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: ["master", "0.1-recovery-foundation", "0.2-background-monitor", "0.3-recovery-engine-foundation", "0.4-ntfs-volume-inspection"]
+    branches: ["master", "0.1-recovery-foundation", "0.2-background-monitor", "0.3-recovery-engine-foundation", "0.4-ntfs-volume-inspection", "0.5-ntfs-data-run-analysis"]
   pull_request:
     branches: ["master"]
 
