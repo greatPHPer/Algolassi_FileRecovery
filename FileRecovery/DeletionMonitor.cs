@@ -119,7 +119,7 @@ public sealed class DeletionMonitor : IDisposable
 
     private void OnDeleted(object sender, FileSystemEventArgs e)
     {
-        var size = _knownSizes.TryRemove(e.FullPath, out var cachedSize)
+        long? size = _knownSizes.TryRemove(e.FullPath, out var cachedSize)
             ? cachedSize
             : null;
 
