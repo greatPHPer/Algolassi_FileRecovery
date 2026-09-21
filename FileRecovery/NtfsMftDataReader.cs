@@ -79,7 +79,7 @@ public sealed class NtfsMftDataReader
             return NotFound("The MFT record does not contain a valid attribute area.");
         }
 
-        var offset = firstAttributeOffset;
+        var offset = (int)firstAttributeOffset;
         while (offset + 16 <= record.Length)
         {
             var type = BinaryPrimitives.ReadUInt32LittleEndian(record.AsSpan(offset, 4));
