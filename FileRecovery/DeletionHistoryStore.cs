@@ -49,11 +49,24 @@ public sealed class DeletionHistoryStore
         }
     }
 
-    public void Add(DeletionRecord record)
+    public bool Upsert(DeletionRecord record)
     {
+        bool existed;
+
         lock (_gate)
         {
-            _records.Add(record);
+            var index = _records.FindIndex(x => x.Id == record.Id);
+            existed = index >= 0;
+
+            if (existed)
+            {
+                _records[index] = record;
+            }
+            else
+            {
+                _records.Add(record);
+            }
+
             _records = _records
                 .OrderByDescending(x => x.DeletedAtUtc)
                 .Take(MaxRecords)
@@ -62,6 +75,7 @@ public sealed class DeletionHistoryStore
         }
 
         Changed?.Invoke(this, EventArgs.Empty);
+        return existed;
     }
 
     public void Clear()
