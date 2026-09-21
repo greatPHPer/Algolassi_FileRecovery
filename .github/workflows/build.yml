@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: ["master", "0.1-recovery-foundation"]
+    branches: ["master", "0.1-recovery-foundation", "0.2-background-monitor"]
   pull_request:
     branches: ["master"]
 
