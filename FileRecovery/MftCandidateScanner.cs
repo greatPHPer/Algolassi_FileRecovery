@@ -38,6 +38,7 @@ public sealed class MftCandidateScanner
         var volumeInfo = new NtfsVolumeInspector().Inspect(fullRoot);
         using var volumeHandle = CreateVolumeHandle(fullRoot);
         var dataReader = new NtfsMftDataReader();
+        var bitmapReader = new NtfsVolumeBitmapReader();
 
         var results = new List<RecoveryCandidate>();
         ulong startFileReferenceNumber = 0;
@@ -126,11 +127,38 @@ public sealed class MftCandidateScanner
                             volumeInfo,
                             fileReference);
 
+                        IReadOnlyList<NtfsExtentAllocation> allocations = [];
+                        string allocationEvidence = string.Empty;
+
+                        if (data.Found && !data.IsResident && data.Extents.Count > 0)
+                        {
+                            try
+                            {
+                                allocations = bitmapReader.CheckExtents(
+                                    volumeHandle,
+                                    data.Extents,
+                                    cancellationToken);
+
+                                allocationEvidence = BuildAllocationEvidence(allocations);
+                            }
+                            catch (Exception ex)
+                            {
+                                allocationEvidence = $"Cluster allocation could not be verified: {ex.Message}";
+                            }
+                        }
+
+                        var freeClusters = allocations.Sum(x => x.FreeClusterCount);
+                        var allocatedClusters = allocations.Sum(x => x.AllocatedClusterCount);
+
                         var strength =
                             data.Found && data.IsResident ? RecoveryStrength.Medium :
-                            data.Found && data.Extents.Count > 0 ? RecoveryStrength.Medium :
-                            string.IsNullOrWhiteSpace(directoryPath) ? RecoveryStrength.Weak :
-                            RecoveryStrength.Medium;
+                            data.Found && allocations.Count > 0 && allocatedClusters == 0
+                                ? RecoveryStrength.Medium :
+                            data.Found && allocatedClusters > 0
+                                ? RecoveryStrength.Weak :
+                            string.IsNullOrWhiteSpace(directoryPath)
+                                ? RecoveryStrength.Weak
+                                : RecoveryStrength.Medium;
 
                         results.Add(new RecoveryCandidate
                         {
@@ -148,7 +176,13 @@ public sealed class MftCandidateScanner
                             FileSizeBytes = data.FileSizeBytes,
                             ValidDataLengthBytes = data.ValidDataLengthBytes,
                             DataExtents = data.Extents,
-                            DataEvidence = data.Evidence
+                            ExtentAllocations = allocations,
+                            FreeDataClusterCount = freeClusters,
+                            AllocatedDataClusterCount = allocatedClusters,
+                            DataEvidence = string.Join(
+                                " ",
+                                new[] { data.Evidence, allocationEvidence }
+                                    .Where(x => !string.IsNullOrWhiteSpace(x)))
                         });
 
                         foundRecords++;
@@ -167,6 +201,29 @@ public sealed class MftCandidateScanner
         }
 
         return results;
+    }
+
+    private static string BuildAllocationEvidence(IReadOnlyList<NtfsExtentAllocation> allocations)
+    {
+        var free = allocations.Sum(x => x.FreeClusterCount);
+        var allocated = allocations.Sum(x => x.AllocatedClusterCount);
+
+        if (allocated == 0 && free > 0)
+        {
+            return $"Current NTFS bitmap: {free:N0} data cluster(s) are free.";
+        }
+
+        if (allocated > 0 && free > 0)
+        {
+            return $"Current NTFS bitmap: {free:N0} data cluster(s) are free and {allocated:N0} are allocated.";
+        }
+
+        if (allocated > 0)
+        {
+            return $"Current NTFS bitmap: {allocated:N0} data cluster(s) are currently allocated.";
+        }
+
+        return "Current NTFS bitmap did not return usable allocation evidence.";
     }
 
     private static SafeFileHandle CreateVolumeHandle(string root)
