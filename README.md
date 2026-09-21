@@ -4,7 +4,7 @@ Windows file-recovery utility written in C# / .NET 9 WinForms.
 
 ## Current branch
 
-`0.2-background-monitor`
+`0.3-recovery-engine-foundation`
 
 ## Background monitor
 
@@ -39,7 +39,15 @@ The main window can be opened from the tray icon and shows:
 
 Items still present in the Windows Recycle Bin are shown as a strong recovery signal because Windows can restore them directly. A deletion that is no longer represented in the Recycle Bin is currently shown as a weak signal; this is only an estimate and is not a guarantee about raw-disk recoverability.
 
-The current recovery implementation does not read raw disk sectors and does not perform NTFS file carving yet.
+### NTFS deleted-file candidate scan
+
+The Recovery Center now includes **Scan NTFS Deleted Files**. On an NTFS source volume, the scanner uses `FSCTL_ENUM_USN_DATA` to enumerate MFT/USN metadata and identifies records carrying `USN_REASON_FILE_DELETE`. Microsoft documents `FSCTL_ENUM_USN_DATA` as an MFT-record enumeration mechanism for NTFS volumes. citeturn282315search1turn282315search0
+
+The scanner resolves the deleted record's parent directory by its NTFS file reference when possible. Results are candidates only: no deleted file bytes are reconstructed by this branch, and the source volume is not written to.
+
+Recovery output is intentionally designed around a different destination volume. The destination policy rejects a recovery target on the same drive as the source, which reduces the risk of overwriting clusters that might still contain recoverable data.
+
+The current branch does not yet perform raw-cluster reads, file-signature carving, or byte-level reconstruction.
 
 ## Standalone EXE
 
@@ -62,8 +70,9 @@ FileRecovery\bin\Release\net9.0-windows\win-x64\publish\
 3. NTFS USN-journal catch-up
 4. Safe NTFS metadata inspection
 5. NTFS deleted-file discovery
-6. Deep file-signature scanning
-7. Preview and recover-to-another-drive workflow
-8. Code signing and public release packaging
+6. NTFS candidate-to-cluster mapping
+7. Deep file-signature scanning
+8. Preview and recover-to-another-drive workflow
+9. Code signing and public release packaging
 
 Recovery software cannot guarantee recovery of every deleted file. SSD TRIM and overwritten data can make deleted data unrecoverable.
