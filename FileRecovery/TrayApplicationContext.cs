@@ -10,6 +10,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly DeletionHistoryStore _history;
     private readonly RecoverySettings _settings;
     private readonly DeletionMonitor _monitor;
+    private readonly UsnJournalMonitor _usnMonitor;
     private readonly SynchronizationContext _uiContext;
     private Form1? _mainForm;
     private DeletionNotificationForm? _notificationForm;
@@ -21,6 +22,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _history = new DeletionHistoryStore();
         _settings = RecoverySettings.Load();
         _monitor = new DeletionMonitor();
+        _usnMonitor = new UsnJournalMonitor(_settings);
 
         _notificationsMenuItem = new ToolStripMenuItem("Notifications")
         {
@@ -50,7 +52,10 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _monitor.DeletionDetected += OnDeletionDetected;
         _monitor.StatusChanged += OnMonitorStatusChanged;
+        _usnMonitor.DeletionDetected += OnDeletionDetected;
+        _usnMonitor.StatusChanged += OnMonitorStatusChanged;
         _monitor.Start();
+        _usnMonitor.Start();
     }
 
     private void OpenMainWindow()
@@ -92,7 +97,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             var wasExisting = _history.Upsert(e.Record);
 
-            if (!wasExisting && !_settings.NotificationsMuted)
+            if (!e.Historical && !wasExisting && !_settings.NotificationsMuted)
             {
                 ShowDeletionNotification(e.Record);
             }
@@ -145,6 +150,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _exiting = true;
         _monitor.Stop();
+        _usnMonitor.Stop();
         _notificationForm?.Close();
 
         if (_mainForm is not null && !_mainForm.IsDisposed)
@@ -157,6 +163,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _trayIcon.Dispose();
         _menu.Dispose();
         _monitor.Dispose();
+        _usnMonitor.Dispose();
 
         ExitThread();
     }
