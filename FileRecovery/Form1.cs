@@ -330,14 +330,4 @@ public partial class Form1 : Form
         e.Cancel = true;
         Hide();
     }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            _history.Changed -= History_Changed;
-        }
-
-        base.Dispose(disposing);
-    }
 }
