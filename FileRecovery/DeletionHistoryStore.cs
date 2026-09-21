@@ -55,7 +55,11 @@ public sealed class DeletionHistoryStore
 
         lock (_gate)
         {
-            var index = _records.FindIndex(x => x.Id == record.Id);
+            var index = _records.FindIndex(x =>
+                x.Id == record.Id ||
+                (string.Equals(x.FullPath, record.FullPath, StringComparison.OrdinalIgnoreCase) &&
+                 Math.Abs((x.DeletedAtUtc - record.DeletedAtUtc).TotalSeconds) <= 5));
+
             existed = index >= 0;
 
             if (existed)
