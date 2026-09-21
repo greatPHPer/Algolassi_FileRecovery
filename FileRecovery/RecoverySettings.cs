@@ -5,6 +5,8 @@ namespace FileRecovery;
 public sealed class RecoverySettings
 {
     public bool NotificationsMuted { get; set; }
+    public Dictionary<string, VolumeJournalCursor> UsnCursors { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
 
     private static readonly string SettingsPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -21,8 +23,11 @@ public sealed class RecoverySettings
                 return new RecoverySettings();
             }
 
-            return JsonSerializer.Deserialize<RecoverySettings>(File.ReadAllText(SettingsPath))
+            var settings = JsonSerializer.Deserialize<RecoverySettings>(File.ReadAllText(SettingsPath))
                 ?? new RecoverySettings();
+
+            settings.UsnCursors ??= new Dictionary<string, VolumeJournalCursor>(StringComparer.OrdinalIgnoreCase);
+            return settings;
         }
         catch
         {
@@ -44,4 +49,10 @@ public sealed class RecoverySettings
             // Settings are non-critical; monitoring should continue if persistence fails.
         }
     }
+}
+
+public sealed class VolumeJournalCursor
+{
+    public ulong JournalId { get; set; }
+    public long NextUsn { get; set; }
 }
