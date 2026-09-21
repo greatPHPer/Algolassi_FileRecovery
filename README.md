@@ -18,7 +18,11 @@ When a deletion is observed:
 - Notifications can be muted without stopping monitoring.
 - The app keeps the latest 500 deletion records.
 
-The live monitor currently uses `FileSystemWatcher` to capture the exact path supplied by Windows. This is intentionally the first layer of monitoring. A future NTFS USN-journal catch-up layer can fill gaps when the application was not running and can make monitoring more resilient to notification-buffer overflow.
+The live monitor uses `FileSystemWatcher` to capture the affected item's fully qualified path. Windows exposes that path through `FileSystemEventArgs.FullPath`, including the deleted filename and its parent directory.
+
+A second NTFS USN-journal layer is also enabled for catch-up. Each USN delete record contains the deleted filename and the parent directory's NTFS file identifier. The app opens that parent directory by file ID and resolves its final filesystem path. This allows the app to reconstruct the deleted directory even though the deleted file itself no longer exists.
+
+USN journal operations require administrator privileges on Windows. If the app is not elevated, the live `FileSystemWatcher` monitoring remains available, while USN catch-up reports a permission warning in the app status area.
 
 ## Recovery Center
 
