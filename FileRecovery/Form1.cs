@@ -231,27 +231,16 @@ public partial class Form1 : Form
                     MessageBoxIcon.Warning);
             }
 
-            _ = RefreshScanAsync();
         }
         finally
         {
             SetBusy(false);
+            UpdateRecoverButton();
         }
-    }
 
-    private async Task RefreshScanAsync()
-    {
-        try
+        if (!IsDisposed)
         {
-            await Task.Delay(150);
-            if (!IsDisposed)
-            {
-                await InvokeAsync(() => btnScanDirectory_Click(null, EventArgs.Empty));
-            }
-        }
-        catch
-        {
-            // UI refresh is best-effort.
+            btnScanDirectory.PerformClick();
         }
     }
 
