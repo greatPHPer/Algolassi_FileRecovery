@@ -35,7 +35,9 @@ public sealed class MftCandidateScanner
         }
 
         var fullRoot = Path.GetFullPath(root);
+        var volumeInfo = new NtfsVolumeInspector().Inspect(fullRoot);
         using var volumeHandle = CreateVolumeHandle(fullRoot);
+        var dataReader = new NtfsMftDataReader();
 
         var results = new List<RecoveryCandidate>();
         ulong startFileReferenceNumber = 0;
@@ -119,6 +121,17 @@ public sealed class MftCandidateScanner
                             volumeHandle,
                             parentReference) ?? string.Empty;
 
+                        var data = dataReader.ReadDefaultDataStream(
+                            volumeHandle,
+                            volumeInfo,
+                            fileReference);
+
+                        var strength =
+                            data.Found && data.IsResident ? RecoveryStrength.Medium :
+                            data.Found && data.Extents.Count > 0 ? RecoveryStrength.Medium :
+                            string.IsNullOrWhiteSpace(directoryPath) ? RecoveryStrength.Weak :
+                            RecoveryStrength.Medium;
+
                         results.Add(new RecoveryCandidate
                         {
                             FileReferenceNumber = fileReference,
@@ -126,12 +139,16 @@ public sealed class MftCandidateScanner
                             Name = name,
                             DirectoryPath = directoryPath,
                             LastUsnTimestampUtc = timestampUtc,
-                            Strength = string.IsNullOrWhiteSpace(directoryPath)
-                                ? RecoveryStrength.Weak
-                                : RecoveryStrength.Medium,
+                            Strength = strength,
                             Evidence = string.IsNullOrWhiteSpace(directoryPath)
-                                ? "NTFS MFT/USN metadata shows a file-delete record, but its parent directory could not be resolved."
-                                : "NTFS MFT/USN metadata shows a file-delete record and the parent directory was resolved; file contents have not yet been verified."
+                                ? "NTFS metadata shows a file-delete record, but the parent directory could not be resolved."
+                                : "NTFS metadata shows a file-delete record and the parent directory was resolved.",
+                            DataStreamFound = data.Found,
+                            DataStreamResident = data.IsResident,
+                            FileSizeBytes = data.FileSizeBytes,
+                            ValidDataLengthBytes = data.ValidDataLengthBytes,
+                            DataExtents = data.Extents,
+                            DataEvidence = data.Evidence
                         });
 
                         foundRecords++;

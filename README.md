@@ -4,7 +4,7 @@ Windows file-recovery utility written in C# / .NET 9 WinForms.
 
 ## Current branch
 
-`0.4-ntfs-volume-inspection`
+`0.5-ntfs-data-run-analysis`
 
 ## Background monitor
 
@@ -49,7 +49,9 @@ This stage only reads filesystem metadata. It does not read deleted-file cluster
 
 The Recovery Center now includes **Scan NTFS Deleted Files**. On an NTFS source volume, the scanner uses `FSCTL_ENUM_USN_DATA` to enumerate MFT/USN metadata and identifies records carrying `USN_REASON_FILE_DELETE`. Microsoft documents `FSCTL_ENUM_USN_DATA` as an MFT-record enumeration mechanism for NTFS volumes.
 
-The scanner resolves the deleted record's parent directory by its NTFS file reference when possible. Results are candidates only: no deleted file bytes are reconstructed by this branch, and the source volume is not written to.
+The scanner resolves the deleted record's parent directory by its NTFS file reference when possible. The current recovery foundation now also reads the retained MFT record for the candidate and inspects the unnamed `$DATA` attribute. A resident stream is kept inside the MFT record; a nonresident stream contains VCN-to-LCN mapping-pairs that describe former cluster locations.
+
+Results are still candidates only: this stage does not claim the former clusters are intact, and it does not reconstruct or write recovered files.
 
 Recovery output is intentionally designed around a different destination volume. The destination policy rejects a recovery target on the same drive as the source, which reduces the risk of overwriting clusters that might still contain recoverable data.
 

@@ -151,6 +151,7 @@ public partial class Form1 : Form
                     DeletedOn = item.DeletedDate,
                     FileSize = item.Size,
                     RecoveryStrength = "Strong",
+                    Evidence = $"Windows Recycle Bin item; original location: {item.OriginalLocation}",
                     RecoverableItem = item
                 })
                 .ToList();
@@ -220,8 +221,11 @@ public partial class Form1 : Form
                 {
                     Name = candidate.Name,
                     DeletedOn = candidate.LastUsnTimestampUtc.ToLocalTime().ToString("g"),
-                    FileSize = "Not yet known",
+                    FileSize = candidate.DataStreamFound
+                        ? FormatSize(candidate.FileSizeBytes)
+                        : "Unknown",
                     RecoveryStrength = candidate.Strength.ToString(),
+                    Evidence = BuildCandidateEvidence(candidate)
                 })
                 .ToList();
 
@@ -256,6 +260,25 @@ public partial class Form1 : Form
             SetBusy(false);
             UpdateRecoverButton();
         }
+    }
+
+    private static string BuildCandidateEvidence(RecoveryCandidate candidate)
+    {
+        var parts = new List<string>();
+
+        if (!string.IsNullOrWhiteSpace(candidate.DataEvidence))
+        {
+            parts.Add(candidate.DataEvidence);
+        }
+
+        if (!string.IsNullOrWhiteSpace(candidate.DirectoryPath))
+        {
+            parts.Add($"Parent: {candidate.DirectoryPath}");
+        }
+
+        return parts.Count == 0
+            ? candidate.Evidence
+            : string.Join(" ", parts);
     }
 
     private string? GetDefaultNtfsRoot()
