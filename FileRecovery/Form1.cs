@@ -6,10 +6,10 @@ public partial class Form1 : Form
     private readonly RecycleBinService _recycleBinService;
     private bool _allowClose;
 
-    public bool AllowClose
+    public void CloseFromApplication()
     {
-        get => _allowClose;
-        set => _allowClose = value;
+        _allowClose = true;
+        Close();
     }
 
     public Form1(DeletionHistoryStore history, RecycleBinService recycleBinService)
