@@ -11,6 +11,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly RecoverySettings _settings;
     private readonly DeletionMonitor _monitor;
     private readonly UsnJournalMonitor _usnMonitor;
+    private readonly RecycleBinMonitor _recycleBinMonitor;
     private readonly SynchronizationContext _uiContext;
     private Form1? _mainForm;
     private DeletionNotificationForm? _notificationForm;
@@ -23,6 +24,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _settings = RecoverySettings.Load();
         _monitor = new DeletionMonitor();
         _usnMonitor = new UsnJournalMonitor(_settings);
+        _recycleBinMonitor = new RecycleBinMonitor();
 
         _notificationsMenuItem = new ToolStripMenuItem("Notifications")
         {
@@ -54,8 +56,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         _monitor.StatusChanged += OnMonitorStatusChanged;
         _usnMonitor.DeletionDetected += OnDeletionDetected;
         _usnMonitor.StatusChanged += OnMonitorStatusChanged;
+        _recycleBinMonitor.DeletionDetected += OnDeletionDetected;
+        _recycleBinMonitor.StatusChanged += OnMonitorStatusChanged;
         _monitor.Start();
         _usnMonitor.Start();
+        _recycleBinMonitor.Start();
     }
 
     private void OpenMainWindow()
@@ -151,6 +156,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _exiting = true;
         _monitor.Stop();
         _usnMonitor.Stop();
+        _recycleBinMonitor.Stop();
         _notificationForm?.Close();
 
         if (_mainForm is not null && !_mainForm.IsDisposed)
@@ -163,6 +169,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _menu.Dispose();
         _monitor.Dispose();
         _usnMonitor.Dispose();
+        _recycleBinMonitor.Dispose();
 
         ExitThread();
     }
