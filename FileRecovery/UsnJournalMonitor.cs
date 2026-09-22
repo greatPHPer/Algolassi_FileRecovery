@@ -11,6 +11,7 @@ public sealed class UsnJournalMonitor : IDisposable
 {
     private const uint FsctlQueryUsnJournal = 0x000900F4;
     private const uint FsctlReadUsnJournal = 0x000900BB;
+    private const uint FsctlCreateUsnJournal = 0x000900E7;
 
     private const uint GenericRead = 0x80000000;
     private const uint FileShareRead = 0x00000001;
@@ -22,6 +23,7 @@ public sealed class UsnJournalMonitor : IDisposable
     private const int ErrorJournalDeleteInProgress = 1178;
     private const int ErrorJournalNotActive = 1179;
     private const int ErrorJournalEntryDeleted = 1181;
+    private const int ErrorFileNotFound = 2;
 
     private const uint UsnReasonFileDelete = 0x00000200;
     private const int UsnRecordV2MinimumLength = 60;
@@ -103,9 +105,20 @@ public sealed class UsnJournalMonitor : IDisposable
                     throw new Win32Exception(Marshal.GetLastWin32Error());
                 }
 
-                if (!TryQueryJournal(volumeHandle, out var journal))
+                if (!TryQueryJournal(volumeHandle, out var journal, out var queryError))
                 {
-                    continue;
+                    if (queryError == ErrorFileNotFound ||
+                        queryError == ErrorJournalNotActive)
+                    {
+                        if (!TryCreateJournal(volumeHandle, volumeKey, out journal))
+                        {
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        continue;
+                    }
                 }
 
                 if (!_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) ||
@@ -259,9 +272,20 @@ public sealed class UsnJournalMonitor : IDisposable
             throw new Win32Exception(Marshal.GetLastWin32Error());
         }
 
-        if (!TryQueryJournal(volumeHandle, out var journal))
+        if (!TryQueryJournal(volumeHandle, out var journal, out var queryError))
         {
-            return;
+            if (queryError == ErrorFileNotFound ||
+                queryError == ErrorJournalNotActive)
+            {
+                if (!TryCreateJournal(volumeHandle, volumeKey, out journal))
+                {
+                    return;
+                }
+            }
+            else
+            {
+                return;
+            }
         }
 
         var cache = _parentPathCaches.GetOrAdd(
@@ -377,9 +401,72 @@ public sealed class UsnJournalMonitor : IDisposable
         }
     }
 
-    private static bool TryQueryJournal(SafeFileHandle volumeHandle, out JournalInfo journal)
+    private static bool TryCreateJournal(
+        SafeFileHandle volumeHandle,
+        string volumeKey,
+        out JournalInfo journal)
     {
         journal = default;
+
+        var request = new CreateUsnJournalData
+        {
+            MaximumSize = 64UL * 1024UL * 1024UL,
+            AllocationDelta = 16UL * 1024UL * 1024UL
+        };
+
+        var input = StructureToBytes(request);
+
+        if (!DeviceIoControl(
+                volumeHandle,
+                FsctlCreateUsnJournal,
+                input,
+                (uint)input.Length,
+                null,
+                0,
+                out _,
+                IntPtr.Zero))
+        {
+            var error = Marshal.GetLastWin32Error();
+            StatusMessageForJournalFailure(volumeKey, error);
+            return false;
+        }
+
+        if (!TryQueryJournal(volumeHandle, out journal, out var queryError))
+        {
+            StatusMessageForJournalFailure(volumeKey, queryError);
+            return false;
+        }
+
+        StatusChanged?.Invoke(
+            this,
+            $"USN journal created and active on {volumeKey}.");
+
+        return true;
+    }
+
+    private void StatusMessageForJournalFailure(string volumeKey, int error)
+    {
+        if (error == 5)
+        {
+            StatusChanged?.Invoke(
+                this,
+                $"USN journal for {volumeKey} could not be created because administrator privileges are required.");
+        }
+        else if (error != 0)
+        {
+            StatusChanged?.Invoke(
+                this,
+                $"USN journal for {volumeKey} is unavailable (error {error}).");
+        }
+    }
+
+    private static bool TryQueryJournal(
+        SafeFileHandle volumeHandle,
+        out JournalInfo journal,
+        out int errorCode)
+    {
+        journal = default;
+        errorCode = 0;
         var output = new byte[64];
 
         if (!DeviceIoControl(
@@ -393,7 +480,9 @@ public sealed class UsnJournalMonitor : IDisposable
                 IntPtr.Zero))
         {
             var error = Marshal.GetLastWin32Error();
-            if (error == 2 ||
+            errorCode = error;
+
+            if (error == ErrorFileNotFound ||
                 error == ErrorJournalDeleteInProgress ||
                 error == ErrorJournalNotActive)
             {
@@ -844,6 +933,13 @@ public sealed class UsnJournalMonitor : IDisposable
         uint FileAttributes,
         string FileName,
         DateTime TimestampUtc);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CreateUsnJournalData
+    {
+        public ulong MaximumSize;
+        public ulong AllocationDelta;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct ReadUsnJournalRequest
