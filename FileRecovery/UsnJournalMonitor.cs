@@ -586,7 +586,7 @@ public sealed class UsnJournalMonitor : IDisposable
             return false;
         }
 
-        if (!TryQueryJournal(volumeHandle, out var journal))
+        if (!TryQueryJournal(volumeHandle, out var journal, out _))
         {
             return false;
         }
