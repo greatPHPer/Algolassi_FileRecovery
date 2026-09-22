@@ -14,6 +14,7 @@ public sealed class MftCandidateScanner
     private const uint FileShareDelete = 0x00000004;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOverlapped = 0x40000000;
 
     private const uint UsnReasonFileDelete = 0x00000200;
     private const uint FileAttributeDirectory = 0x00000010;
@@ -98,7 +99,9 @@ public sealed class MftCandidateScanner
         var fullRoot = Path.GetFullPath(root);
         var volumeInfo = new NtfsVolumeInspector().Inspect(fullRoot);
         using var volumeHandle = CreateVolumeHandle(fullRoot);
-        using var mftScanVolumeHandle = CreateVolumeHandle(fullRoot);
+        using var mftScanVolumeHandle = CreateVolumeHandle(
+            fullRoot,
+            overlapped: true);
 
         const int bufferSize = 4 * 1024 * 1024;
 
@@ -150,7 +153,7 @@ public sealed class MftCandidateScanner
             mftScanVolumeHandle,
             FileAccess.Read,
             bufferSize,
-            isAsync: false);
+            isAsync: true);
 
         if (mftStream.Seek(mftStartOffset, SeekOrigin.Begin) != mftStartOffset)
         {
@@ -175,16 +178,14 @@ public sealed class MftCandidateScanner
                 break;
             }
 
-            // The raw volume handle is opened synchronously. The entire
-            // scanner already runs inside Task.Run(), so use a synchronous
-            // device read here rather than mixing a synchronous handle with
-            // FileStream.ReadAsync().
+            // The MFT scan uses an overlapped raw-volume handle so the
+            // cancellation token can interrupt a slow device read instead
+            // of leaving RestoreHistoryRowsAsync waiting indefinitely.
             cancellationToken.ThrowIfCancellationRequested();
 
-            var bytesRead = mftStream.Read(
-                buffer,
-                0,
-                requestBytes);
+            var bytesRead = await mftStream.ReadAsync(
+                buffer.AsMemory(0, requestBytes),
+                cancellationToken).ConfigureAwait(false);
 
             if (bytesRead <= 0)
             {
@@ -807,16 +808,22 @@ public sealed class MftCandidateScanner
         return "Current NTFS bitmap did not return usable allocation evidence.";
     }
 
-    private static SafeFileHandle CreateVolumeHandle(string root)
+    private static SafeFileHandle CreateVolumeHandle(
+        string root,
+        bool overlapped = false)
     {
         var volumeName = root.TrimEnd(Path.DirectorySeparatorChar);
+        var flags =
+            FileFlagBackupSemantics |
+            (overlapped ? FileFlagOverlapped : 0);
+
         var handle = CreateFile(
             $@"\\.\{volumeName[..2]}",
             GenericRead,
             FileShareRead | FileShareWrite | FileShareDelete,
             IntPtr.Zero,
             OpenExisting,
-            FileFlagBackupSemantics,
+            flags,
             IntPtr.Zero);
 
         if (handle.IsInvalid)
