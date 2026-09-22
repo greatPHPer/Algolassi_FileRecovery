@@ -11,6 +11,7 @@ public partial class Form1 : Form
 
     private readonly DeletionHistoryStore _history;
     private readonly RecycleBinService _recycleBinService;
+    private readonly UsnJournalMonitor? _usnMonitor;
     private readonly MftCandidateScanner _mftCandidateScanner = new();
     private readonly NtfsByteRecoveryService _ntfsRecoveryService = new();
     private bool _allowClose;
@@ -26,10 +27,14 @@ public partial class Form1 : Form
         Close();
     }
 
-    public Form1(DeletionHistoryStore history, RecycleBinService recycleBinService)
+    public Form1(
+        DeletionHistoryStore history,
+        RecycleBinService recycleBinService,
+        UsnJournalMonitor? usnMonitor = null)
     {
         _history = history;
         _recycleBinService = recycleBinService;
+        _usnMonitor = usnMonitor;
 
         InitializeComponent();
         _history.Changed += History_Changed;
@@ -637,6 +642,53 @@ public partial class Form1 : Form
                             !record.FileReferenceNumber.HasValue ||
                             !record.ParentFileReferenceNumber.HasValue)
                         .ToList();
+
+                    // A history row can predate NTFS reference capture, or the
+                    // deletion-time USN lookup may have raced the journal update.
+                    // Give Recover Selected one final live-journal opportunity
+                    // before classifying the row as legacy/unavailable.
+                    if (_usnMonitor is not null && legacyRecords.Count > 0)
+                    {
+                        var resolvedRecords = new List<DeletionRecord>();
+
+                        foreach (var record in legacyRecords)
+                        {
+                            var resolved = await Task.Run(() =>
+                            {
+                                if (!_usnMonitor.TryResolveRecentDeletedFile(
+                                        record.FullPath,
+                                        record.DeletedAtUtc,
+                                        out var fileReferenceNumber,
+                                        out var parentFileReferenceNumber))
+                                {
+                                    return false;
+                                }
+
+                                record.FileReferenceNumber = fileReferenceNumber;
+                                record.ParentFileReferenceNumber = parentFileReferenceNumber;
+                                return true;
+                            });
+
+                            if (resolved)
+                            {
+                                resolvedRecords.Add(record);
+                                await Task.Run(() => _history.Upsert(record));
+                            }
+                        }
+
+                        if (resolvedRecords.Count > 0)
+                        {
+                            directRecords.AddRange(resolvedRecords);
+
+                            var resolvedIds = resolvedRecords
+                                .Select(record => record.Id)
+                                .ToHashSet();
+
+                            legacyRecords = legacyRecords
+                                .Where(record => !resolvedIds.Contains(record.Id))
+                                .ToList();
+                        }
+                    }
 
                     if (directRecords.Count > 0)
                     {
