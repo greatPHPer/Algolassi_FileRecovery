@@ -750,7 +750,7 @@ public partial class Form1 : Form
     private static async Task<Dictionary<Guid, RecoveryItem>> ResolveRecycleBinMatchesWithTimeoutAsync(
         Task<Dictionary<Guid, RecoveryItem>> recycleResolutionTask)
     {
-        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
+        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(15));
 
         var completed = await Task.WhenAny(
                 recycleResolutionTask,
