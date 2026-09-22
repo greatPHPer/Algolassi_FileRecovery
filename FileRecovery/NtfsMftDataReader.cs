@@ -13,6 +13,7 @@ public sealed class NtfsMftDataReader
     private const uint FileShareDelete = 0x00000004;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOverlapped = 0x40000000;
 
     private const uint NtfsAttributeList = 0x20;
     private const uint NtfsAttributeData = 0x80;
@@ -608,9 +609,9 @@ public sealed class NtfsMftDataReader
         return record;
     }
 
-    internal static SafeFileHandle OpenMftHandle(string rootPath)
+    internal static SafeFileHandle OpenMftHandle(string rootPath, bool asynchronous = false)
     {
-        return CreateMftHandle(rootPath);
+        return CreateMftHandle(rootPath, asynchronous);
     }
 
     private static NtfsDataStreamInfo NotFound(string evidence) =>
@@ -660,7 +661,7 @@ public sealed class NtfsMftDataReader
         }
     }
 
-    private static SafeFileHandle CreateMftHandle(string rootPath)
+    private static SafeFileHandle CreateMftHandle(string rootPath, bool asynchronous = false)
     {
         var normalizedRoot = Path.GetPathRoot(rootPath);
         if (string.IsNullOrWhiteSpace(normalizedRoot))
@@ -675,7 +676,7 @@ public sealed class NtfsMftDataReader
             FileShareRead | FileShareWrite | FileShareDelete,
             IntPtr.Zero,
             OpenExisting,
-            FileFlagBackupSemantics,
+            FileFlagBackupSemantics | (asynchronous ? FileFlagOverlapped : 0),
             IntPtr.Zero);
 
         if (handle.IsInvalid)
