@@ -91,16 +91,22 @@ public sealed class MftCandidateScanner
                 target.ParentFileReferenceNumber) ?? string.Empty;
 
             var name = Path.GetFileName(target.FullPath);
-            if (string.IsNullOrWhiteSpace(directoryPath) ||
-                string.IsNullOrWhiteSpace(name))
+            if (string.IsNullOrWhiteSpace(name))
             {
                 continue;
             }
 
-            var fullPath = NormalizePath(Path.Combine(directoryPath, name));
-            if (!string.Equals(fullPath, target.FullPath, StringComparison.OrdinalIgnoreCase))
+            // The NTFS file reference is authoritative. Parent-path reconstruction
+            // can fail for a deleted file even when its MFT record is still intact.
+            // Do not discard the candidate merely because the reconstructed path
+            // differs from the historical path.
+            if (string.IsNullOrWhiteSpace(directoryPath) ||
+                directoryPath.StartsWith("(Parent directory unavailable)", StringComparison.OrdinalIgnoreCase))
             {
-                continue;
+                var historicalDirectory = Path.GetDirectoryName(target.FullPath);
+                directoryPath = string.IsNullOrWhiteSpace(historicalDirectory)
+                    ? string.Empty
+                    : historicalDirectory;
             }
 
             var data = dataReader.ReadDefaultDataStream(
