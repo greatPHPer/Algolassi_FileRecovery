@@ -665,14 +665,48 @@ public partial class Form1 : Form
                         }
                     }
 
-                    // Older history records may not have the NTFS file reference that
-                    // is required for a bounded direct MFT lookup. Do not fall back to a
-                    // volume-wide FSCTL_ENUM_USN_DATA scan here; that operation can take
-                    // an unbounded amount of time and cannot be cancelled reliably while
-                    // DeviceIoControl is blocked.
+                    // Older history records may not have the NTFS file reference
+                    // required for the exact direct lookup above. Use a targeted,
+                    // bounded MFT enumeration as a fallback instead of giving up
+                    // immediately. The scanner checks only the selected file paths and
+                    // stops after a fixed page budget or cancellation.
                     if (legacyRecords.Count > 0)
                     {
-                        unavailable.AddRange(legacyRecords);
+                        var targetPaths = legacyRecords
+                            .Select(record => NormalizePath(record.FullPath))
+                            .Where(path => !string.IsNullOrWhiteSpace(path))
+                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                            .ToList();
+
+                        using var fallbackCts = new CancellationTokenSource(
+                            TimeSpan.FromSeconds(20));
+
+                        var fallbackCandidates = await Task.Run(
+                            () => _mftCandidateScanner.ScanForPaths(
+                                root,
+                                targetPaths,
+                                fallbackCts.Token,
+                                maxPages: 128));
+
+                        foreach (var record in legacyRecords)
+                        {
+                            var match = fallbackCandidates.FirstOrDefault(candidate =>
+                                string.Equals(
+                                    NormalizePath(Path.Combine(
+                                        candidate.DirectoryPath ?? string.Empty,
+                                        candidate.Name)),
+                                    NormalizePath(record.FullPath),
+                                    StringComparison.OrdinalIgnoreCase));
+
+                            if (match is not null)
+                            {
+                                ntfsCandidates.Add(match);
+                            }
+                            else
+                            {
+                                unavailable.Add(record);
+                            }
+                        }
                     }
                 }
                 catch (UnauthorizedAccessException)
