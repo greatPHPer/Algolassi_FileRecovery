@@ -19,8 +19,9 @@ jobs:
           dotnet-version: 9.0.x
 
       - name: Restore
-        run: dotnet restore FileRecovery.sln
-dotnet restore FileRecovery.Tests/FileRecovery.Tests.csproj
+        run: |
+          dotnet restore FileRecovery.sln
+          dotnet restore FileRecovery.Tests/FileRecovery.Tests.csproj
 
       - name: Build
         run: dotnet build FileRecovery/FileRecovery.csproj -c Release --no-restore
