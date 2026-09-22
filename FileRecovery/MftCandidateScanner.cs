@@ -134,7 +134,6 @@ public sealed class MftCandidateScanner
         var scanBufferSize = bufferSize - bufferSize % recordSize;
         scanBufferSize = Math.Max(recordSize, scanBufferSize);
         var buffer = new byte[scanBufferSize];
-        var record = new byte[recordSize];
 
         long scanned = 0;
 
@@ -166,18 +165,10 @@ public sealed class MftCandidateScanner
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                // Reuse one record buffer. The previous implementation allocated
-                // a new array for every FILE record, which made large MFT scans
-                // dramatically slower and much more allocation-heavy.
-                Buffer.BlockCopy(
-                    buffer,
-                    offset,
-                    record,
-                    0,
-                    recordSize);
-
+                // Parse the FILE record directly from the read buffer. Avoid
+                // copying every MFT record into a second array.
                 if (!TryParseDeletedFileNameEntries(
-                        record,
+                        buffer.AsSpan(offset, recordSize),
                         volumeInfo.BytesPerSector,
                         (ulong)((scanned + offset) / recordSize),
                         out var fileReferenceNumber,
@@ -597,7 +588,7 @@ public sealed class MftCandidateScanner
     }
 
     private static bool TryParseDeletedFileNameEntries(
-        byte[] record,
+        Span<byte> record,
         uint bytesPerSector,
         ulong segmentNumber,
         out ulong fileReferenceNumber,
