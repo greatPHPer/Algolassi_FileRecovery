@@ -433,7 +433,7 @@ public partial class Form1 : Form
             : Path.GetPathRoot(firstDirectory);
     }
 
-    private void btnRecover_Click(object? sender, EventArgs e)
+    private async void btnRecover_Click(object? sender, EventArgs e)
     {
         var rows = dgvResults.SelectedRows
             .Cast<DataGridViewRow>()
@@ -470,14 +470,14 @@ public partial class Form1 : Form
 
         if (candidates.Count > 0)
         {
-            RecoverNtfsCandidates(candidates);
+            await RecoverNtfsCandidatesAsync(candidates);
             return;
         }
 
-        RestoreRecycleBinItems(recycleItems);
+        await RestoreRecycleBinItemsAsync(recycleItems);
     }
 
-    private void RecoverNtfsCandidates(IReadOnlyList<RecoveryCandidate> candidates)
+    private async Task RecoverNtfsCandidatesAsync(IReadOnlyList<RecoveryCandidate> candidates)
     {
         using var dialog = new FolderBrowserDialog
         {
@@ -492,35 +492,41 @@ public partial class Form1 : Form
             return;
         }
 
+        var destinationDirectory = dialog.SelectedPath;
         SetBusy(true, "Recovering selected deleted-file data to the chosen destination...");
-
-        var failures = new List<string>();
-        var successes = new List<RecoveryResult>();
 
         try
         {
-            foreach (var candidate in candidates)
+            var result = await Task.Run(() =>
             {
-                try
-                {
-                    successes.Add(_ntfsRecoveryService.Recover(
-                        candidate,
-                        dialog.SelectedPath));
-                }
-                catch (Exception ex)
-                {
-                    failures.Add($"{candidate.Name}: {ex.Message}");
-                }
-            }
+                var failures = new List<string>();
+                var successes = new List<RecoveryResult>();
 
-            if (failures.Count > 0)
+                foreach (var candidate in candidates)
+                {
+                    try
+                    {
+                        successes.Add(_ntfsRecoveryService.Recover(
+                            candidate,
+                            destinationDirectory));
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add($"{candidate.Name}: {ex.Message}");
+                    }
+                }
+
+                return (successes, failures);
+            });
+
+            if (result.failures.Count > 0)
             {
-                var message = $"Recovered: {successes.Count:N0}" +
+                var message = $"Recovered: {result.successes.Count:N0}" +
                               Environment.NewLine +
-                              $"Failed: {failures.Count:N0}" +
+                              $"Failed: {result.failures.Count:N0}" +
                               Environment.NewLine +
                               Environment.NewLine +
-                              string.Join(Environment.NewLine, failures.Take(8));
+                              string.Join(Environment.NewLine, result.failures.Take(8));
 
                 MessageBox.Show(
                     this,
@@ -533,15 +539,15 @@ public partial class Form1 : Form
             {
                 MessageBox.Show(
                     this,
-                    $"Recovered {successes.Count:N0} item(s) to:{Environment.NewLine}{dialog.SelectedPath}",
+                    $"Recovered {result.successes.Count:N0} item(s) to:{Environment.NewLine}{destinationDirectory}",
                     "NTFS Recovery Results",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
             }
 
-            lblStatus.Text = failures.Count == 0
-                ? $"Recovered {successes.Count:N0} NTFS item(s) to the selected destination."
-                : $"Recovered {successes.Count:N0} NTFS item(s); {failures.Count:N0} item(s) failed.";
+            lblStatus.Text = result.failures.Count == 0
+                ? $"Recovered {result.successes.Count:N0} NTFS item(s) to the selected destination."
+                : $"Recovered {result.successes.Count:N0} NTFS item(s); {result.failures.Count:N0} item(s) failed.";
         }
         finally
         {
@@ -550,7 +556,7 @@ public partial class Form1 : Form
         }
     }
 
-    private void RestoreRecycleBinItems(IReadOnlyList<RecoveryItem> items)
+    private async Task RestoreRecycleBinItemsAsync(IReadOnlyList<RecoveryItem> items)
     {
         var answer = MessageBox.Show(
             this,
@@ -566,21 +572,26 @@ public partial class Form1 : Form
 
         SetBusy(true, "Restoring selected items...");
 
-        var failures = new List<string>();
-
         try
         {
-            foreach (var item in items)
+            var failures = await Task.Run(() =>
             {
-                try
+                var restoreFailures = new List<string>();
+
+                foreach (var item in items)
                 {
-                    _recycleBinService.Restore(item);
+                    try
+                    {
+                        _recycleBinService.Restore(item);
+                    }
+                    catch (Exception ex)
+                    {
+                        restoreFailures.Add($"{item.Name}: {ex.Message}");
+                    }
                 }
-                catch (Exception ex)
-                {
-                    failures.Add($"{item.Name}: {ex.Message}");
-                }
-            }
+
+                return restoreFailures;
+            });
 
             if (failures.Count == 0)
             {
