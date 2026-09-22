@@ -364,14 +364,6 @@ public sealed class UsnJournalMonitor : IDisposable
             journal.FirstUsn,
             journal.NextUsn - 8L * 1024L * 1024L);
 
-        if (_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) &&
-            cursor.JournalId == journal.JournalId &&
-            cursor.NextUsn >= journal.FirstUsn &&
-            cursor.NextUsn < journal.NextUsn)
-        {
-            searchStart = Math.Max(searchStart, cursor.NextUsn);
-        }
-
         var nextUsn = searchStart;
         var iterations = 0;
 
