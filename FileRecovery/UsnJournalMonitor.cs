@@ -33,6 +33,9 @@ public sealed class UsnJournalMonitor : IDisposable
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _accessDeniedUntilUtc =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<RecentDeletedRecord> _recentDeletedRecords = new();
+
+    private const int RecentDeletedRecordLimit = 512;
 
     private Task? _worker;
     private bool _started;
@@ -251,6 +254,22 @@ public sealed class UsnJournalMonitor : IDisposable
 
                 var recordPath = Path.Combine(directory, record.FileName);
 
+                _recentDeletedRecords.Enqueue(
+                    new RecentDeletedRecord(
+                        record.FileReferenceNumber,
+                        record.ParentFileReferenceNumber,
+                        record.FileName,
+                        string.IsNullOrWhiteSpace(directory) ||
+                        directory.Equals("(Parent directory unavailable)", StringComparison.OrdinalIgnoreCase)
+                            ? null
+                            : directory,
+                        record.TimestampUtc));
+
+                while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+                       _recentDeletedRecords.TryDequeue(out _))
+                {
+                }
+
                 var deletion = new DeletionRecord
                 {
                     FileReferenceNumber = record.FileReferenceNumber,
@@ -330,6 +349,43 @@ public sealed class UsnJournalMonitor : IDisposable
         fileReferenceNumber = 0;
         parentFileReferenceNumber = 0;
 
+        var normalizedTarget = NormalizePath(fullPath);
+
+        // Prefer records already observed by the background USN monitor. This
+        // avoids a race with FileSystemWatcher and avoids another native journal
+        // read when the record is already available.
+        var cached = _recentDeletedRecords
+            .ToArray()
+            .OrderByDescending(item => Math.Abs((item.TimestampUtc - deletedAtUtc).TotalMilliseconds))
+            .FirstOrDefault(item =>
+            {
+                if (deletedAtUtc != default &&
+                    Math.Abs((item.TimestampUtc - deletedAtUtc).TotalMinutes) > 5)
+                {
+                    return false;
+                }
+
+                var candidatePath = item.DirectoryPath is null
+                    ? string.Empty
+                    : NormalizePath(Path.Combine(item.DirectoryPath, item.FileName));
+
+                return string.Equals(
+                    candidatePath,
+                    normalizedTarget,
+                    StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(
+                        item.FileName,
+                        Path.GetFileName(normalizedTarget),
+                        StringComparison.OrdinalIgnoreCase);
+            });
+
+        if (cached is not null)
+        {
+            fileReferenceNumber = cached.FileReferenceNumber;
+            parentFileReferenceNumber = cached.ParentFileReferenceNumber;
+            return true;
+        }
+
         if (!IsAdministrator())
         {
             return false;
@@ -364,8 +420,6 @@ public sealed class UsnJournalMonitor : IDisposable
         {
             return false;
         }
-
-        var normalizedTarget = NormalizePath(fullPath);
 
         // StartUsn must be an actual USN from the journal; USNs are sequence
         // numbers, not byte offsets. Prefer the monitor's last valid cursor;
@@ -694,6 +748,13 @@ public sealed class UsnJournalMonitor : IDisposable
         long FirstUsn,
         long NextUsn,
         long LowestValidUsn);
+
+    private readonly record struct RecentDeletedRecord(
+        ulong FileReferenceNumber,
+        ulong ParentFileReferenceNumber,
+        string FileName,
+        string? DirectoryPath,
+        DateTime TimestampUtc);
 
     private readonly record struct UsnRecord(
         ulong FileReferenceNumber,
