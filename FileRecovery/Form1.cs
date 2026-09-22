@@ -443,6 +443,38 @@ public partial class Form1 : Form
             : Path.GetPathRoot(firstDirectory);
     }
 
+    private void btnSkipRecycleBin_Click(object? sender, EventArgs e)
+    {
+        var rows = dgvResults.SelectedRows
+            .Cast<DataGridViewRow>()
+            .Select(row => row.DataBoundItem as RecoveryDisplayRow)
+            .Where(row => row is not null)
+            .Cast<RecoveryDisplayRow>()
+            .ToList();
+
+        if (rows.Count == 0)
+        {
+            return;
+        }
+
+        var historyRows = rows
+            .Where(row => row.HistoryId.HasValue)
+            .ToList();
+
+        if (historyRows.Count != rows.Count)
+        {
+            MessageBox.Show(
+                this,
+                "Skip Recycle Bin is available for deletion history rows only.",
+                "Recovery Selection",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        _ = RestoreHistoryRowsAsync(historyRows, skipRecycleBin: true);
+    }
+
     private async void btnRecover_Click(object? sender, EventArgs e)
     {
         var rows = dgvResults.SelectedRows
@@ -513,7 +545,9 @@ public partial class Form1 : Form
         }
     }
 
-    private async Task RestoreHistoryRowsAsync(IReadOnlyList<RecoveryDisplayRow> rows)
+    private async Task RestoreHistoryRowsAsync(
+        IReadOnlyList<RecoveryDisplayRow> rows,
+        bool skipRecycleBin = false)
     {
         try
         {
@@ -549,62 +583,75 @@ public partial class Form1 : Form
                 return;
             }
 
-            // First try the normal Windows Recycle Bin path. This covers ordinary
-            // Delete operations where the item was sent to the Recycle Bin.
-            SetBusy(true, "Checking the Windows Recycle Bin for the selected deleted file...");
+            Dictionary<Guid, RecoveryItem> recycleResolution = [];
+            List<DeletionRecord> missingRecords;
 
-            var recycleResolutionTask = RunInStaAsync(() =>
+            if (skipRecycleBin)
             {
-                var availableItems = _recycleBinService.Scan();
-                var matches = new Dictionary<Guid, RecoveryItem>();
+                SetBusy(
+                    true,
+                    "Skipping the Windows Recycle Bin and going directly to NTFS recovery...");
 
-                foreach (var record in historyRecords)
+                missingRecords = historyRecords;
+            }
+            else
+            {
+                // First try the normal Windows Recycle Bin path. This covers ordinary
+                // Delete operations where the item was sent to the Recycle Bin.
+                SetBusy(
+                    true,
+                    "Checking the Windows Recycle Bin for the selected deleted file...");
+
+                var recycleResolutionTask = RunInStaAsync(() =>
                 {
-                    var expectedFullPath = NormalizePath(record.FullPath);
+                    var availableItems = _recycleBinService.Scan();
+                    var matches = new Dictionary<Guid, RecoveryItem>();
 
-                    var match = availableItems.FirstOrDefault(item =>
-                        string.Equals(
-                            NormalizePath(Path.Combine(item.OriginalLocation, item.Name)),
-                            expectedFullPath,
-                            StringComparison.OrdinalIgnoreCase));
-
-                    if (match is not null)
+                    foreach (var record in historyRecords)
                     {
-                        matches[record.Id] = match;
+                        var expectedFullPath = NormalizePath(record.FullPath);
+
+                        var match = availableItems.FirstOrDefault(item =>
+                            string.Equals(
+                                NormalizePath(Path.Combine(item.OriginalLocation, item.Name)),
+                                expectedFullPath,
+                                StringComparison.OrdinalIgnoreCase));
+
+                        if (match is not null)
+                        {
+                            matches[record.Id] = match;
+                        }
                     }
+
+                    return matches;
+                });
+
+                // Shell automation must never hold Recover Selected indefinitely.
+                // Keep the timeout decision off the WinForms synchronization context.
+                var recycleOutcome = await ResolveRecycleBinMatchesWithTimeoutAsync(
+                    recycleResolutionTask);
+
+                recycleResolution = recycleOutcome.Matches;
+
+                if (recycleOutcome.TimedOut)
+                {
+                    lblStatus.Text =
+                        "Recycle Bin lookup timed out after 15 seconds; continuing with NTFS recovery.";
+                }
+                else if (recycleOutcome.Error is not null)
+                {
+                    lblStatus.Text =
+                        $"Recycle Bin lookup failed ({recycleOutcome.Error.GetType().Name}); continuing with NTFS recovery.";
                 }
 
-                return matches;
-            });
-
-            // Shell automation must never hold Recover Selected indefinitely. A Shift+Delete
-            // item is not in the Recycle Bin, so after a bounded lookup we continue with NTFS.
-            // Keep the timeout decision off the WinForms synchronization context.
-            // Shell automation may become slow or unresponsive; the timeout must
-            // still fire even when the UI thread is busy processing messages.
-            var recycleOutcome = await ResolveRecycleBinMatchesWithTimeoutAsync(
-                recycleResolutionTask);
-
-            var recycleResolution = recycleOutcome.Matches;
-
-            if (recycleOutcome.TimedOut)
-            {
-                lblStatus.Text =
-                    "Recycle Bin lookup timed out after 15 seconds; continuing with NTFS recovery.";
-            }
-            else if (recycleOutcome.Error is not null)
-            {
-                lblStatus.Text =
-                    $"Recycle Bin lookup failed ({recycleOutcome.Error.GetType().Name}); continuing with NTFS recovery.";
+                missingRecords = historyRecords
+                    .Where(record => !recycleResolution.ContainsKey(record.Id))
+                    .ToList();
             }
 
             var recycleItems = historyRecords
                 .Where(record => recycleResolution.ContainsKey(record.Id))
                 .Select(record => recycleResolution[record.Id])
-                .ToList();
-
-            var missingRecords = historyRecords
-                .Where(record => !recycleResolution.ContainsKey(record.Id))
                 .ToList();
 
             if (missingRecords.Count == 0)
@@ -1103,10 +1150,15 @@ public partial class Form1 : Form
 
         var hasCandidates = rows.Any(row => row.RecoveryCandidate is not null);
         var hasRecycleItems = rows.Any(row => row.RecoverableItem is not null);
+        var allHistoryRows = rows.Count > 0 &&
+                             rows.All(row => row.HistoryId.HasValue);
 
         btnRecover.Enabled = !_operationInProgress
             && rows.Count > 0
             && !(hasCandidates && hasRecycleItems);
+
+        btnSkipRecycleBin.Enabled = !_operationInProgress
+            && allHistoryRows;
     }
 
     private void SetBusy(bool busy, string? status = null)
@@ -1114,6 +1166,13 @@ public partial class Form1 : Form
         _operationInProgress = busy;
 
         lstDirectories.Enabled = !busy;
+        btnSkipRecycleBin.Enabled = !busy && dgvResults.SelectedRows.Count > 0 &&
+                                    dgvResults.SelectedRows
+                                        .Cast<DataGridViewRow>()
+                                        .Select(row => row.DataBoundItem as RecoveryDisplayRow)
+                                        .Where(row => row is not null)
+                                        .Cast<RecoveryDisplayRow>()
+                                        .All(row => row.HistoryId.HasValue);
         btnScanDirectory.Enabled = !busy;
         btnShowHistory.Enabled = !busy;
         btnClearHistory.Enabled = !busy;
