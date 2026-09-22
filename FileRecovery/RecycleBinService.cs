@@ -21,7 +21,10 @@ public sealed class RecycleBinService
             throw new InvalidOperationException("The Windows Recycle Bin could not be opened.");
         }
 
-        var columns = ReadColumnIndexes(folder);
+        // Keep the tuple statically typed. Passing the dynamic folder directly would
+        // make this method call dynamic and turn the ValueTuple result into dynamic,
+        // causing columns.OriginalLocation to fail at runtime.
+        var columns = ReadColumnIndexes((object)folder);
         var results = new List<RecoveryItem>();
         dynamic items = folder.Items();
 
@@ -88,8 +91,9 @@ public sealed class RecycleBinService
         throw new InvalidOperationException("Windows did not expose a Restore command for this Recycle Bin item.");
     }
 
-    private static (int OriginalLocation, int DeletedDate, int Size) ReadColumnIndexes(dynamic folder)
+    private static (int OriginalLocation, int DeletedDate, int Size) ReadColumnIndexes(object folderObject)
     {
+        dynamic folder = folderObject;
         int originalLocation = -1;
         int deletedDate = -1;
         int size = -1;
