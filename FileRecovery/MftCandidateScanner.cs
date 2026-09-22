@@ -123,7 +123,6 @@ public sealed class MftCandidateScanner
                             parentReference) ?? string.Empty;
 
                         var data = dataReader.ReadDefaultDataStream(
-                            volumeHandle,
                             volumeInfo,
                             fileReference);
 
