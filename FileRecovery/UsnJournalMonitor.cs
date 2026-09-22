@@ -298,7 +298,9 @@ public sealed class UsnJournalMonitor : IDisposable
                 return false;
             }
 
-            throw new Win32Exception(error);
+            throw new Win32Exception(
+                error,
+                $"FSCTL_READ_USN_JOURNAL failed (error {error}) at USN {startUsn} for journal {journalId}.");
         }
 
         if (bytesReturned < 60)
@@ -448,8 +450,11 @@ public sealed class UsnJournalMonitor : IDisposable
             StartUsn = startUsn,
             ReasonMask = UsnReasonFileDelete,
             ReturnOnlyOnClose = 0,
-            Timeout = 1,
-            BytesToWaitFor = 1,
+            // This is a bounded historical lookup, not a live wait for new
+            // journal entries. BytesToWaitFor must therefore be zero so the
+            // operation returns when it reaches the current end of the journal.
+            Timeout = 0,
+            BytesToWaitFor = 0,
             UsnJournalId = journalId,
             MinMajorVersion = 2,
             MaxMajorVersion = 2
