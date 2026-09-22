@@ -102,6 +102,32 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         try
         {
+            // FileSystemWatcher can report a deletion before the USN monitor's polling
+            // pass sees it. Resolve the recent USN record here before persisting the
+            // history row so direct NTFS recovery does not depend on that race.
+            if (!e.Historical &&
+                !e.Record.FileReferenceNumber.HasValue &&
+                !string.IsNullOrWhiteSpace(e.Record.FullPath))
+            {
+                var resolved = await Task.Run(() =>
+                {
+                    if (!_usnMonitor.TryResolveRecentDeletedFile(
+                            e.Record.FullPath,
+                            e.Record.DeletedAtUtc,
+                            out var fileReferenceNumber,
+                            out var parentFileReferenceNumber))
+                    {
+                        return false;
+                    }
+
+                    e.Record.FileReferenceNumber = fileReferenceNumber;
+                    e.Record.ParentFileReferenceNumber = parentFileReferenceNumber;
+                    return true;
+                });
+
+                _ = resolved;
+            }
+
             // Keep JSON serialization and file replacement off the WinForms UI thread.
             // DeletionHistoryStore raises Changed after the background update, which
             // queues the Recovery Center refresh through its UI synchronization path.
