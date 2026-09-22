@@ -449,19 +449,19 @@ public sealed class UsnJournalMonitor : IDisposable
         long startUsn,
         out long nextUsn)
     {
+        // Use the V0 NTFS input layout here. The V1 extension adds
+        // MinMajorVersion/MaxMajorVersion, and Windows can reject the larger
+        // input buffer with ERROR_INVALID_PARAMETER (87) for NTFS journals.
         var request = new ReadUsnJournalRequest
         {
             StartUsn = startUsn,
             ReasonMask = UsnReasonFileDelete,
             ReturnOnlyOnClose = 0,
             // This is a bounded historical lookup, not a live wait for new
-            // journal entries. BytesToWaitFor must therefore be zero so the
-            // operation returns when it reaches the current end of the journal.
+            // journal entries. BytesToWaitFor = 0 means do not wait for new data.
             Timeout = 0,
             BytesToWaitFor = 0,
-            UsnJournalId = journalId,
-            MinMajorVersion = 2,
-            MaxMajorVersion = 2
+            UsnJournalId = journalId
         };
 
         var input = StructureToBytes(request);
@@ -702,8 +702,6 @@ public sealed class UsnJournalMonitor : IDisposable
         public ulong Timeout;
         public ulong BytesToWaitFor;
         public ulong UsnJournalId;
-        public ushort MinMajorVersion;
-        public ushort MaxMajorVersion;
     }
 
     [StructLayout(LayoutKind.Explicit, Size = 24)]
