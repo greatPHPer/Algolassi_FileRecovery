@@ -54,7 +54,7 @@ public sealed class MftCandidateScanner
         return ScanInternal(rootPath, normalizedTargets, cancellationToken, maxPages);
     }
 
-    public IReadOnlyList<RecoveryCandidate> ScanRawMftForPaths(
+    public async Task<IReadOnlyList<RecoveryCandidate>> ScanRawMftForPathsAsync(
         string rootPath,
         IReadOnlyCollection<string> targetPaths,
         CancellationToken cancellationToken = default,
@@ -97,8 +97,18 @@ public sealed class MftCandidateScanner
         var fullRoot = Path.GetFullPath(root);
         var volumeInfo = new NtfsVolumeInspector().Inspect(fullRoot);
         using var volumeHandle = CreateVolumeHandle(fullRoot);
-        using var mftScanHandle = NtfsMftDataReader.OpenMftHandle(fullRoot);
+        using var mftScanHandle = NtfsMftDataReader.OpenMftHandle(
+            fullRoot,
+            asynchronous: true);
         using var mftDataHandle = NtfsMftDataReader.OpenMftHandle(fullRoot);
+
+        const int bufferSize = 4 * 1024 * 1024;
+        using var mftStream = new FileStream(
+            mftScanHandle,
+            FileAccess.Read,
+            bufferSize,
+            isAsync: true);
+
         var dataReader = new NtfsMftDataReader();
         var bitmapReader = new NtfsVolumeBitmapReader();
 
@@ -121,16 +131,17 @@ public sealed class MftCandidateScanner
             volumeInfo.MftValidDataLength,
             maxBytesToScan);
 
-        var bufferSize = 4 * 1024 * 1024;
-        bufferSize -= bufferSize % recordSize;
-        bufferSize = Math.Max(recordSize, bufferSize);
+        var scanBufferSize = bufferSize - bufferSize % recordSize;
+        scanBufferSize = Math.Max(recordSize, scanBufferSize);
+        var buffer = new byte[scanBufferSize];
+        var record = new byte[recordSize];
 
-        var buffer = new byte[bufferSize];
         long scanned = 0;
 
-        while (scanned < bytesToScan &&
-               !cancellationToken.IsCancellationRequested)
+        while (scanned < bytesToScan)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             var remaining = bytesToScan - scanned;
             var requestBytes = (int)Math.Min(buffer.Length, remaining);
             requestBytes -= requestBytes % recordSize;
@@ -140,30 +151,30 @@ public sealed class MftCandidateScanner
                 break;
             }
 
-            if (!ReadFile(
-                    mftScanHandle,
-                    buffer,
-                    (uint)requestBytes,
-                    out var bytesRead,
-                    IntPtr.Zero))
-            {
-                throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    $"Could not read the NTFS MFT while scanning {fullRoot}.");
-            }
+            var bytesRead = await mftStream.ReadAsync(
+                buffer.AsMemory(0, requestBytes),
+                cancellationToken);
 
-            if (bytesRead == 0)
+            if (bytesRead <= 0)
             {
                 break;
             }
 
-            var usableBytes = (int)bytesRead - ((int)bytesRead % recordSize);
+            var usableBytes = bytesRead - bytesRead % recordSize;
+
             for (var offset = 0; offset < usableBytes; offset += recordSize)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var record = new byte[recordSize];
-                Buffer.BlockCopy(buffer, offset, record, 0, recordSize);
+                // Reuse one record buffer. The previous implementation allocated
+                // a new array for every FILE record, which made large MFT scans
+                // dramatically slower and much more allocation-heavy.
+                Buffer.BlockCopy(
+                    buffer,
+                    offset,
+                    record,
+                    0,
+                    recordSize);
 
                 if (!TryParseDeletedFileNameEntries(
                         record,
@@ -269,7 +280,7 @@ public sealed class MftCandidateScanner
 
             scanned += usableBytes;
 
-            if (bytesRead < (uint)requestBytes)
+            if (bytesRead < requestBytes)
             {
                 break;
             }
