@@ -114,9 +114,7 @@ public sealed class NtfsMftDataReader
             dataAttributes.AddRange(extensionData);
         }
 
-        return BuildDataStream(
-            dataAttributes,
-            dataAttributes.Select(x => x.SourceSegmentCount).DefaultIfEmpty(1).Max());
+        return BuildDataStream(dataAttributes, Math.Max(1, dataAttributes.Count));
     }
 
     private static List<DataAttributeDescriptor> FindUnnamedDataAttributes(
@@ -453,7 +451,6 @@ public sealed class NtfsMftDataReader
         public long ValidDataLengthBytes { get; init; }
         public byte[]? ResidentData { get; init; }
         public IReadOnlyList<NtfsDataExtent> Extents { get; init; } = [];
-        public int SourceSegmentCount { get; init; } = 1;
     }
 
     private sealed class AttributeListDescriptor
