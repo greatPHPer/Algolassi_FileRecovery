@@ -654,10 +654,7 @@ public partial class Form1 : Form
                         foreach (var record in directRecords)
                         {
                             var match = directCandidates.FirstOrDefault(candidate =>
-                                string.Equals(
-                                    NormalizePath(candidate.FullPath),
-                                    NormalizePath(record.FullPath),
-                                    StringComparison.OrdinalIgnoreCase));
+                                candidate.FileReferenceNumber == record.FileReferenceNumber!.Value);
 
                             if (match is not null)
                             {
