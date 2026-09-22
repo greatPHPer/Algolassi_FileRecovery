@@ -21,6 +21,7 @@ partial class Form1
     private DataGridViewTextBoxColumn colStrength = null!;
     private DataGridViewTextBoxColumn colEvidence = null!;
     private Button btnRecover = null!;
+    private Button btnSkipRecycleBin = null!;
     private Label lblStatus = null!;
 
     protected override void Dispose(bool disposing)
@@ -52,6 +53,7 @@ partial class Form1
         colStrength = new DataGridViewTextBoxColumn();
         colEvidence = new DataGridViewTextBoxColumn();
         btnRecover = new Button();
+        btnSkipRecycleBin = new Button();
         lblStatus = new Label();
 
         ((System.ComponentModel.ISupportInitialize)dgvResults).BeginInit();
@@ -158,6 +160,14 @@ partial class Form1
         colEvidence.MinimumWidth = 220;
         colEvidence.FillWeight = 30F;
 
+        btnSkipRecycleBin.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+        btnSkipRecycleBin.Enabled = false;
+        btnSkipRecycleBin.Location = new Point(664, 582);
+        btnSkipRecycleBin.Size = new Size(174, 36);
+        btnSkipRecycleBin.Text = "Skip Recycle Bin";
+        btnSkipRecycleBin.UseVisualStyleBackColor = true;
+        btnSkipRecycleBin.Click += btnSkipRecycleBin_Click;
+
         btnRecover.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         btnRecover.Enabled = false;
         btnRecover.Location = new Point(846, 582);
@@ -170,13 +180,14 @@ partial class Form1
         lblStatus.AutoEllipsis = true;
         lblStatus.ForeColor = Color.DimGray;
         lblStatus.Location = new Point(24, 589);
-        lblStatus.Size = new Size(805, 24);
+        lblStatus.Size = new Size(632, 24);
         lblStatus.Text = "Monitoring status: starting...";
 
         AutoScaleDimensions = new SizeF(7F, 15F);
         AutoScaleMode = AutoScaleMode.Font;
         ClientSize = new Size(1030, 635);
         Controls.Add(lblStatus);
+        Controls.Add(btnSkipRecycleBin);
         Controls.Add(btnRecover);
         Controls.Add(dgvResults);
         Controls.Add(lblFiles);
