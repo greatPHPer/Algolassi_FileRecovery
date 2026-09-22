@@ -4,7 +4,7 @@ Windows file-recovery utility written in C# / .NET 9 WinForms.
 
 ## Current branch
 
-`1.0-nonresident-attribute-list`
+`1.1-ntfs-parser-tests`
 
 ## Background monitor
 
@@ -104,7 +104,8 @@ FileRecovery\bin\Release\net9.0-windows\win-x64\publish\
 9. MFT extent correctness
 10. Multi-record `$DATA` via `$ATTRIBUTE_LIST`
 11. Nonresident `$ATTRIBUTE_LIST` reconstruction
-12. Deep file-signature scanning
+12. NTFS parser regression tests
+13. Deep file-signature scanning
 10. Preview and recover-to-another-drive workflow
 11. Code signing and public release packaging
 

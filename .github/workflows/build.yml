@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: ["master", "0.1-recovery-foundation", "0.2-background-monitor", "0.3-recovery-engine-foundation", "0.4-ntfs-volume-inspection", "0.5-ntfs-data-run-analysis", "0.6-ntfs-cluster-safety", "0.7-byte-recovery-foundation", "0.8-mft-extent-correctness", "0.9-attribute-list-data-extents", "1.0-nonresident-attribute-list"]
+    branches: ["master", "0.1-recovery-foundation", "0.2-background-monitor", "0.3-recovery-engine-foundation", "0.4-ntfs-volume-inspection", "0.5-ntfs-data-run-analysis", "0.6-ntfs-cluster-safety", "0.7-byte-recovery-foundation", "0.8-mft-extent-correctness", "0.9-attribute-list-data-extents", "1.0-nonresident-attribute-list", "1.1-ntfs-parser-tests"]
   pull_request:
     branches: ["master"]
 
@@ -19,10 +19,14 @@ jobs:
           dotnet-version: 9.0.x
 
       - name: Restore
-        run: dotnet restore FileRecovery/FileRecovery.csproj
+        run: |
+          dotnet restore FileRecovery.sln
+          dotnet restore FileRecovery.Tests/FileRecovery.Tests.csproj
 
       - name: Build
         run: dotnet build FileRecovery/FileRecovery.csproj -c Release --no-restore
 
+      - name: Test NTFS parsers
+        run: dotnet test FileRecovery.Tests/FileRecovery.Tests.csproj -c Release --no-restore
       - name: Publish standalone win-x64
         run: dotnet publish FileRecovery/FileRecovery.csproj -c Release -r win-x64 --self-contained true --no-restore

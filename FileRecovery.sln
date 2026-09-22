@@ -5,6 +5,8 @@ VisualStudioVersion = 17.14.37027.9 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FileRecovery", "FileRecovery\FileRecovery.csproj", "{5CCEADE4-8889-4A6C-AB64-2F07878E49EE}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FileRecovery.Tests", "FileRecovery.Tests\\FileRecovery.Tests.csproj", "{46495913-1BA8-4D6A-9BFA-EB076D631BEA}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -15,6 +17,10 @@ Global
 		{5CCEADE4-8889-4A6C-AB64-2F07878E49EE}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{5CCEADE4-8889-4A6C-AB64-2F07878E49EE}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{5CCEADE4-8889-4A6C-AB64-2F07878E49EE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{46495913-1BA8-4D6A-9BFA-EB076D631BEA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{46495913-1BA8-4D6A-9BFA-EB076D631BEA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{46495913-1BA8-4D6A-9BFA-EB076D631BEA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{46495913-1BA8-4D6A-9BFA-EB076D631BEA}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
