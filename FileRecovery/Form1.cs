@@ -613,6 +613,14 @@ public partial class Form1 : Form
                                 "The selected Recycle Bin item is no longer available.");
                         }
 
+                        var destinationPath = GetRecycleBinRestorePath(match);
+                        if (File.Exists(destinationPath) || Directory.Exists(destinationPath))
+                        {
+                            throw new InvalidOperationException(
+                                $"Cannot restore because the original destination already exists:{Environment.NewLine}{destinationPath}{Environment.NewLine}{Environment.NewLine}" +
+                                "Rename or move the existing item first, then try Recover Selected again.");
+                        }
+
                         _recycleBinService.Restore(match);
                     }
                     catch (Exception ex)
@@ -653,6 +661,18 @@ public partial class Form1 : Form
             }
         }
     }
+    private static string GetRecycleBinRestorePath(RecoveryItem item)
+    {
+        if (string.IsNullOrWhiteSpace(item.OriginalLocation) ||
+            item.OriginalLocation.Equals("(Unavailable)", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Windows did not provide the original location for this Recycle Bin item.");
+        }
+
+        return Path.Combine(item.OriginalLocation, item.Name);
+    }
+
     private static Task<T> RunInStaAsync<T>(Func<T> action)
     {
         ArgumentNullException.ThrowIfNull(action);
