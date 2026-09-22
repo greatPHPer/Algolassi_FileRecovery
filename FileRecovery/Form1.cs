@@ -583,7 +583,6 @@ public partial class Form1 : Form
             // Shell automation may become slow or unresponsive; the timeout must
             // still fire even when the UI thread is busy processing messages.
             var recycleResolution = await ResolveRecycleBinMatchesWithTimeoutAsync(
-                historyRecords,
                 recycleResolutionTask);
 
             var recycleItems = historyRecords
@@ -749,7 +748,6 @@ public partial class Form1 : Form
     }
     
     private static async Task<Dictionary<Guid, RecoveryItem>> ResolveRecycleBinMatchesWithTimeoutAsync(
-        IReadOnlyList<DeletionRecord> historyRecords,
         Task<Dictionary<Guid, RecoveryItem>> recycleResolutionTask)
     {
         var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
