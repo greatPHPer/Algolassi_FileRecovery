@@ -579,19 +579,12 @@ public partial class Form1 : Form
 
             // Shell automation must never hold Recover Selected indefinitely. A Shift+Delete
             // item is not in the Recycle Bin, so after a bounded lookup we continue with NTFS.
-            var completed = await Task.WhenAny(
-                recycleResolutionTask,
-                Task.Delay(TimeSpan.FromSeconds(5)));
-
-            Dictionary<Guid, RecoveryItem> recycleResolution;
-            if (completed == recycleResolutionTask)
-            {
-                recycleResolution = await recycleResolutionTask;
-            }
-            else
-            {
-                recycleResolution = [];
-            }
+            // Keep the timeout decision off the WinForms synchronization context.
+            // Shell automation may become slow or unresponsive; the timeout must
+            // still fire even when the UI thread is busy processing messages.
+            var recycleResolution = await ResolveRecycleBinMatchesWithTimeoutAsync(
+                historyRecords,
+                recycleResolutionTask);
 
             var recycleItems = historyRecords
                 .Where(record => recycleResolution.ContainsKey(record.Id))
@@ -754,6 +747,35 @@ public partial class Form1 : Form
             }
         }
     }
+    
+    private static async Task<Dictionary<Guid, RecoveryItem>> ResolveRecycleBinMatchesWithTimeoutAsync(
+        IReadOnlyList<DeletionRecord> historyRecords,
+        Task<Dictionary<Guid, RecoveryItem>> recycleResolutionTask)
+    {
+        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5));
+
+        var completed = await Task.WhenAny(
+                recycleResolutionTask,
+                timeoutTask)
+            .ConfigureAwait(false);
+
+        if (completed != recycleResolutionTask)
+        {
+            return [];
+        }
+
+        try
+        {
+            return await recycleResolutionTask.ConfigureAwait(false);
+        }
+        catch
+        {
+            // A failed or unavailable Shell lookup must not block Shift+Delete
+            // recovery. Continue with the NTFS path instead.
+            return [];
+        }
+    }
+
     private async Task RecoverNtfsCandidatesAsync(IReadOnlyList<RecoveryCandidate> candidates)
     {
         using var dialog = new FolderBrowserDialog
