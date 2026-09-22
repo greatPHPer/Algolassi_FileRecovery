@@ -375,7 +375,7 @@ public sealed class UsnJournalMonitor : IDisposable
         if (_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) &&
             cursor.JournalId == journal.JournalId &&
             cursor.NextUsn >= journal.FirstUsn &&
-            cursor.NextUsn < journal.NextUsn)
+            cursor.NextUsn <= journal.NextUsn)
         {
             searchStart = cursor.NextUsn;
         }
