@@ -380,7 +380,8 @@ public sealed class UsnJournalMonitor : IDisposable
                             StringComparison.OrdinalIgnoreCase));
             });
 
-        if (cached is not null)
+        if (cached.FileReferenceNumber != 0 &&
+            cached.ParentFileReferenceNumber != 0)
         {
             fileReferenceNumber = cached.FileReferenceNumber;
             parentFileReferenceNumber = cached.ParentFileReferenceNumber;
