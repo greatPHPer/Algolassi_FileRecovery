@@ -665,11 +665,10 @@ public partial class Form1 : Form
                         }
                     }
 
-                    // Older history records may not have the NTFS file reference
-                    // required for the exact direct lookup above. Use a targeted,
-                    // bounded MFT enumeration as a fallback instead of giving up
-                    // immediately. The scanner checks only the selected file paths and
-                    // stops after a fixed page budget or cancellation.
+                    // Older history records may not have an NTFS file reference.
+                    // Use the raw $MFT fallback instead of FSCTL_ENUM_USN_DATA. This
+                    // scans retained NTFS FILE records directly, so it can also find
+                    // deletions that happened before the USN journal existed.
                     if (legacyRecords.Count > 0)
                     {
                         var targetPaths = legacyRecords
@@ -682,11 +681,11 @@ public partial class Form1 : Form
                             TimeSpan.FromSeconds(20));
 
                         var fallbackCandidates = await Task.Run(
-                            () => _mftCandidateScanner.ScanForPaths(
+                            () => _mftCandidateScanner.ScanRawMftForPaths(
                                 root,
                                 targetPaths,
                                 fallbackCts.Token,
-                                maxPages: 128));
+                                maxBytesToScan: 512L * 1024L * 1024L));
 
                         foreach (var record in legacyRecords)
                         {
