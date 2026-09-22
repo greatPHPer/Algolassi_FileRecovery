@@ -304,7 +304,7 @@ public sealed class UsnJournalMonitor : IDisposable
 
             throw new Win32Exception(
                 error,
-                $"FSCTL_READ_USN_JOURNAL failed (error {error}) at USN {startUsn} for journal {journalId}.");
+                $"FSCTL_QUERY_USN_JOURNAL failed (error {error}).");
         }
 
         if (bytesReturned < 60)
@@ -487,7 +487,9 @@ public sealed class UsnJournalMonitor : IDisposable
                 return [];
             }
 
-            throw new Win32Exception(error);
+            throw new Win32Exception(
+                error,
+                $"FSCTL_READ_USN_JOURNAL failed (error {error}) at USN {startUsn} for journal {journalId}.");
         }
 
         if (bytesReturned < sizeof(long))
