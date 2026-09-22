@@ -804,10 +804,12 @@ public sealed class MftCandidateScanner
 
         if (handle.IsInvalid)
         {
+            var error = Marshal.GetLastWin32Error();
             handle.Dispose();
+
             throw new Win32Exception(
-                Marshal.GetLastWin32Error(),
-                $"Could not open NTFS volume {root}.");
+                error,
+                $"Could not open NTFS volume {root}. Device={volumeName}.");
         }
 
         return handle;
