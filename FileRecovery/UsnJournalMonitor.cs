@@ -401,7 +401,7 @@ public sealed class UsnJournalMonitor : IDisposable
         }
     }
 
-    private static bool TryCreateJournal(
+    private bool TryCreateJournal(
         SafeFileHandle volumeHandle,
         string volumeKey,
         out JournalInfo journal)
