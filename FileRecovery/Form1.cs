@@ -2,6 +2,13 @@ namespace FileRecovery;
 
 public partial class Form1 : Form
 {
+    private sealed record RecoveryItemDescriptor(
+        string Name,
+        string OriginalLocation,
+        string DeletedDate,
+        string Size);
+
+
     private readonly DeletionHistoryStore _history;
     private readonly RecycleBinService _recycleBinService;
     private readonly MftCandidateScanner _mftCandidateScanner = new();
@@ -570,6 +577,17 @@ public partial class Form1 : Form
             return;
         }
 
+        // Keep Shell COM objects on the same worker thread that creates them.
+        // The RecoveryItem instances shown in the grid were created during an
+        // earlier background scan and must not be invoked from another apartment.
+        var selectedItems = items
+            .Select(item => new RecoveryItemDescriptor(
+                item.Name,
+                item.OriginalLocation,
+                item.DeletedDate,
+                item.Size))
+            .ToList();
+
         SetBusy(true, "Restoring selected items...");
 
         try
@@ -577,16 +595,29 @@ public partial class Form1 : Form
             var failures = await Task.Run(() =>
             {
                 var restoreFailures = new List<string>();
+                var availableItems = _recycleBinService.Scan();
 
-                foreach (var item in items)
+                foreach (var selected in selectedItems)
                 {
                     try
                     {
-                        _recycleBinService.Restore(item);
+                        var match = availableItems.FirstOrDefault(item =>
+                            string.Equals(item.Name, selected.Name, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(item.OriginalLocation, selected.OriginalLocation, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(item.DeletedDate, selected.DeletedDate, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(item.Size, selected.Size, StringComparison.OrdinalIgnoreCase));
+
+                        if (match is null)
+                        {
+                            throw new InvalidOperationException(
+                                "The selected Recycle Bin item is no longer available.");
+                        }
+
+                        _recycleBinService.Restore(match);
                     }
                     catch (Exception ex)
                     {
-                        restoreFailures.Add($"{item.Name}: {ex.Message}");
+                        restoreFailures.Add($"{selected.Name}: {ex.Message}");
                     }
                 }
 
@@ -615,10 +646,13 @@ public partial class Form1 : Form
 
         if (!IsDisposed)
         {
-            btnScanDirectory.PerformClick();
+            await Task.Yield();
+            if (!IsDisposed)
+            {
+                btnScanDirectory.PerformClick();
+            }
         }
     }
-
     private void btnClearHistory_Click(object? sender, EventArgs e)
     {
         var answer = MessageBox.Show(
@@ -670,9 +704,9 @@ public partial class Form1 : Form
         btnShowHistory.Enabled = !busy;
         btnClearHistory.Enabled = !busy;
         btnScanNtfs.Enabled = !busy;
-        dgvResults.Enabled = !busy;
+        dgvResults.Enabled = true;
         btnRecover.Enabled = !busy && btnRecover.Enabled;
-        UseWaitCursor = busy;
+        UseWaitCursor = false;
 
         if (!string.IsNullOrWhiteSpace(status))
         {
