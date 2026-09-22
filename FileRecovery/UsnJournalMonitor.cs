@@ -356,7 +356,7 @@ public sealed class UsnJournalMonitor : IDisposable
         // read when the record is already available.
         var cached = _recentDeletedRecords
             .ToArray()
-            .OrderByDescending(item => Math.Abs((item.TimestampUtc - deletedAtUtc).TotalMilliseconds))
+            .OrderBy(item => Math.Abs((item.TimestampUtc - deletedAtUtc).TotalMilliseconds))
             .FirstOrDefault(item =>
             {
                 if (deletedAtUtc != default &&
@@ -373,10 +373,11 @@ public sealed class UsnJournalMonitor : IDisposable
                     candidatePath,
                     normalizedTarget,
                     StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(
-                        item.FileName,
-                        Path.GetFileName(normalizedTarget),
-                        StringComparison.OrdinalIgnoreCase);
+                    || (item.DirectoryPath is null &&
+                        string.Equals(
+                            item.FileName,
+                            Path.GetFileName(normalizedTarget),
+                            StringComparison.OrdinalIgnoreCase));
             });
 
         if (cached is not null)
