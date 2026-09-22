@@ -22,21 +22,27 @@ public sealed class MftCandidateScanner
     public IReadOnlyList<RecoveryCandidate> Scan(
         string rootPath,
         CancellationToken cancellationToken = default) =>
-        ScanInternal(rootPath, targetPaths: null, cancellationToken);
+        ScanInternal(rootPath, targetPaths: null, cancellationToken, maxPages: int.MaxValue);
 
     public IReadOnlyList<RecoveryCandidate> ScanForPaths(
         string rootPath,
         IReadOnlyCollection<string> targetPaths,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int maxPages = 128)
     {
         ArgumentNullException.ThrowIfNull(targetPaths);
+
+        if (maxPages <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxPages));
+        }
 
         var normalizedTargets = targetPaths
             .Where(path => !string.IsNullOrWhiteSpace(path))
             .Select(NormalizePath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        return ScanInternal(rootPath, normalizedTargets, cancellationToken);
+        return ScanInternal(rootPath, normalizedTargets, cancellationToken, maxPages);
     }
 
     public IReadOnlyList<RecoveryCandidate> ScanForFileReferences(
@@ -152,7 +158,8 @@ public sealed class MftCandidateScanner
     private IReadOnlyList<RecoveryCandidate> ScanInternal(
         string rootPath,
         IReadOnlySet<string>? targetPaths,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int maxPages)
     {
         var root = Path.GetPathRoot(rootPath);
         if (string.IsNullOrWhiteSpace(root))
@@ -181,9 +188,13 @@ public sealed class MftCandidateScanner
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         ulong startFileReferenceNumber = 0;
+        var pagesRead = 0;
 
-        while (!cancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested &&
+               pagesRead < maxPages)
         {
+            pagesRead++;
+
             var request = new MftEnumDataV0
             {
                 StartFileReferenceNumber = startFileReferenceNumber,
