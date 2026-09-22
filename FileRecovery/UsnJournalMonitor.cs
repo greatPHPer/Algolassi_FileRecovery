@@ -251,6 +251,8 @@ public sealed class UsnJournalMonitor : IDisposable
 
                 var deletion = new DeletionRecord
                 {
+                    FileReferenceNumber = record.FileReferenceNumber,
+                    ParentFileReferenceNumber = record.ParentFileReferenceNumber,
                     FullPath = recordPath,
                     FileName = record.FileName,
                     DirectoryPath = directory,
