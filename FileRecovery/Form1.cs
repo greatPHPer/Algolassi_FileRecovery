@@ -172,6 +172,16 @@ public partial class Form1 : Form
             .Select(id => id!.Value)
             .ToHashSet();
 
+        Guid? firstVisibleHistoryId = null;
+        var previousFirstVisibleRow = -1;
+
+        if (dgvResults.RowCount > 0 && dgvResults.FirstDisplayedScrollingRowIndex >= 0)
+        {
+            previousFirstVisibleRow = dgvResults.FirstDisplayedScrollingRowIndex;
+            firstVisibleHistoryId =
+                (dgvResults.Rows[previousFirstVisibleRow].DataBoundItem as RecoveryDisplayRow)?.HistoryId;
+        }
+
         var records = _history.GetRecent()
             .Where(record => selectedDirectory is null ||
                              IsDirectoryMatch(record.DirectoryPath, selectedDirectory))
@@ -208,6 +218,38 @@ public partial class Form1 : Form
                             row.Selected = true;
                         }
                     }
+                }
+
+                // Restore the same logical viewport after rebinding. Using the row's
+                // history ID keeps the user's position even when new records are
+                // inserted at the top of the history list.
+                var restoredFirstVisibleRow = -1;
+
+                if (firstVisibleHistoryId.HasValue)
+                {
+                    foreach (DataGridViewRow row in dgvResults.Rows)
+                    {
+                        if (row.DataBoundItem is RecoveryDisplayRow displayRow &&
+                            displayRow.HistoryId == firstVisibleHistoryId.Value)
+                        {
+                            restoredFirstVisibleRow = row.Index;
+                            break;
+                        }
+                    }
+                }
+
+                if (restoredFirstVisibleRow < 0 &&
+                    previousFirstVisibleRow >= 0 &&
+                    dgvResults.RowCount > 0)
+                {
+                    restoredFirstVisibleRow =
+                        Math.Min(previousFirstVisibleRow, dgvResults.RowCount - 1);
+                }
+
+                if (restoredFirstVisibleRow >= 0 &&
+                    restoredFirstVisibleRow < dgvResults.RowCount)
+                {
+                    dgvResults.FirstDisplayedScrollingRowIndex = restoredFirstVisibleRow;
                 }
 
                 lblFiles.Text = $"Deleted files ({records.Count:N0})";
