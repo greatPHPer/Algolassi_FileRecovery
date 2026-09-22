@@ -165,6 +165,12 @@ public partial class Form1 : Form
         }
 
         var selectedDirectory = GetSelectedDirectory();
+        var selectedHistoryIds = dgvResults.SelectedRows
+            .Cast<DataGridViewRow>()
+            .Select(row => (row.DataBoundItem as RecoveryDisplayRow)?.HistoryId)
+            .Where(id => id.HasValue)
+            .Select(id => id!.Value)
+            .ToHashSet();
 
         var records = _history.GetRecent()
             .Where(record => selectedDirectory is null ||
