@@ -67,6 +67,18 @@ public sealed class UsnJournalMonitor : IDisposable
                 return;
             }
 
+            try
+            {
+                WindowsPrivilege.EnableSeBackupPrivilege();
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke(
+                    this,
+                    $"USN monitoring could not enable SeBackupPrivilege: {ex.Message}");
+                return;
+            }
+
             // Arm every NTFS journal before the FileSystemWatcher starts producing
             // deletion records. This closes the startup race where a file could be
             // Shift+Deleted before the background USN worker had established its
