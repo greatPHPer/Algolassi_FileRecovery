@@ -57,8 +57,87 @@ public sealed class UsnJournalMonitor : IDisposable
                 return;
             }
 
+            if (!IsAdministrator())
+            {
+                StatusChanged?.Invoke(
+                    this,
+                    "USN monitoring is disabled because administrator privileges are required. Run AlgoLassi File Recovery as Administrator to enable it.");
+                return;
+            }
+
+            // Arm every NTFS journal before the FileSystemWatcher starts producing
+            // deletion records. This closes the startup race where a file could be
+            // Shift+Deleted before the background USN worker had established its
+            // first cursor, leaving the history row without an NTFS reference.
+            ArmInitialCursors();
+
             _started = true;
             _worker = Task.Run(MonitorAllVolumesAsync);
+        }
+    }
+
+    private void ArmInitialCursors()
+    {
+        foreach (var drive in GetNtfsFixedDrives())
+        {
+            if (_cts.IsCancellationRequested)
+            {
+                return;
+            }
+
+            var volumeKey = drive.RootDirectory.FullName.TrimEnd(Path.DirectorySeparatorChar);
+
+            try
+            {
+                using var volumeHandle = CreateFile(
+                    $@"\\.\\{volumeKey[..2]}",
+                    GenericRead,
+                    FileShareRead | FileShareWrite | FileShareDelete,
+                    IntPtr.Zero,
+                    OpenExisting,
+                    FileFlagBackupSemantics,
+                    IntPtr.Zero);
+
+                if (volumeHandle.IsInvalid)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+
+                if (!TryQueryJournal(volumeHandle, out var journal))
+                {
+                    continue;
+                }
+
+                if (!_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) ||
+                    cursor.JournalId != journal.JournalId ||
+                    cursor.NextUsn <= 0)
+                {
+                    _settings.UsnCursors[volumeKey] = new VolumeJournalCursor
+                    {
+                        JournalId = journal.JournalId,
+                        NextUsn = journal.NextUsn
+                    };
+                    _settings.Save();
+
+                    StatusChanged?.Invoke(
+                        this,
+                        $"USN journal armed for {volumeKey}. New deletions will be tracked.");
+                }
+            }
+            catch (UnauthorizedAccessException)
+            {
+                ReportAccessDenied(volumeKey);
+            }
+            catch (Win32Exception ex) when (ex.NativeErrorCode == 5)
+            {
+                ReportAccessDenied(volumeKey);
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke(
+                    this,
+                    $"USN monitoring warning for {volumeKey}: {ex.Message}");
+            }
         }
     }
 
