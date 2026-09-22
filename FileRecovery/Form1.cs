@@ -290,7 +290,7 @@ public partial class Form1 : Form
 
         try
         {
-            var items = await Task.Run(() => _recycleBinService.Scan());
+            var items = await RunInStaAsync(() => _recycleBinService.Scan());
 
             var filtered = items
                 .Where(item => selectedDirectory is null ||
@@ -592,7 +592,7 @@ public partial class Form1 : Form
 
         try
         {
-            var failures = await Task.Run(() =>
+            var failures = await RunInStaAsync(() =>
             {
                 var restoreFailures = new List<string>();
                 var availableItems = _recycleBinService.Scan();
@@ -653,6 +653,35 @@ public partial class Form1 : Form
             }
         }
     }
+    private static Task<T> RunInStaAsync<T>(Func<T> action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+
+        var completion = new TaskCompletionSource<T>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                completion.SetResult(action());
+            }
+            catch (Exception ex)
+            {
+                completion.SetException(ex);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "AlgoLassi File Recovery - Shell STA"
+        };
+
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+
+        return completion.Task;
+    }
+
     private void btnClearHistory_Click(object? sender, EventArgs e)
     {
         var answer = MessageBox.Show(
