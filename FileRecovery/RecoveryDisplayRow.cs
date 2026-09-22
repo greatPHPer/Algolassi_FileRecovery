@@ -9,4 +9,5 @@ public sealed class RecoveryDisplayRow
     public string Evidence { get; init; } = string.Empty;
 
     internal RecoveryItem? RecoverableItem { get; init; }
+    internal RecoveryCandidate? RecoveryCandidate { get; init; }
 }
