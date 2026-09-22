@@ -19,7 +19,9 @@ public sealed class UsnJournalMonitor : IDisposable
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileReadAttributes = 0x00000080;
-    private const int ErrorJournalEntryDeleted = 1177;
+    private const int ErrorJournalDeleteInProgress = 1178;
+    private const int ErrorJournalNotActive = 1179;
+    private const int ErrorJournalEntryDeleted = 1181;
 
     private const uint UsnReasonFileDelete = 0x00000200;
     private const int UsnRecordV2MinimumLength = 60;
@@ -293,7 +295,9 @@ public sealed class UsnJournalMonitor : IDisposable
                 IntPtr.Zero))
         {
             var error = Marshal.GetLastWin32Error();
-            if (error == 2 || error == 1178)
+            if (error == 2 ||
+                error == ErrorJournalDeleteInProgress ||
+                error == ErrorJournalNotActive)
             {
                 return false;
             }
@@ -476,7 +480,9 @@ public sealed class UsnJournalMonitor : IDisposable
         {
             var error = Marshal.GetLastWin32Error();
 
-            if (error == ErrorJournalEntryDeleted)
+            if (error == ErrorJournalDeleteInProgress ||
+                error == ErrorJournalNotActive ||
+                error == ErrorJournalEntryDeleted)
             {
                 return [];
             }
