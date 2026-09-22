@@ -90,10 +90,12 @@ public sealed class NtfsVolumeInspector
 
         if (handle.IsInvalid)
         {
+            var error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
             handle.Dispose();
+
             throw new Win32Exception(
-                System.Runtime.InteropServices.Marshal.GetLastWin32Error(),
-                $"Could not open NTFS volume {root}.");
+                error,
+                $"Could not open NTFS volume {root}. Device={volumeName}.");
         }
 
         return handle;
