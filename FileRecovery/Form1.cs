@@ -512,7 +512,6 @@ public partial class Form1 : Form
 
     private async Task RestoreHistoryRowsAsync(IReadOnlyList<RecoveryDisplayRow> rows)
     {
-    {
         try
         {
             var selectedIds = rows
