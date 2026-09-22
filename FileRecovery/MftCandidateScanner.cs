@@ -617,7 +617,7 @@ public sealed class MftCandidateScanner
             return false;
         }
 
-        var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
+        var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.Slice(22, 2));
 
         // Only deleted file records: bit 0 (IN_USE) is clear and bit 1
         // (DIRECTORY) is clear.
@@ -627,14 +627,14 @@ public sealed class MftCandidateScanner
         }
 
         var sequenceNumber = BinaryPrimitives.ReadUInt16LittleEndian(
-            record.AsSpan(16, 2));
+            record.Slice(16, 2));
 
         fileReferenceNumber =
             (segmentNumber & 0x0000FFFFFFFFFFFFUL) |
             ((ulong)sequenceNumber << 48);
 
         var firstAttributeOffset = BinaryPrimitives.ReadUInt16LittleEndian(
-            record.AsSpan(20, 2));
+            record.Slice(20, 2));
 
         if (firstAttributeOffset < 24 ||
             firstAttributeOffset >= record.Length)
@@ -648,7 +648,7 @@ public sealed class MftCandidateScanner
         while (offset + 16 <= record.Length)
         {
             var type = BinaryPrimitives.ReadUInt32LittleEndian(
-                record.AsSpan(offset, 4));
+                record.Slice(offset, 4));
 
             if (type == 0xFFFFFFFF)
             {
@@ -656,7 +656,7 @@ public sealed class MftCandidateScanner
             }
 
             var attributeLength = BinaryPrimitives.ReadUInt32LittleEndian(
-                record.AsSpan(offset + 4, 4));
+                record.Slice(offset + 4, 4));
 
             if (attributeLength < 24 ||
                 offset + attributeLength > record.Length)
@@ -670,19 +670,19 @@ public sealed class MftCandidateScanner
             if (type == 0x30 && nonResident == 0 && attributeNameLength == 0)
             {
                 var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
-                    record.AsSpan(offset + 16, 4));
+                    record.Slice(offset + 16, 4));
                 var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
-                    record.AsSpan(offset + 20, 2));
+                    record.Slice(offset + 20, 2));
 
                 if (valueOffset + valueLength <= attributeLength &&
                     valueLength >= 66)
                 {
                     var valueStart = offset + valueOffset;
                     var parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
-                        record.AsSpan(valueStart, 8));
+                        record.Slice(valueStart, 8));
 
                     var timestampFileTime = BinaryPrimitives.ReadInt64LittleEndian(
-                        record.AsSpan(valueStart + 16, 8));
+                        record.Slice(valueStart + 16, 8));
 
                     var nameLength = record[valueStart + 64];
                     var nameByteLength = checked(nameLength * 2);
@@ -691,9 +691,7 @@ public sealed class MftCandidateScanner
                         nameLength > 0)
                     {
                         var name = System.Text.Encoding.Unicode.GetString(
-                            record,
-                            valueStart + 66,
-                            nameByteLength);
+                            record.Slice(valueStart + 66, nameByteLength));
 
                         DateTime timestampUtc;
                         try
