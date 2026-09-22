@@ -95,6 +95,24 @@ public sealed class NtfsByteRecoveryService
         var volumeInfo = new NtfsVolumeInspector().Inspect(sourceRoot);
         using var volumeHandle = CreateVolumeHandle(sourceRoot);
 
+        var currentAllocations = new NtfsVolumeBitmapReader().CheckExtents(
+            volumeHandle,
+            candidate.DataExtents,
+            cancellationToken);
+
+        if (currentAllocations.Count != candidate.DataExtents.Count(x => !x.IsSparse))
+        {
+            throw new InvalidOperationException(
+                "Current NTFS cluster allocation could not be verified for every non-sparse data extent. Recovery is blocked for safety.");
+        }
+
+        var currentlyAllocated = currentAllocations.Sum(x => x.AllocatedClusterCount);
+        if (currentlyAllocated != 0)
+        {
+            throw new InvalidOperationException(
+                $"Recovery is blocked because {currentlyAllocated:N0} former data cluster(s) are currently allocated.");
+        }
+
         long recovered = 0;
 
         try
