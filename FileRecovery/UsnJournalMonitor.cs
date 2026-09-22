@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using Microsoft.Win32.SafeHandles;
 
 namespace FileRecovery;
@@ -27,6 +28,8 @@ public sealed class UsnJournalMonitor : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly object _gate = new();
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<ulong, string>> _parentPathCaches =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTime> _accessDeniedUntilUtc =
         new(StringComparer.OrdinalIgnoreCase);
 
     private Task? _worker;
@@ -81,6 +84,14 @@ public sealed class UsnJournalMonitor : IDisposable
 
     private async Task MonitorAllVolumesAsync()
     {
+        if (!IsAdministrator())
+        {
+            StatusChanged?.Invoke(
+                this,
+                "USN monitoring is disabled because administrator privileges are required. Run AlgoLassi File Recovery as Administrator to enable it.");
+            return;
+        }
+
         while (!_cts.IsCancellationRequested)
         {
             foreach (var drive in GetNtfsFixedDrives())
@@ -90,21 +101,29 @@ public sealed class UsnJournalMonitor : IDisposable
                     break;
                 }
 
+                var volumeKey = drive.RootDirectory.FullName.TrimEnd(Path.DirectorySeparatorChar);
+                if (_accessDeniedUntilUtc.TryGetValue(volumeKey, out var retryAfterUtc) &&
+                    retryAfterUtc > DateTime.UtcNow)
+                {
+                    continue;
+                }
+
                 try
                 {
                     ReadVolume(drive);
+                    _accessDeniedUntilUtc.TryRemove(volumeKey, out _);
                 }
                 catch (UnauthorizedAccessException)
                 {
-                    StatusChanged?.Invoke(this, $"USN monitoring for {drive.RootDirectory.FullName} requires administrator privileges.");
+                    ReportAccessDenied(volumeKey);
                 }
                 catch (Win32Exception ex) when (ex.NativeErrorCode == 5)
                 {
-                    StatusChanged?.Invoke(this, $"USN monitoring for {drive.RootDirectory.FullName} requires administrator privileges.");
+                    ReportAccessDenied(volumeKey);
                 }
                 catch (Exception ex)
                 {
-                    StatusChanged?.Invoke(this, $"USN monitoring warning for {drive.RootDirectory.FullName}: {ex.Message}");
+                    StatusChanged?.Invoke(this, $"USN monitoring warning for {volumeKey}: {ex.Message}");
                 }
             }
 
@@ -117,6 +136,26 @@ public sealed class UsnJournalMonitor : IDisposable
                 return;
             }
         }
+    }
+
+    private void ReportAccessDenied(string volumeKey)
+    {
+        _accessDeniedUntilUtc[volumeKey] = DateTime.UtcNow.AddSeconds(30);
+        StatusChanged?.Invoke(
+            this,
+            $"USN monitoring for {volumeKey} requires administrator privileges. Retrying in 30 seconds.");
+    }
+
+    private static bool IsAdministrator()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        if (identity is null)
+        {
+            return false;
+        }
+
+        var principal = new WindowsPrincipal(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
     private void ReadVolume(DriveInfo drive)
