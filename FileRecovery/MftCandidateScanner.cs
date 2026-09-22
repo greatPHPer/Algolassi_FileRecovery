@@ -15,6 +15,8 @@ public sealed class MftCandidateScanner
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOverlapped = 0x40000000;
+    private const int ErrorIoPending = 997;
+    private const int ErrorOperationAborted = 995;
 
     private const uint UsnReasonFileDelete = 0x00000200;
     private const uint FileAttributeDirectory = 0x00000010;
@@ -149,18 +151,6 @@ public sealed class MftCandidateScanner
                 "The NTFS MFT start offset is not aligned to the volume sector size.");
         }
 
-        using var mftStream = new FileStream(
-            mftScanVolumeHandle,
-            FileAccess.Read,
-            bufferSize,
-            isAsync: true);
-
-        if (mftStream.Seek(mftStartOffset, SeekOrigin.Begin) != mftStartOffset)
-        {
-            throw new IOException(
-                $"Could not seek to the NTFS MFT start on {root}.");
-        }
-
         long scanned = 0;
 
         while (scanned < bytesToScan)
@@ -178,14 +168,21 @@ public sealed class MftCandidateScanner
                 break;
             }
 
-            // The MFT scan uses an overlapped raw-volume handle so the
-            // cancellation token can interrupt a slow device read instead
-            // of leaving RestoreHistoryRowsAsync waiting indefinitely.
             cancellationToken.ThrowIfCancellationRequested();
 
-            var bytesRead = await mftStream.ReadAsync(
-                buffer.AsMemory(0, requestBytes),
-                cancellationToken).ConfigureAwait(false);
+            var readOffset = checked(mftStartOffset + scanned);
+
+            // FileStream's async layer does not handle this raw NTFS volume
+            // handle reliably on Windows. Issue the overlapped volume read
+            // directly so cancellation can call CancelIoEx on the pending I/O.
+            var bytesRead = await Task.Run(
+                () => ReadRawVolumeChunk(
+                    mftScanVolumeHandle,
+                    buffer,
+                    requestBytes,
+                    readOffset,
+                    cancellationToken),
+                CancellationToken.None).ConfigureAwait(false);
 
             if (bytesRead <= 0)
             {
@@ -808,6 +805,118 @@ public sealed class MftCandidateScanner
         return "Current NTFS bitmap did not return usable allocation evidence.";
     }
 
+    private static int ReadRawVolumeChunk(
+        SafeFileHandle volumeHandle,
+        byte[] buffer,
+        int bytesToRead,
+        long fileOffset,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        using var completionEvent = new ManualResetEvent(initialState: false);
+
+        var overlapped = new NativeOverlapped
+        {
+            OffsetLow = unchecked((int)(fileOffset & 0xFFFFFFFF)),
+            OffsetHigh = unchecked((int)(fileOffset >> 32)),
+            HEvent = completionEvent.SafeWaitHandle.DangerousGetHandle()
+        };
+
+        var overlappedPtr = Marshal.AllocHGlobal(
+            Marshal.SizeOf<NativeOverlapped>());
+
+        try
+        {
+            Marshal.StructureToPtr(
+                overlapped,
+                overlappedPtr,
+                fDeleteOld: false);
+
+            var bufferHandle = GCHandle.Alloc(
+                buffer,
+                GCHandleType.Pinned);
+
+            try
+            {
+                using var cancellationRegistration =
+                    cancellationToken.Register(
+                        static state =>
+                        {
+                            var request = (CancelReadState)state!;
+                            _ = CancelIoEx(
+                                request.Handle,
+                                request.Overlapped);
+                        },
+                        new CancelReadState(volumeHandle, overlappedPtr));
+
+                var started = ReadFile(
+                    volumeHandle,
+                    bufferHandle.AddrOfPinnedObject(),
+                    checked((uint)bytesToRead),
+                    IntPtr.Zero,
+                    overlappedPtr);
+
+                if (!started)
+                {
+                    var startError = Marshal.GetLastWin32Error();
+
+                    if (startError != ErrorIoPending)
+                    {
+                        throw new Win32Exception(
+                            startError,
+                            $"Raw NTFS volume read failed at offset {fileOffset:N0}.");
+                    }
+                }
+
+                completionEvent.WaitOne();
+
+                if (!GetOverlappedResult(
+                        volumeHandle,
+                        overlappedPtr,
+                        out var bytesRead,
+                        bWait: false))
+                {
+                    var completionError = Marshal.GetLastWin32Error();
+
+                    if (completionError == ErrorOperationAborted &&
+                        cancellationToken.IsCancellationRequested)
+                    {
+                        throw new OperationCanceledException(cancellationToken);
+                    }
+
+                    throw new Win32Exception(
+                        completionError,
+                        $"Raw NTFS volume read completion failed at offset {fileOffset:N0}.");
+                }
+
+                return checked((int)bytesRead);
+            }
+            finally
+            {
+                bufferHandle.Free();
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(overlappedPtr);
+        }
+    }
+
+    private readonly record struct CancelReadState(
+        SafeFileHandle Handle,
+        IntPtr Overlapped);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeOverlapped
+    {
+        public IntPtr Internal;
+        public IntPtr InternalHigh;
+        public int OffsetLow;
+        public int OffsetHigh;
+        public IntPtr HEvent;
+    }
+
     private static SafeFileHandle CreateVolumeHandle(
         string root,
         bool overlapped = false)
@@ -867,9 +976,21 @@ public sealed class MftCandidateScanner
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool ReadFile(
         SafeFileHandle hFile,
-        byte[] lpBuffer,
+        IntPtr lpBuffer,
         uint nNumberOfBytesToRead,
-        out uint lpNumberOfBytesRead,
+        IntPtr lpNumberOfBytesRead,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetOverlappedResult(
+        SafeFileHandle hFile,
+        IntPtr lpOverlapped,
+        out uint lpNumberOfBytesTransferred,
+        [MarshalAs(UnmanagedType.Bool)] bool bWait);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CancelIoEx(
+        SafeFileHandle hFile,
         IntPtr lpOverlapped);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
