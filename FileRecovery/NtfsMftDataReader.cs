@@ -621,7 +621,7 @@ public sealed class NtfsMftDataReader
             Evidence = evidence
         };
 
-    internal static void ApplyUpdateSequenceFixups(byte[] record, int bytesPerSector)
+    internal static void ApplyUpdateSequenceFixups(Span<byte> record, int bytesPerSector)
     {
         if (bytesPerSector <= 0 || record.Length < 48)
         {
