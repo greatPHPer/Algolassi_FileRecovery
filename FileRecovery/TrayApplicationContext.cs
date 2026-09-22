@@ -58,8 +58,10 @@ public sealed class TrayApplicationContext : ApplicationContext
         _usnMonitor.StatusChanged += OnMonitorStatusChanged;
         _recycleBinMonitor.DeletionDetected += OnDeletionDetected;
         _recycleBinMonitor.StatusChanged += OnMonitorStatusChanged;
-        _monitor.Start();
+        // Arm the USN journals before FileSystemWatcher starts so a very early
+        // Shift+Delete cannot be missed during application startup.
         _usnMonitor.Start();
+        _monitor.Start();
         _recycleBinMonitor.Start();
     }
 
