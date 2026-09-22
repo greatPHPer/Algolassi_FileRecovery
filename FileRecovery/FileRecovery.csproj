@@ -19,4 +19,8 @@
     <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="FileRecovery.Tests" />
+  </ItemGroup>
+
 </Project>
