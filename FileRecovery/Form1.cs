@@ -626,28 +626,85 @@ public partial class Form1 : Form
 
                 try
                 {
-                    var targetPaths = group
-                        .Select(record => NormalizePath(record.FullPath))
-                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    var directRecords = group
+                        .Where(record =>
+                            record.FileReferenceNumber.HasValue &&
+                            record.ParentFileReferenceNumber.HasValue)
+                        .ToList();
 
-                    var candidates = await Task.Run(() =>
-                        _mftCandidateScanner.ScanForPaths(root, targetPaths));
+                    var legacyRecords = group
+                        .Where(record =>
+                            !record.FileReferenceNumber.HasValue ||
+                            !record.ParentFileReferenceNumber.HasValue)
+                        .ToList();
 
-                    foreach (var record in group)
+                    if (directRecords.Count > 0)
                     {
-                        var match = candidates.FirstOrDefault(candidate =>
-                            string.Equals(
-                                NormalizePath(candidate.FullPath),
-                                NormalizePath(record.FullPath),
-                                StringComparison.OrdinalIgnoreCase));
+                        var directTargets = directRecords
+                            .Select(record => (
+                                FullPath: NormalizePath(record.FullPath),
+                                FileReferenceNumber: record.FileReferenceNumber!.Value,
+                                ParentFileReferenceNumber: record.ParentFileReferenceNumber!.Value,
+                                DeletedAtUtc: record.DeletedAtUtc))
+                            .ToList();
 
-                        if (match is not null)
+                        var directCandidates = await Task.Run(() =>
+                            _mftCandidateScanner.ScanForFileReferences(root, directTargets));
+
+                        foreach (var record in directRecords)
                         {
-                            ntfsCandidates.Add(match);
+                            var match = directCandidates.FirstOrDefault(candidate =>
+                                string.Equals(
+                                    NormalizePath(candidate.FullPath),
+                                    NormalizePath(record.FullPath),
+                                    StringComparison.OrdinalIgnoreCase));
+
+                            if (match is not null)
+                            {
+                                ntfsCandidates.Add(match);
+                            }
+                            else
+                            {
+                                unavailable.Add(record);
+                            }
                         }
-                        else
+                    }
+
+                    if (legacyRecords.Count > 0)
+                    {
+                        var targetPaths = legacyRecords
+                            .Select(record => NormalizePath(record.FullPath))
+                            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                        using var legacyScanCts = new CancellationTokenSource(
+                            TimeSpan.FromSeconds(15));
+
+                        SetBusy(
+                            true,
+                            $"Searching legacy NTFS metadata for {legacyRecords.Count:N0} history item(s) (maximum 15 seconds)...");
+
+                        var candidates = await Task.Run(
+                            () => _mftCandidateScanner.ScanForPaths(
+                                root,
+                                targetPaths,
+                                legacyScanCts.Token));
+
+                        foreach (var record in legacyRecords)
                         {
-                            unavailable.Add(record);
+                            var match = candidates.FirstOrDefault(candidate =>
+                                string.Equals(
+                                    NormalizePath(candidate.FullPath),
+                                    NormalizePath(record.FullPath),
+                                    StringComparison.OrdinalIgnoreCase));
+
+                            if (match is not null)
+                            {
+                                ntfsCandidates.Add(match);
+                            }
+                            else
+                            {
+                                unavailable.Add(record);
+                            }
                         }
                     }
                 }
