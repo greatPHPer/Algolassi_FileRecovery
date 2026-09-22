@@ -195,18 +195,9 @@ public sealed class NtfsByteRecoveryService
 
     private static void ValidateExtents(RecoveryCandidate candidate)
     {
-        if (candidate.ExtentAllocations.Count == 0)
-        {
-            throw new InvalidOperationException(
-                "Current NTFS cluster allocation could not be verified. Recovery is blocked for safety.");
-        }
-
-        if (candidate.AllocatedDataClusterCount != 0)
-        {
-            throw new InvalidOperationException(
-                "Recovery is blocked because one or more former data clusters are currently allocated.");
-        }
-
+        // Allocation state is intentionally validated immediately before recovery
+        // against the live NTFS volume bitmap below. Do not require a stale
+        // pre-scan bitmap snapshot on the candidate.
         var expectedVcn = 0L;
         foreach (var extent in candidate.DataExtents)
         {
