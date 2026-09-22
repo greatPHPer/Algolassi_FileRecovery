@@ -18,10 +18,13 @@ public sealed class NtfsMftDataReader
     private const uint NtfsAttributeData = 0x80;
     private const uint NtfsAttributeEnd = 0xFFFFFFFF;
     private const byte NonResidentForm = 1;
+    private const int MaxAttributeListBytes = 16 * 1024 * 1024;
+    private const int RawReadBufferSize = 1024 * 1024;
 
     public NtfsDataStreamInfo ReadDefaultDataStream(
         NtfsVolumeInfo volumeInfo,
         SafeFileHandle mftHandle,
+        SafeFileHandle volumeHandle,
         ulong fileReferenceNumber)
     {
         var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
@@ -57,16 +60,16 @@ public sealed class NtfsMftDataReader
 
         var dataAttributes = FindUnnamedDataAttributes(record, volumeInfo);
 
-        var attributeList = FindAttributeList(record, volumeInfo);
+        var attributeList = FindAttributeList(record, volumeInfo, volumeHandle);
         if (!attributeList.Found)
         {
             return BuildDataStream(dataAttributes, 1);
         }
 
-        if (!attributeList.IsResident)
+        if (!attributeList.IsResident && attributeList.ResidentData is null)
         {
             return NotFound(
-                "The file retains a nonresident $ATTRIBUTE_LIST; this recovery stage requires the attribute list itself to be resident.");
+                "The file retains a nonresident $ATTRIBUTE_LIST that could not be safely reconstructed.");
         }
 
         IReadOnlyList<AttributeListEntry> entries;
@@ -147,7 +150,8 @@ public sealed class NtfsMftDataReader
 
     private static AttributeListDescriptor FindAttributeList(
         byte[] record,
-        NtfsVolumeInfo volumeInfo)
+        NtfsVolumeInfo volumeInfo,
+        SafeFileHandle volumeHandle)
     {
         foreach (var attribute in EnumerateAttributes(record))
         {
@@ -158,7 +162,101 @@ public sealed class NtfsMftDataReader
 
             if (attribute.FormCode == NonResidentForm)
             {
-                return new AttributeListDescriptor { Found = true, IsResident = false };
+                if (attribute.Length < 64)
+                {
+                    throw new InvalidDataException("The nonresident $ATTRIBUTE_LIST attribute is incomplete.");
+                }
+
+                var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(attribute.Offset + 16, 8));
+                var mappingPairsOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(attribute.Offset + 32, 2));
+                var fileSize = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(attribute.Offset + 48, 8));
+                var validDataLength = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(attribute.Offset + 56, 8));
+
+                if (lowestVcn != 0 ||
+                    mappingPairsOffset >= attribute.Length ||
+                    fileSize <= 0 ||
+                    fileSize > MaxAttributeListBytes ||
+                    validDataLength <= 0 ||
+                    validDataLength > fileSize)
+                {
+                    throw new InvalidDataException(
+                        "The nonresident $ATTRIBUTE_LIST geometry is outside the supported safe range.");
+                }
+
+                IReadOnlyList<NtfsDataExtent> extents;
+                try
+                {
+                    extents = NtfsMappingPairsParser.Parse(
+                        record.AsSpan(
+                            attribute.Offset + mappingPairsOffset,
+                            attribute.Length - mappingPairsOffset),
+                        lowestVcn);
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidDataException(
+                        "The nonresident $ATTRIBUTE_LIST mapping pairs could not be parsed.",
+                        ex);
+                }
+
+                var data = new byte[checked((int)validDataLength)];
+                var expectedVcn = 0L;
+                var remaining = data.LongLength;
+                var destinationOffset = 0;
+
+                foreach (var extent in extents)
+                {
+                    if (extent.VirtualClusterNumber != expectedVcn)
+                    {
+                        throw new InvalidDataException(
+                            "The nonresident $ATTRIBUTE_LIST contains a VCN gap or overlap.");
+                    }
+
+                    var extentBytes = checked(extent.ClusterCount * volumeInfo.BytesPerCluster);
+                    var bytesToRead = Math.Min(extentBytes, remaining);
+
+                    if (bytesToRead <= 0)
+                    {
+                        break;
+                    }
+
+                    if (!extent.IsSparse)
+                    {
+                        ReadRawClusters(
+                            volumeHandle,
+                            extent.LogicalClusterNumber,
+                            bytesToRead,
+                            volumeInfo.BytesPerCluster,
+                            data,
+                            destinationOffset);
+                    }
+
+                    destinationOffset = checked(destinationOffset + (int)bytesToRead);
+                    remaining -= bytesToRead;
+                    expectedVcn = checked(expectedVcn + extent.ClusterCount);
+
+                    if (remaining == 0)
+                    {
+                        break;
+                    }
+                }
+
+                if (remaining != 0)
+                {
+                    throw new InvalidDataException(
+                        "The nonresident $ATTRIBUTE_LIST data runs do not cover its valid data length.");
+                }
+
+                return new AttributeListDescriptor
+                {
+                    Found = true,
+                    IsResident = false,
+                    ResidentData = data
+                };
             }
 
             var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
@@ -171,16 +269,16 @@ public sealed class NtfsMftDataReader
                 throw new InvalidDataException("The resident $ATTRIBUTE_LIST value is outside its attribute record.");
             }
 
-            var data = new byte[checked((int)valueLength)];
+            var residentData = new byte[checked((int)valueLength)];
             record.AsSpan(
                 attribute.Offset + valueOffset,
-                checked((int)valueLength)).CopyTo(data);
+                checked((int)valueLength)).CopyTo(residentData);
 
             return new AttributeListDescriptor
             {
                 Found = true,
                 IsResident = true,
-                ResidentData = data
+                ResidentData = residentData
             };
         }
 
@@ -466,6 +564,51 @@ public sealed class NtfsMftDataReader
         public long LowestVcn { get; init; }
         public ulong SegmentReference { get; init; }
         public bool IsUnnamed { get; init; }
+    }
+
+    private static void ReadRawClusters(
+        SafeFileHandle volumeHandle,
+        long logicalClusterNumber,
+        long byteCount,
+        uint bytesPerCluster,
+        byte[] destination,
+        int destinationOffset)
+    {
+        var offset = checked(logicalClusterNumber * (long)bytesPerCluster);
+        var buffer = new byte[Math.Min(RawReadBufferSize, 1024 * 1024)];
+        var remaining = byteCount;
+        var targetOffset = destinationOffset;
+
+        while (remaining > 0)
+        {
+            var chunk = (int)Math.Min(buffer.Length, remaining);
+
+            if (!SetFilePointerEx(volumeHandle, offset, out _, 0))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "Could not seek to a nonresident $ATTRIBUTE_LIST data extent.");
+            }
+
+            if (!ReadFile(
+                    volumeHandle,
+                    buffer,
+                    (uint)chunk,
+                    out var bytesRead,
+                    IntPtr.Zero) ||
+                bytesRead != (uint)chunk)
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "Could not read a nonresident $ATTRIBUTE_LIST data extent.");
+            }
+
+            Buffer.BlockCopy(buffer, 0, destination, targetOffset, chunk);
+
+            offset = checked(offset + chunk);
+            targetOffset = checked(targetOffset + chunk);
+            remaining -= chunk;
+        }
     }
 
     private static byte[]? ReadRecord(
