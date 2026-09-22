@@ -171,6 +171,7 @@ public partial class Form1 : Form
                              IsDirectoryMatch(record.DirectoryPath, selectedDirectory))
             .Select(record => new RecoveryDisplayRow
             {
+                HistoryId = record.Id,
                 Name = record.FileName,
                 DeletedOn = record.DeletedAtUtc.ToLocalTime().ToString("g"),
                 FileSize = record.FileSizeBytes.HasValue
@@ -183,13 +184,26 @@ public partial class Form1 : Form
         _suppressGridSelectionChanged = true;
         try
         {
-            btnRecover.Enabled = false;
-
             SuspendLayout();
             dgvResults.SuspendLayout();
             try
             {
                 dgvResults.DataSource = records;
+                dgvResults.ClearSelection();
+
+                if (selectedHistoryIds.Count > 0)
+                {
+                    foreach (DataGridViewRow row in dgvResults.Rows)
+                    {
+                        if (row.DataBoundItem is RecoveryDisplayRow displayRow &&
+                            displayRow.HistoryId.HasValue &&
+                            selectedHistoryIds.Contains(displayRow.HistoryId.Value))
+                        {
+                            row.Selected = true;
+                        }
+                    }
+                }
+
                 lblFiles.Text = $"Deleted files ({records.Count:N0})";
             }
             finally
@@ -555,7 +569,6 @@ public partial class Form1 : Form
         }
 
         _history.Clear();
-        RefreshFromHistory();
     }
 
     private void dgvResults_SelectionChanged(object? sender, EventArgs e)
