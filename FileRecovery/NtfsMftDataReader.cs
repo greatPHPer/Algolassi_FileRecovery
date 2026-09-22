@@ -72,7 +72,7 @@ public sealed class NtfsMftDataReader
                 "The file retains a nonresident $ATTRIBUTE_LIST that could not be safely reconstructed.");
         }
 
-        IReadOnlyList<AttributeListEntry> entries;
+        IReadOnlyList<NtfsAttributeListEntry> entries;
         try
         {
             entries = NtfsAttributeListParser.Parse(attributeList.ResidentData!);
@@ -509,6 +509,51 @@ public sealed class NtfsMftDataReader
         public bool Found { get; init; }
         public bool IsResident { get; init; }
         public byte[]? ResidentData { get; init; }
+    }
+
+    private static void ReadRawClusters(
+        SafeFileHandle volumeHandle,
+        long logicalClusterNumber,
+        long byteCount,
+        uint bytesPerCluster,
+        byte[] destination,
+        int destinationOffset)
+    {
+        var offset = checked(logicalClusterNumber * (long)bytesPerCluster);
+        var buffer = new byte[RawReadBufferSize];
+        var remaining = byteCount;
+        var targetOffset = destinationOffset;
+
+        while (remaining > 0)
+        {
+            var chunk = (int)Math.Min(buffer.Length, remaining);
+
+            if (!SetFilePointerEx(volumeHandle, offset, out _, 0))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "Could not seek to a nonresident $ATTRIBUTE_LIST data extent.");
+            }
+
+            if (!ReadFile(
+                    volumeHandle,
+                    buffer,
+                    (uint)chunk,
+                    out var bytesRead,
+                    IntPtr.Zero) ||
+                bytesRead != (uint)chunk)
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "Could not read a nonresident $ATTRIBUTE_LIST data extent.");
+            }
+
+            Buffer.BlockCopy(buffer, 0, destination, targetOffset, chunk);
+
+            offset = checked(offset + chunk);
+            targetOffset = checked(targetOffset + chunk);
+            remaining -= chunk;
+        }
     }
 
     private static byte[]? ReadRecord(
