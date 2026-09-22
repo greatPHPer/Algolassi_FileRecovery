@@ -165,7 +165,9 @@ public sealed class MftCandidateScanner
             cancellationToken.ThrowIfCancellationRequested();
 
             var remaining = bytesToScan - scanned;
-            var requestBytes = (int)Math.Min(buffer.Length, remaining);
+            var requestBytes = (int)Math.Min(
+                Math.Min(buffer.Length, 1024 * 1024),
+                remaining);
             requestBytes -= requestBytes % recordSize;
 
             if (requestBytes < recordSize)
@@ -173,9 +175,16 @@ public sealed class MftCandidateScanner
                 break;
             }
 
-            var bytesRead = await mftStream.ReadAsync(
-                buffer.AsMemory(0, requestBytes),
-                cancellationToken).ConfigureAwait(false);
+            // The raw volume handle is opened synchronously. The entire
+            // scanner already runs inside Task.Run(), so use a synchronous
+            // device read here rather than mixing a synchronous handle with
+            // FileStream.ReadAsync().
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var bytesRead = mftStream.Read(
+                buffer,
+                0,
+                requestBytes);
 
             if (bytesRead <= 0)
             {
