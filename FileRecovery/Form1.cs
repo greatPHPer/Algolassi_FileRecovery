@@ -718,9 +718,18 @@ public partial class Form1 : Form
 
             if (unavailable.Count > 0)
             {
+                var missingNtfsReferenceCount = unavailable.Count(
+                    record => !record.FileReferenceNumber.HasValue);
+
+                var referenceDetail = missingNtfsReferenceCount > 0
+                    ? $"{Environment.NewLine}{Environment.NewLine}" +
+                      $"{missingNtfsReferenceCount:N0} selected history item(s) do not contain an NTFS file reference. " +
+                      "They were recorded before the direct NTFS reference tracking was available (or USN monitoring was not active)."
+                    : string.Empty;
+
                 MessageBox.Show(
                     this,
-                    $"The selected deleted file(s) were not found in the Recycle Bin and no usable NTFS recovery candidate is currently available.{Environment.NewLine}{Environment.NewLine}" +
+                    $"The selected deleted file(s) were not found in the Recycle Bin and no usable NTFS recovery candidate is currently available.{referenceDetail}{Environment.NewLine}{Environment.NewLine}" +
                     "For Shift+Delete files, recovery depends on the NTFS metadata and data clusters still being intact.",
                     "Recovery Not Available",
                     MessageBoxButtons.OK,
