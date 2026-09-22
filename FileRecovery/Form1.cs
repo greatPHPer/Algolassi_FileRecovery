@@ -454,6 +454,10 @@ public partial class Form1 : Form
             return;
         }
 
+        var historyRows = rows
+            .Where(row => row.HistoryId.HasValue)
+            .ToList();
+
         var candidates = rows
             .Where(row => row.RecoveryCandidate is not null)
             .Select(row => row.RecoveryCandidate!)
@@ -463,6 +467,25 @@ public partial class Form1 : Form
             .Where(row => row.RecoverableItem is not null)
             .Select(row => row.RecoverableItem!)
             .ToList();
+
+        // History rows are resolved separately because they do not carry a live
+        // Recycle Bin object or an NTFS candidate.
+        if (historyRows.Count > 0)
+        {
+            if (historyRows.Count != rows.Count)
+            {
+                MessageBox.Show(
+                    this,
+                    "Select either history rows or live recovery results, not both at once.",
+                    "Recovery Selection",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            await RestoreHistoryRowsAsync(historyRows);
+            return;
+        }
 
         if (candidates.Count > 0 && recycleItems.Count > 0)
         {
@@ -484,12 +507,7 @@ public partial class Form1 : Form
         if (recycleItems.Count > 0)
         {
             await RestoreRecycleBinItemsAsync(recycleItems);
-            return;
         }
-
-        // History rows contain only the persisted deletion record. Resolve the
-        // selected record against the current Recycle Bin before attempting restore.
-        await RestoreHistoryRowsAsync(rows);
     }
 
     private async Task RestoreHistoryRowsAsync(IReadOnlyList<RecoveryDisplayRow> rows)
