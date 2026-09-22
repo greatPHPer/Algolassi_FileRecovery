@@ -19,7 +19,6 @@ public sealed class NtfsMftDataReader
     private const byte NonResidentForm = 1;
 
     public NtfsDataStreamInfo ReadDefaultDataStream(
-        SafeFileHandle volumeHandle,
         NtfsVolumeInfo volumeInfo,
         ulong fileReferenceNumber)
     {
@@ -27,14 +26,11 @@ public sealed class NtfsMftDataReader
         var sequenceNumber = (ushort)(fileReferenceNumber >> 48);
 
         if (volumeInfo.BytesPerFileRecordSegment == 0 ||
-            volumeInfo.MftStartLcn < 0)
+            volumeInfo.MftValidDataLength <= 0 ||
+            string.IsNullOrWhiteSpace(volumeInfo.RootPath))
         {
-            return NotFound("The NTFS volume did not report a usable MFT geometry.");
+            return NotFound("The NTFS volume did not report usable MFT geometry.");
         }
-
-        var recordOffset = checked(
-            volumeInfo.MftStartLcn * (long)volumeInfo.BytesPerCluster +
-            (long)segmentNumber * volumeInfo.BytesPerFileRecordSegment);
 
         var relativeMftOffset = checked(
             (long)segmentNumber * volumeInfo.BytesPerFileRecordSegment);
@@ -45,8 +41,10 @@ public sealed class NtfsMftDataReader
             return NotFound("The deleted file's MFT segment is outside the current valid MFT range.");
         }
 
+        using var mftHandle = CreateMftHandle(volumeInfo.RootPath);
+
         var record = new byte[checked((int)volumeInfo.BytesPerFileRecordSegment)];
-        ReadAt(volumeHandle, recordOffset, record);
+        ReadAt(mftHandle, relativeMftOffset, record);
 
         if (record.Length < 48 ||
             record[0] != (byte)'F' ||
@@ -249,6 +247,36 @@ public sealed class NtfsMftDataReader
 
             BinaryPrimitives.WriteUInt16LittleEndian(record.AsSpan(endOffset, 2), replacement);
         }
+    }
+
+    private static SafeFileHandle CreateMftHandle(string rootPath)
+    {
+        var normalizedRoot = Path.GetPathRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(normalizedRoot))
+        {
+            throw new InvalidOperationException("The NTFS source volume root could not be determined.");
+        }
+
+        var mftPath = Path.Combine(normalizedRoot, "$MFT");
+        var handle = CreateFile(
+            mftPath,
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(
+                error,
+                $"Could not open the NTFS MFT at {mftPath}.");
+        }
+
+        return handle;
     }
 
     private static void ReadAt(SafeFileHandle handle, long offset, byte[] buffer)
