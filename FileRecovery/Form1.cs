@@ -11,7 +11,6 @@ public partial class Form1 : Form
 
     private readonly DeletionHistoryStore _history;
     private readonly RecycleBinService _recycleBinService;
-    private readonly UsnJournalMonitor? _usnMonitor;
     private readonly MftCandidateScanner _mftCandidateScanner = new();
     private readonly NtfsByteRecoveryService _ntfsRecoveryService = new();
     private bool _allowClose;
@@ -29,12 +28,10 @@ public partial class Form1 : Form
 
     public Form1(
         DeletionHistoryStore history,
-        RecycleBinService recycleBinService,
-        UsnJournalMonitor? usnMonitor = null)
+        RecycleBinService recycleBinService)
     {
         _history = history;
         _recycleBinService = recycleBinService;
-        _usnMonitor = usnMonitor;
 
         InitializeComponent();
         _history.Changed += History_Changed;
