@@ -37,6 +37,7 @@ public sealed class MftCandidateScanner
         var fullRoot = Path.GetFullPath(root);
         var volumeInfo = new NtfsVolumeInspector().Inspect(fullRoot);
         using var volumeHandle = CreateVolumeHandle(fullRoot);
+        using var mftHandle = NtfsMftDataReader.OpenMftHandle(fullRoot);
         var dataReader = new NtfsMftDataReader();
         var bitmapReader = new NtfsVolumeBitmapReader();
 
@@ -124,6 +125,7 @@ public sealed class MftCandidateScanner
 
                         var data = dataReader.ReadDefaultDataStream(
                             volumeInfo,
+                            mftHandle,
                             fileReference);
 
                         IReadOnlyList<NtfsExtentAllocation> allocations = [];
