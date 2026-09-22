@@ -109,20 +109,31 @@ public sealed class TrayApplicationContext : ApplicationContext
                 !e.Record.FileReferenceNumber.HasValue &&
                 !string.IsNullOrWhiteSpace(e.Record.FullPath))
             {
-                var resolved = await Task.Run(() =>
+                var resolved = await Task.Run(async () =>
                 {
-                    if (!_usnMonitor.TryResolveRecentDeletedFile(
-                            e.Record.FullPath,
-                            e.Record.DeletedAtUtc,
-                            out var fileReferenceNumber,
-                            out var parentFileReferenceNumber))
+                    // The NTFS USN record can appear just after FileSystemWatcher
+                    // raises its delete notification. Retry briefly instead of
+                    // persisting a watcher-only legacy row.
+                    for (var attempt = 0; attempt < 5; attempt++)
                     {
-                        return false;
+                        if (_usnMonitor.TryResolveRecentDeletedFile(
+                                e.Record.FullPath,
+                                e.Record.DeletedAtUtc,
+                                out var fileReferenceNumber,
+                                out var parentFileReferenceNumber))
+                        {
+                            e.Record.FileReferenceNumber = fileReferenceNumber;
+                            e.Record.ParentFileReferenceNumber = parentFileReferenceNumber;
+                            return true;
+                        }
+
+                        if (attempt < 4)
+                        {
+                            await Task.Delay(250);
+                        }
                     }
 
-                    e.Record.FileReferenceNumber = fileReferenceNumber;
-                    e.Record.ParentFileReferenceNumber = parentFileReferenceNumber;
-                    return true;
+                    return false;
                 });
 
                 _ = resolved;
