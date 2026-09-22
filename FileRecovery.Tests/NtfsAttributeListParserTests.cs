@@ -10,7 +10,7 @@ public sealed class NtfsAttributeListParserTests
     {
         var data = new byte[64];
 
-        WriteEntry(data, 0, 0x80, 0, 42, 0x000200000000002AUL);
+        WriteEntry(data, 0, 0x80, 0, 0, 0x000200000000002AUL);
         WriteEntry(data, 32, 0x80, 1, 7, 0x0003000000000040UL);
 
         var entries = NtfsAttributeListParser.Parse(data);
