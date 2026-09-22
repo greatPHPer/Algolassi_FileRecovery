@@ -47,9 +47,6 @@ public sealed class NtfsByteRecoveryService
         RecoveryCandidate candidate,
         string destinationPath)
     {
-        var data = candidate.DataEvidence;
-        _ = data;
-
         // NtfsMftDataReader supplies the resident bytes through the candidate.
         if (candidate.ResidentData is null)
         {
