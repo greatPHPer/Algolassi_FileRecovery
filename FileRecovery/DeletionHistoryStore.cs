@@ -70,6 +70,23 @@ public sealed class DeletionHistoryStore
 
                 if (existed)
                 {
+                    var existing = _records[index];
+
+                    // FileSystemWatcher/Recycle Bin updates may arrive after the
+                    // USN record and omit NTFS identifiers. Never erase identifiers
+                    // that are already known for the same deletion.
+                    if (!record.FileReferenceNumber.HasValue &&
+                        existing.FileReferenceNumber.HasValue)
+                    {
+                        record.FileReferenceNumber = existing.FileReferenceNumber;
+                    }
+
+                    if (!record.ParentFileReferenceNumber.HasValue &&
+                        existing.ParentFileReferenceNumber.HasValue)
+                    {
+                        record.ParentFileReferenceNumber = existing.ParentFileReferenceNumber;
+                    }
+
                     _records[index] = record;
                 }
                 else
