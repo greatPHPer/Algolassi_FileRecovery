@@ -315,6 +315,136 @@ public sealed class UsnJournalMonitor : IDisposable
         return true;
     }
 
+    public bool TryResolveRecentDeletedFile(
+        string fullPath,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        if (!IsAdministrator())
+        {
+            return false;
+        }
+
+        var root = Path.GetPathRoot(fullPath);
+        if (string.IsNullOrWhiteSpace(root) ||
+            !string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        using var volumeHandle = CreateFile(
+            $@"\\.\{volumeKey[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (volumeHandle.IsInvalid)
+        {
+            return false;
+        }
+
+        if (!TryQueryJournal(volumeHandle, out var journal))
+        {
+            return false;
+        }
+
+        var normalizedTarget = NormalizePath(fullPath);
+        var searchStart = Math.Max(
+            journal.FirstUsn,
+            journal.NextUsn - 8L * 1024L * 1024L);
+
+        if (_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) &&
+            cursor.JournalId == journal.JournalId &&
+            cursor.NextUsn >= journal.FirstUsn &&
+            cursor.NextUsn < journal.NextUsn)
+        {
+            searchStart = Math.Max(searchStart, cursor.NextUsn);
+        }
+
+        var nextUsn = searchStart;
+        var iterations = 0;
+
+        while (nextUsn < journal.NextUsn && iterations++ < 256)
+        {
+            var records = ReadRecords(
+                volumeHandle,
+                journal.JournalId,
+                nextUsn,
+                out var returnedNextUsn);
+
+            if (returnedNextUsn <= nextUsn)
+            {
+                break;
+            }
+
+            foreach (var record in records)
+            {
+                if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                    (record.FileAttributes & 0x10) != 0 ||
+                    string.IsNullOrWhiteSpace(record.FileName))
+                {
+                    continue;
+                }
+
+                var directory = ResolveParentDirectory(
+                    volumeHandle,
+                    record.ParentFileReferenceNumber);
+
+                if (string.IsNullOrWhiteSpace(directory))
+                {
+                    continue;
+                }
+
+                var candidatePath = NormalizePath(
+                    Path.Combine(directory, record.FileName));
+
+                if (!string.Equals(
+                        candidatePath,
+                        normalizedTarget,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                // The journal timestamp must be reasonably close to the deletion
+                // event being resolved. This prevents matching an older deletion
+                // of a file with the same name/path.
+                if (deletedAtUtc != default &&
+                    Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes) > 5)
+                {
+                    continue;
+                }
+
+                fileReferenceNumber = record.FileReferenceNumber;
+                parentFileReferenceNumber = record.ParentFileReferenceNumber;
+
+                _parentPathCaches.GetOrAdd(
+                    volumeKey,
+                    _ => new ConcurrentDictionary<ulong, string>())[record.ParentFileReferenceNumber] = directory;
+
+                return true;
+            }
+
+            nextUsn = returnedNextUsn;
+        }
+
+        return false;
+    }
+
+    private static string NormalizePath(string path) =>
+        path.Trim().Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+
     private static List<UsnRecord> ReadRecords(
         SafeFileHandle volumeHandle,
         ulong journalId,
