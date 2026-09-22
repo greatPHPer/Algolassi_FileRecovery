@@ -75,7 +75,7 @@ public sealed class NtfsMftDataReader
         IReadOnlyList<AttributeListEntry> entries;
         try
         {
-            entries = ParseAttributeList(attributeList.ResidentData!);
+            entries = NtfsAttributeListParser.Parse(attributeList.ResidentData!);
         }
         catch (Exception ex)
         {
@@ -283,53 +283,6 @@ public sealed class NtfsMftDataReader
         }
 
         return new AttributeListDescriptor();
-    }
-
-    private static IReadOnlyList<AttributeListEntry> ParseAttributeList(byte[] data)
-    {
-        var result = new List<AttributeListEntry>();
-        var offset = 0;
-
-        while (offset + 26 <= data.Length)
-        {
-            var type = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
-            if (type == NtfsAttributeEnd)
-            {
-                break;
-            }
-
-            var recordLength = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(offset + 4, 2));
-            var nameLength = data[offset + 6];
-            var nameOffset = data[offset + 7];
-
-            if (recordLength < 26 ||
-                offset + recordLength > data.Length)
-            {
-                throw new InvalidDataException("An NTFS $ATTRIBUTE_LIST entry has an invalid record length.");
-            }
-
-            var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(data.AsSpan(offset + 8, 8));
-            var segmentReference = BinaryPrimitives.ReadUInt64LittleEndian(data.AsSpan(offset + 16, 8));
-
-            if (nameLength != 0 &&
-                (nameOffset == 0 ||
-                 nameOffset + nameLength * 2 > recordLength))
-            {
-                throw new InvalidDataException("An NTFS $ATTRIBUTE_LIST entry has an invalid attribute name.");
-            }
-
-            result.Add(new AttributeListEntry
-            {
-                AttributeType = type,
-                LowestVcn = lowestVcn,
-                SegmentReference = segmentReference,
-                IsUnnamed = nameLength == 0
-            });
-
-            offset += recordLength;
-        }
-
-        return result;
     }
 
     private static IEnumerable<AttributeDescriptor> EnumerateAttributes(byte[] record)
@@ -556,59 +509,6 @@ public sealed class NtfsMftDataReader
         public bool Found { get; init; }
         public bool IsResident { get; init; }
         public byte[]? ResidentData { get; init; }
-    }
-
-    private sealed class AttributeListEntry
-    {
-        public uint AttributeType { get; init; }
-        public long LowestVcn { get; init; }
-        public ulong SegmentReference { get; init; }
-        public bool IsUnnamed { get; init; }
-    }
-
-    private static void ReadRawClusters(
-        SafeFileHandle volumeHandle,
-        long logicalClusterNumber,
-        long byteCount,
-        uint bytesPerCluster,
-        byte[] destination,
-        int destinationOffset)
-    {
-        var offset = checked(logicalClusterNumber * (long)bytesPerCluster);
-        var buffer = new byte[Math.Min(RawReadBufferSize, 1024 * 1024)];
-        var remaining = byteCount;
-        var targetOffset = destinationOffset;
-
-        while (remaining > 0)
-        {
-            var chunk = (int)Math.Min(buffer.Length, remaining);
-
-            if (!SetFilePointerEx(volumeHandle, offset, out _, 0))
-            {
-                throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    "Could not seek to a nonresident $ATTRIBUTE_LIST data extent.");
-            }
-
-            if (!ReadFile(
-                    volumeHandle,
-                    buffer,
-                    (uint)chunk,
-                    out var bytesRead,
-                    IntPtr.Zero) ||
-                bytesRead != (uint)chunk)
-            {
-                throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    "Could not read a nonresident $ATTRIBUTE_LIST data extent.");
-            }
-
-            Buffer.BlockCopy(buffer, 0, destination, targetOffset, chunk);
-
-            offset = checked(offset + chunk);
-            targetOffset = checked(targetOffset + chunk);
-            remaining -= chunk;
-        }
     }
 
     private static byte[]? ReadRecord(
