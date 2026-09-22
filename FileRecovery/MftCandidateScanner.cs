@@ -126,6 +126,7 @@ public sealed class MftCandidateScanner
                         var data = dataReader.ReadDefaultDataStream(
                             volumeInfo,
                             mftHandle,
+                            volumeHandle,
                             fileReference);
 
                         IReadOnlyList<NtfsExtentAllocation> allocations = [];

@@ -4,7 +4,7 @@ Windows file-recovery utility written in C# / .NET 9 WinForms.
 
 ## Current branch
 
-`0.9-attribute-list-data-extents`
+`1.0-nonresident-attribute-list`
 
 ## Background monitor
 
@@ -73,7 +73,7 @@ The MFT reader now opens the NTFS `$MFT` system file and reads the required reco
 
 ### Multi-record `$DATA` extents
 
-The recovery reader also follows a resident `$ATTRIBUTE_LIST` and loads unnamed `$DATA` attributes from referenced extension MFT records. The retained VCN mappings are merged in order, with VCN gaps or overlaps rejected. Nonresident `$ATTRIBUTE_LIST` data remains intentionally unsupported at this stage.
+The recovery reader follows an NTFS `$ATTRIBUTE_LIST` and loads unnamed `$DATA` attributes from referenced extension MFT records. Both resident and bounded nonresident attribute-list data are supported; retained VCN mappings are merged in order, with VCN gaps or overlaps rejected.
 
 The current branch does not yet perform raw-cluster reads, file-signature carving, or byte-level reconstruction.
 
@@ -103,7 +103,8 @@ FileRecovery\bin\Release\net9.0-windows\win-x64\publish\
 8. Byte-level NTFS recovery
 9. MFT extent correctness
 10. Multi-record `$DATA` via `$ATTRIBUTE_LIST`
-11. Deep file-signature scanning
+11. Nonresident `$ATTRIBUTE_LIST` reconstruction
+12. Deep file-signature scanning
 10. Preview and recover-to-another-drive workflow
 11. Code signing and public release packaging
 
