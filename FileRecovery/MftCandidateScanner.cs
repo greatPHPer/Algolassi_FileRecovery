@@ -21,8 +21,15 @@ public sealed class MftCandidateScanner
 
     public IReadOnlyList<RecoveryCandidate> Scan(
         string rootPath,
-        CancellationToken cancellationToken = default) =>
-        ScanInternal(rootPath, targetPaths: null, cancellationToken: cancellationToken, maxPages: int.MaxValue);
+        CancellationToken cancellationToken = default)
+    {
+        WindowsPrivilege.EnableSeBackupPrivilege();
+        return ScanInternal(
+            rootPath,
+            targetPaths: null,
+            cancellationToken: cancellationToken,
+            maxPages: int.MaxValue);
+    }
 
     public IReadOnlyList<RecoveryCandidate> ScanForPaths(
         string rootPath,
@@ -31,6 +38,8 @@ public sealed class MftCandidateScanner
         int maxPages = 128)
     {
         ArgumentNullException.ThrowIfNull(targetPaths);
+
+        WindowsPrivilege.EnableSeBackupPrivilege();
 
         if (maxPages <= 0)
         {
@@ -52,6 +61,8 @@ public sealed class MftCandidateScanner
         long maxBytesToScan = 512L * 1024L * 1024L)
     {
         ArgumentNullException.ThrowIfNull(targetPaths);
+
+        WindowsPrivilege.EnableSeBackupPrivilege();
 
         if (maxBytesToScan <= 0)
         {
@@ -272,6 +283,8 @@ public sealed class MftCandidateScanner
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(targets);
+
+        WindowsPrivilege.EnableSeBackupPrivilege();
 
         var normalizedTargets = targets
             .Where(target =>
