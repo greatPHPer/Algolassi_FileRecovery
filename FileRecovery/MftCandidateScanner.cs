@@ -627,7 +627,7 @@ public sealed class MftCandidateScanner
         }
 
         var found = new List<DeletedFileNameEntry>();
-        var offset = firstAttributeOffset;
+        var offset = (int)firstAttributeOffset;
 
         while (offset + 16 <= record.Length)
         {
