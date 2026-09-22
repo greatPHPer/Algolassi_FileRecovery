@@ -546,7 +546,9 @@ public partial class Form1 : Form
 
         // First try the normal Windows Recycle Bin path. This covers ordinary
         // Delete operations where the item was sent to the Recycle Bin.
-        var recycleResolution = await RunInStaAsync(() =>
+        SetBusy(true, "Checking the Windows Recycle Bin for the selected deleted file...");
+
+        var recycleResolutionTask = RunInStaAsync(() =>
         {
             var availableItems = _recycleBinService.Scan();
             var matches = new Dictionary<Guid, RecoveryItem>();
@@ -570,6 +572,22 @@ public partial class Form1 : Form
             return matches;
         });
 
+        // Shell automation must never hold Recover Selected indefinitely. A Shift+Delete
+        // item is not in the Recycle Bin, so after a bounded lookup we continue with NTFS.
+        var completed = await Task.WhenAny(
+            recycleResolutionTask,
+            Task.Delay(TimeSpan.FromSeconds(5)));
+
+        Dictionary<Guid, RecoveryItem> recycleResolution;
+        if (completed == recycleResolutionTask)
+        {
+            recycleResolution = await recycleResolutionTask;
+        }
+        else
+        {
+            recycleResolution = [];
+        }
+
         var recycleItems = historyRecords
             .Where(record => recycleResolution.ContainsKey(record.Id))
             .Select(record => recycleResolution[record.Id])
@@ -584,6 +602,8 @@ public partial class Form1 : Form
             await RestoreRecycleBinItemsAsync(recycleItems);
             return;
         }
+
+        SetBusy(true, "Searching NTFS metadata for Shift+Delete deleted-file data...");
 
         // Items that were deleted with Shift+Delete do not exist in the Recycle
         // Bin. Search the NTFS MFT for retained metadata/data-stream evidence.
