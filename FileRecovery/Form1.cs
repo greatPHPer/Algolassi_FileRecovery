@@ -134,7 +134,13 @@ public partial class Form1 : Form
             return;
         }
 
-        lblStatus.Text = "Monitoring status: " + message;
+        var statusText = "Monitoring status: " + message;
+        if (string.Equals(lblStatus.Text, statusText, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        lblStatus.Text = statusText;
     }
 
     private void History_Changed(object? sender, EventArgs e)
