@@ -700,7 +700,7 @@ public partial class Form1 : Form
                             $"Scanning the NTFS $MFT directly on {root} (up to 512 MB) for {legacyRecords.Count:N0} selected item(s)...";
 
                         var fallbackCandidates = await Task.Run(
-                            () => _mftCandidateScanner.ScanRawMftForPaths(
+                            () => _mftCandidateScanner.ScanRawMftForPathsAsync(
                                 root,
                                 targetPaths,
                                 fallbackCts.Token,
