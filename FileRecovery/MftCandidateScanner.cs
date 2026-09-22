@@ -98,17 +98,9 @@ public sealed class MftCandidateScanner
         var fullRoot = Path.GetFullPath(root);
         var volumeInfo = new NtfsVolumeInspector().Inspect(fullRoot);
         using var volumeHandle = CreateVolumeHandle(fullRoot);
-        using var mftScanHandle = NtfsMftDataReader.OpenMftHandle(
-            fullRoot,
-            asynchronous: true);
-        using var mftDataHandle = NtfsMftDataReader.OpenMftHandle(fullRoot);
+        using var mftScanVolumeHandle = CreateVolumeHandle(fullRoot);
 
         const int bufferSize = 4 * 1024 * 1024;
-        using var mftStream = new FileStream(
-            mftScanHandle,
-            FileAccess.Read,
-            bufferSize,
-            isAsync: true);
 
         var dataReader = new NtfsMftDataReader();
 
@@ -145,6 +137,27 @@ public sealed class MftCandidateScanner
         scanBufferSize = Math.Max(recordSize, scanBufferSize);
         var buffer = new byte[scanBufferSize];
 
+        var mftStartOffset = checked(
+            volumeInfo.MftStartLcn * (long)volumeInfo.BytesPerCluster);
+
+        if (mftStartOffset % volumeInfo.BytesPerSector != 0)
+        {
+            throw new InvalidOperationException(
+                "The NTFS MFT start offset is not aligned to the volume sector size.");
+        }
+
+        using var mftStream = new FileStream(
+            mftScanVolumeHandle,
+            FileAccess.Read,
+            bufferSize,
+            isAsync: false);
+
+        if (mftStream.Seek(mftStartOffset, SeekOrigin.Begin) != mftStartOffset)
+        {
+            throw new IOException(
+                $"Could not seek to the NTFS MFT start on {root}.");
+        }
+
         long scanned = 0;
 
         while (scanned < bytesToScan)
@@ -162,7 +175,7 @@ public sealed class MftCandidateScanner
 
             var bytesRead = await mftStream.ReadAsync(
                 buffer.AsMemory(0, requestBytes),
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
 
             if (bytesRead <= 0)
             {
@@ -229,7 +242,6 @@ public sealed class MftCandidateScanner
 
                     var data = dataReader.ReadDefaultDataStream(
                         volumeInfo,
-                        mftDataHandle,
                         volumeHandle,
                         fileReferenceNumber);
 
@@ -311,7 +323,6 @@ public sealed class MftCandidateScanner
         var fullRoot = Path.GetFullPath(root);
         var volumeInfo = new NtfsVolumeInspector().Inspect(fullRoot);
         using var volumeHandle = CreateVolumeHandle(fullRoot);
-        using var mftHandle = NtfsMftDataReader.OpenMftHandle(fullRoot);
         var dataReader = new NtfsMftDataReader();
         var bitmapReader = new NtfsVolumeBitmapReader();
         var results = new List<RecoveryCandidate>();
@@ -345,7 +356,6 @@ public sealed class MftCandidateScanner
 
             var data = dataReader.ReadDefaultDataStream(
                 volumeInfo,
-                mftHandle,
                 volumeHandle,
                 target.FileReferenceNumber);
 
@@ -403,7 +413,6 @@ public sealed class MftCandidateScanner
         var fullRoot = Path.GetFullPath(root);
         var volumeInfo = new NtfsVolumeInspector().Inspect(fullRoot);
         using var volumeHandle = CreateVolumeHandle(fullRoot);
-        using var mftHandle = NtfsMftDataReader.OpenMftHandle(fullRoot);
         var dataReader = new NtfsMftDataReader();
         var bitmapReader = new NtfsVolumeBitmapReader();
 
@@ -520,7 +529,6 @@ public sealed class MftCandidateScanner
 
                         var data = dataReader.ReadDefaultDataStream(
                             volumeInfo,
-                            mftHandle,
                             volumeHandle,
                             fileReference);
 
