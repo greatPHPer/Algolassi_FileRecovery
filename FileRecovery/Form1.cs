@@ -626,7 +626,12 @@ public partial class Form1 : Form
 
                 try
                 {
-                    var candidates = await Task.Run(() => _mftCandidateScanner.Scan(root));
+                    var targetPaths = group
+                        .Select(record => NormalizePath(record.FullPath))
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                    var candidates = await Task.Run(() =>
+                        _mftCandidateScanner.ScanForPaths(root, targetPaths));
 
                     foreach (var record in group)
                     {
