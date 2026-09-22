@@ -556,6 +556,7 @@ public sealed class NtfsMftDataReader
     }
 
     private static byte[]? ReadRecord(
+        SafeFileHandle volumeHandle,
         NtfsVolumeInfo volumeInfo,
         ulong segmentNumber,
         ushort expectedSequenceNumber,
