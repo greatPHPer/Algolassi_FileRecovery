@@ -61,10 +61,30 @@ public sealed class DeletionHistoryStore
 
             lock (_gate)
             {
-                var index = _records.FindIndex(x =>
-                    x.Id == record.Id ||
-                    (string.Equals(x.FullPath, record.FullPath, StringComparison.OrdinalIgnoreCase) &&
-                     Math.Abs((x.DeletedAtUtc - record.DeletedAtUtc).TotalSeconds) <= 5));
+                var index = _records.FindIndex(x => x.Id == record.Id);
+
+                // A USN record carries the authoritative NTFS file reference.
+                // Prefer that identifier when merging asynchronous monitor events.
+                if (index < 0 && record.FileReferenceNumber.HasValue)
+                {
+                    index = _records.FindIndex(x =>
+                        x.FileReferenceNumber.HasValue &&
+                        x.FileReferenceNumber.Value == record.FileReferenceNumber.Value);
+                }
+
+                // FileSystemWatcher and USN can report the same deletion at slightly
+                // different times. Merge matching paths within a bounded window so
+                // the later USN record can upgrade the earlier watcher-only row.
+                if (index < 0)
+                {
+                    index = _records.FindIndex(x =>
+                        string.Equals(
+                            x.FullPath,
+                            record.FullPath,
+                            StringComparison.OrdinalIgnoreCase) &&
+                        Math.Abs(
+                            (x.DeletedAtUtc - record.DeletedAtUtc).TotalMinutes) <= 5);
+                }
 
                 existed = index >= 0;
 
