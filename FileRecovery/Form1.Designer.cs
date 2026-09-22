@@ -14,7 +14,7 @@ partial class Form1
     private Button btnShowHistory = null!;
     private Button btnClearHistory = null!;
     private Label lblFiles = null!;
-    private DataGridView dgvResults = null!;
+    private BufferedDataGridView dgvResults = null!;
     private DataGridViewTextBoxColumn colName = null!;
     private DataGridViewTextBoxColumn colDeleted = null!;
     private DataGridViewTextBoxColumn colSize = null!;
@@ -45,7 +45,7 @@ partial class Form1
         btnShowHistory = new Button();
         btnClearHistory = new Button();
         lblFiles = new Label();
-        dgvResults = new DataGridView();
+        dgvResults = new BufferedDataGridView();
         colName = new DataGridViewTextBoxColumn();
         colDeleted = new DataGridViewTextBoxColumn();
         colSize = new DataGridViewTextBoxColumn();
