@@ -105,18 +105,26 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         try
         {
-            // FileSystemWatcher can report a deletion before the USN monitor's polling
-            // pass sees it. Resolve the recent USN record here before persisting the
-            // history row so direct NTFS recovery does not depend on that race.
-            if (!e.Historical &&
-                !e.Record.FileReferenceNumber.HasValue &&
-                !string.IsNullOrWhiteSpace(e.Record.FullPath))
+            // Persist the deletion immediately so FileSystemWatcher/USN lookup
+            // latency can never prevent the deleted-file result from appearing.
+            // NTFS identifiers are enriched separately below.
+            wasExisting = await Task.Run(() => _history.Upsert(e.Record));
+        }
+        catch
+        {
+            // The history store is non-critical. Monitoring and notifications should
+            // continue even if a background history update fails unexpectedly.
+            return;
+        }
+
+        if (!e.Historical &&
+            !e.Record.FileReferenceNumber.HasValue &&
+            !string.IsNullOrWhiteSpace(e.Record.FullPath))
+        {
+            _ = Task.Run(async () =>
             {
-                var resolved = await Task.Run(async () =>
+                try
                 {
-                    // The NTFS USN record can appear just after FileSystemWatcher
-                    // raises its delete notification. Retry briefly instead of
-                    // persisting a watcher-only legacy row.
                     for (var attempt = 0; attempt < 5; attempt++)
                     {
                         if (_usnMonitor.TryResolveRecentDeletedFile(
@@ -127,7 +135,11 @@ public sealed class TrayApplicationContext : ApplicationContext
                         {
                             e.Record.FileReferenceNumber = fileReferenceNumber;
                             e.Record.ParentFileReferenceNumber = parentFileReferenceNumber;
-                            return true;
+
+                            // Upsert merges this enrichment into the existing
+                            // watcher-created history row.
+                            await Task.Run(() => _history.Upsert(e.Record));
+                            return;
                         }
 
                         if (attempt < 4)
@@ -135,23 +147,13 @@ public sealed class TrayApplicationContext : ApplicationContext
                             await Task.Delay(250);
                         }
                     }
-
-                    return false;
-                });
-
-                _ = resolved;
-            }
-
-            // Keep JSON serialization and file replacement off the WinForms UI thread.
-            // DeletionHistoryStore raises Changed after the background update, which
-            // queues the Recovery Center refresh through its UI synchronization path.
-            wasExisting = await Task.Run(() => _history.Upsert(e.Record));
-        }
-        catch
-        {
-            // The history store is non-critical. Monitoring and notifications should
-            // continue even if a background history update fails unexpectedly.
-            return;
+                }
+                catch
+                {
+                    // USN enrichment is best-effort; the original deletion
+                    // history row must remain available.
+                }
+            });
         }
 
         if (!e.Historical && !wasExisting && !_settings.NotificationsMuted)
