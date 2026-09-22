@@ -210,6 +210,8 @@ public sealed class DeletionHistoryStore
     private static DeletionRecord Clone(DeletionRecord item) => new()
     {
         Id = item.Id,
+        FileReferenceNumber = item.FileReferenceNumber,
+        ParentFileReferenceNumber = item.ParentFileReferenceNumber,
         FullPath = item.FullPath,
         FileName = item.FileName,
         DirectoryPath = item.DirectoryPath,
