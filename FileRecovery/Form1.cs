@@ -670,42 +670,14 @@ public partial class Form1 : Form
                         }
                     }
 
+                    // Older history records may not have the NTFS file reference that
+                    // is required for a bounded direct MFT lookup. Do not fall back to a
+                    // volume-wide FSCTL_ENUM_USN_DATA scan here; that operation can take
+                    // an unbounded amount of time and cannot be cancelled reliably while
+                    // DeviceIoControl is blocked.
                     if (legacyRecords.Count > 0)
                     {
-                        var targetPaths = legacyRecords
-                            .Select(record => NormalizePath(record.FullPath))
-                            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-                        using var legacyScanCts = new CancellationTokenSource(
-                            TimeSpan.FromSeconds(15));
-
-                        SetBusy(
-                            true,
-                            $"Searching legacy NTFS metadata for {legacyRecords.Count:N0} history item(s) (maximum 15 seconds)...");
-
-                        var candidates = await Task.Run(
-                            () => _mftCandidateScanner.ScanForPaths(
-                                root,
-                                targetPaths,
-                                legacyScanCts.Token));
-
-                        foreach (var record in legacyRecords)
-                        {
-                            var match = candidates.FirstOrDefault(candidate =>
-                                string.Equals(
-                                    NormalizePath(candidate.FullPath),
-                                    NormalizePath(record.FullPath),
-                                    StringComparison.OrdinalIgnoreCase));
-
-                            if (match is not null)
-                            {
-                                ntfsCandidates.Add(match);
-                            }
-                            else
-                            {
-                                unavailable.Add(record);
-                            }
-                        }
+                        unavailable.AddRange(legacyRecords);
                     }
                 }
                 catch (UnauthorizedAccessException)
