@@ -743,6 +743,15 @@ public partial class Form1 : Form
                         using var fallbackCts = new CancellationTokenSource(
                             TimeSpan.FromSeconds(20));
 
+                        const long maxFallbackBytes = 512L * 1024L * 1024L;
+                        var fallbackProgress = new Progress<long>(bytesScanned =>
+                        {
+                            var scannedMb = bytesScanned / (1024d * 1024d);
+                            var totalMb = maxFallbackBytes / (1024d * 1024d);
+                            lblStatus.Text =
+                                $"Scanning the NTFS $MFT on {root}: {scannedMb:0} / {totalMb:0} MB for {legacyRecords.Count:N0} selected item(s)...";
+                        });
+
                         lblStatus.Text =
                             $"Scanning the NTFS $MFT directly on {root} (up to 512 MB) for {legacyRecords.Count:N0} selected item(s)...";
 
@@ -751,7 +760,8 @@ public partial class Form1 : Form
                                 root,
                                 targetPaths,
                                 fallbackCts.Token,
-                                maxBytesToScan: 512L * 1024L * 1024L));
+                                maxBytesToScan: maxFallbackBytes,
+                                progress: fallbackProgress));
 
                         foreach (var record in legacyRecords)
                         {
