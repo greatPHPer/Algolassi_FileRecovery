@@ -527,7 +527,7 @@ public sealed class NtfsMftDataReader
             ValidDataLengthBytes = validDataLength,
             Extents = extents,
             Evidence = mftSegmentCount > 1
-                ? $"The default $DATA stream spans {mftSegmentCount:N0} MFT record(s) through a resident $ATTRIBUTE_LIST and retained {extents.Count:N0} data extent(s)."
+                ? $"The default $DATA stream spans {mftSegmentCount:N0} MFT record(s) through an NTFS $ATTRIBUTE_LIST and retained {extents.Count:N0} data extent(s)."
                 : $"The default $DATA stream retained {extents.Count:N0} nonresident extent(s)."
         };
     }
