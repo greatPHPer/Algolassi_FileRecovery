@@ -22,7 +22,7 @@ public sealed class MftCandidateScanner
     public IReadOnlyList<RecoveryCandidate> Scan(
         string rootPath,
         CancellationToken cancellationToken = default) =>
-        ScanInternal(rootPath, targetPaths: null, cancellationToken, maxPages: int.MaxValue);
+        ScanInternal(rootPath, targetPaths: null, cancellationToken: cancellationToken, maxPages: int.MaxValue);
 
     public IReadOnlyList<RecoveryCandidate> ScanForPaths(
         string rootPath,
