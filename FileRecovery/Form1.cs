@@ -18,6 +18,7 @@ public partial class Form1 : Form
     private bool _historyRefreshPending;
     private bool _suppressDirectorySelectionChanged;
     private bool _suppressGridSelectionChanged;
+    private bool _operationInProgress;
 
     public void CloseFromApplication()
     {
@@ -964,26 +965,31 @@ public partial class Form1 : Form
         var hasCandidates = rows.Any(row => row.RecoveryCandidate is not null);
         var hasRecycleItems = rows.Any(row => row.RecoverableItem is not null);
 
-        btnRecover.Enabled = !IsBusy
+        btnRecover.Enabled = !_operationInProgress
             && rows.Count > 0
             && !(hasCandidates && hasRecycleItems);
     }
 
     private void SetBusy(bool busy, string? status = null)
     {
+        _operationInProgress = busy;
+
         lstDirectories.Enabled = !busy;
         btnScanDirectory.Enabled = !busy;
         btnShowHistory.Enabled = !busy;
         btnClearHistory.Enabled = !busy;
         btnScanNtfs.Enabled = !busy;
         dgvResults.Enabled = true;
-        btnRecover.Enabled = !busy && btnRecover.Enabled;
         UseWaitCursor = false;
 
         if (!string.IsNullOrWhiteSpace(status))
         {
             lblStatus.Text = status;
         }
+
+        // Always calculate Recover Selected from the actual current selection.
+        // Never preserve the button's previous Enabled value as state.
+        UpdateRecoverButton();
     }
 
     private string? GetSelectedDirectory()
@@ -1014,7 +1020,7 @@ public partial class Form1 : Form
         return $"{bytes / (1024d * 1024d * 1024d):0.#} GB";
     }
 
-    private bool IsBusy => !btnScanDirectory.Enabled;
+    private bool IsBusy => _operationInProgress;
 
     private void Form1_FormClosing(object? sender, FormClosingEventArgs e)
     {
