@@ -643,53 +643,10 @@ public partial class Form1 : Form
                             !record.ParentFileReferenceNumber.HasValue)
                         .ToList();
 
-                    // A history row can predate NTFS reference capture, or the
-                    // deletion-time USN lookup may have raced the journal update.
-                    // Give Recover Selected one final live-journal opportunity
-                    // before classifying the row as legacy/unavailable.
-                    if (_usnMonitor is not null && legacyRecords.Count > 0)
-                    {
-                        var resolvedRecords = new List<DeletionRecord>();
-
-                        foreach (var record in legacyRecords)
-                        {
-                            var resolved = await Task.Run(() =>
-                            {
-                                if (!_usnMonitor.TryResolveRecentDeletedFile(
-                                        record.FullPath,
-                                        record.DeletedAtUtc,
-                                        out var fileReferenceNumber,
-                                        out var parentFileReferenceNumber))
-                                {
-                                    return false;
-                                }
-
-                                record.FileReferenceNumber = fileReferenceNumber;
-                                record.ParentFileReferenceNumber = parentFileReferenceNumber;
-                                return true;
-                            });
-
-                            if (resolved)
-                            {
-                                resolvedRecords.Add(record);
-                                await Task.Run(() => _history.Upsert(record));
-                            }
-                        }
-
-                        if (resolvedRecords.Count > 0)
-                        {
-                            directRecords.AddRange(resolvedRecords);
-
-                            var resolvedIds = resolvedRecords
-                                .Select(record => record.Id)
-                                .ToHashSet();
-
-                            legacyRecords = legacyRecords
-                                .Where(record => !resolvedIds.Contains(record.Id))
-                                .ToList();
-                        }
-                    }
-
+                    // Do not perform a recovery-time scan of the USN journal.
+                    // A historical lookup can enumerate a large journal and make
+                    // Recover Selected appear hung. NTFS references are captured by
+                    // the background USN monitor and merged into history separately.
                     if (directRecords.Count > 0)
                     {
                         var directTargets = directRecords
