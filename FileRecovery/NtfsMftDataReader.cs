@@ -169,13 +169,13 @@ public sealed class NtfsMftDataReader
                 }
 
                 var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(
-                    record.Slice(attribute.Offset + 16, 8));
+                    record.AsSpan(attribute.Offset + 16, 8));
                 var mappingPairsOffset = BinaryPrimitives.ReadUInt16LittleEndian(
-                    record.Slice(attribute.Offset + 32, 2));
+                    record.AsSpan(attribute.Offset + 32, 2));
                 var fileSize = BinaryPrimitives.ReadInt64LittleEndian(
-                    record.Slice(attribute.Offset + 48, 8));
+                    record.AsSpan(attribute.Offset + 48, 8));
                 var validDataLength = BinaryPrimitives.ReadInt64LittleEndian(
-                    record.Slice(attribute.Offset + 56, 8));
+                    record.AsSpan(attribute.Offset + 56, 8));
 
                 if (lowestVcn != 0 ||
                     mappingPairsOffset >= attribute.Length ||
@@ -192,7 +192,7 @@ public sealed class NtfsMftDataReader
                 try
                 {
                     extents = NtfsMappingPairsParser.Parse(
-                        record.Slice(
+                        record.AsSpan(
                             attribute.Offset + mappingPairsOffset,
                             attribute.Length - mappingPairsOffset),
                         lowestVcn);
@@ -261,9 +261,9 @@ public sealed class NtfsMftDataReader
             }
 
             var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
-                record.Slice(attribute.Offset + 16, 4));
+                record.AsSpan(attribute.Offset + 16, 4));
             var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
-                record.Slice(attribute.Offset + 20, 2));
+                record.AsSpan(attribute.Offset + 20, 2));
 
             if (valueOffset + valueLength > attribute.Length)
             {
@@ -271,7 +271,7 @@ public sealed class NtfsMftDataReader
             }
 
             var residentData = new byte[checked((int)valueLength)];
-            record.Slice(
+            record.AsSpan(
                 attribute.Offset + valueOffset,
                 checked((int)valueLength)).CopyTo(residentData);
 
@@ -288,7 +288,7 @@ public sealed class NtfsMftDataReader
 
     private static IEnumerable<AttributeDescriptor> EnumerateAttributes(byte[] record)
     {
-        var firstAttributeOffset = BinaryPrimitives.ReadUInt16LittleEndian(record.Slice(20, 2));
+        var firstAttributeOffset = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(20, 2));
         if (firstAttributeOffset < 24 || firstAttributeOffset >= record.Length)
         {
             yield break;
@@ -297,13 +297,13 @@ public sealed class NtfsMftDataReader
         var offset = (int)firstAttributeOffset;
         while (offset + 16 <= record.Length)
         {
-            var type = BinaryPrimitives.ReadUInt32LittleEndian(record.Slice(offset, 4));
+            var type = BinaryPrimitives.ReadUInt32LittleEndian(record.AsSpan(offset, 4));
             if (type == NtfsAttributeEnd)
             {
                 yield break;
             }
 
-            var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(record.Slice(offset + 4, 4));
+            var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(record.AsSpan(offset + 4, 4));
             if (recordLength < 24 ||
                 offset + recordLength > record.Length)
             {
@@ -311,7 +311,7 @@ public sealed class NtfsMftDataReader
             }
 
             var nameLength = record[offset + 9];
-            var nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(record.Slice(offset + 10, 2));
+            var nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(offset + 10, 2));
 
             if (nameLength == 0 ||
                 (nameOffset != 0 &&
@@ -342,9 +342,9 @@ public sealed class NtfsMftDataReader
         }
 
         var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
-            record.Slice(attributeOffset + 16, 4));
+            record.AsSpan(attributeOffset + 16, 4));
         var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
-            record.Slice(attributeOffset + 20, 2));
+            record.AsSpan(attributeOffset + 20, 2));
 
         if (valueOffset + valueLength > attributeLength)
         {
@@ -352,7 +352,7 @@ public sealed class NtfsMftDataReader
         }
 
         var data = new byte[checked((int)valueLength)];
-        record.Slice(
+        record.AsSpan(
             attributeOffset + valueOffset,
             checked((int)valueLength)).CopyTo(data);
 
@@ -377,20 +377,20 @@ public sealed class NtfsMftDataReader
         }
 
         var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(
-            record.Slice(attributeOffset + 16, 8));
+            record.AsSpan(attributeOffset + 16, 8));
         var mappingPairsOffset = BinaryPrimitives.ReadUInt16LittleEndian(
-            record.Slice(attributeOffset + 32, 2));
+            record.AsSpan(attributeOffset + 32, 2));
         var fileSize = BinaryPrimitives.ReadInt64LittleEndian(
-            record.Slice(attributeOffset + 48, 8));
+            record.AsSpan(attributeOffset + 48, 8));
         var validDataLength = BinaryPrimitives.ReadInt64LittleEndian(
-            record.Slice(attributeOffset + 56, 8));
+            record.AsSpan(attributeOffset + 56, 8));
 
         if (mappingPairsOffset >= attributeLength)
         {
             throw new InvalidDataException("The nonresident $DATA mapping pairs are outside the attribute record.");
         }
 
-        var mappingPairs = record.Slice(
+        var mappingPairs = record.AsSpan(
             attributeOffset + mappingPairsOffset,
             attributeLength - mappingPairsOffset);
 
@@ -587,8 +587,8 @@ public sealed class NtfsMftDataReader
 
         ApplyUpdateSequenceFixups(record, checked((int)volumeInfo.BytesPerSector));
 
-        var sequenceNumber = BinaryPrimitives.ReadUInt16LittleEndian(record.Slice(16, 2));
-        var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.Slice(22, 2));
+        var sequenceNumber = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(16, 2));
+        var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
 
         if (expectedSequenceNumber != 0 && sequenceNumber != expectedSequenceNumber)
         {
@@ -600,7 +600,7 @@ public sealed class NtfsMftDataReader
             return null;
         }
 
-        var baseFileReference = BinaryPrimitives.ReadUInt64LittleEndian(record.Slice(32, 8));
+        var baseFileReference = BinaryPrimitives.ReadUInt64LittleEndian(record.AsSpan(32, 8));
         if (baseFileReference != 0 && baseFileReference != expectedBaseFileReference)
         {
             return null;
