@@ -7,6 +7,10 @@ public partial class Form1 : Form
     private readonly MftCandidateScanner _mftCandidateScanner = new();
     private readonly NtfsByteRecoveryService _ntfsRecoveryService = new();
     private bool _allowClose;
+    private bool _refreshInProgress;
+    private bool _historyRefreshPending;
+    private bool _suppressDirectorySelectionChanged;
+    private bool _suppressGridSelectionChanged;
 
     public void CloseFromApplication()
     {
@@ -37,44 +41,84 @@ public partial class Form1 : Form
 
         if (InvokeRequired)
         {
-            BeginInvoke(RefreshFromHistory);
+            QueueHistoryRefresh();
             return;
         }
 
-        var directories = _history.GetRecentDirectories();
-        var selected = lstDirectories.SelectedItem as string;
+        if (_refreshInProgress)
+        {
+            return;
+        }
 
-        lstDirectories.BeginUpdate();
+        _refreshInProgress = true;
         try
         {
-            lstDirectories.Items.Clear();
-            lstDirectories.Items.Add("All recent deletions");
-            foreach (var directory in directories)
-            {
-                lstDirectories.Items.Add(directory);
-            }
+            var directories = _history.GetRecentDirectories();
+            var selected = lstDirectories.SelectedItem as string;
 
-            var preferredIndex = 0;
-            if (!string.IsNullOrWhiteSpace(selected))
+            _suppressDirectorySelectionChanged = true;
+            lstDirectories.BeginUpdate();
+            try
             {
-                for (var i = 0; i < lstDirectories.Items.Count; i++)
+                lstDirectories.Items.Clear();
+                lstDirectories.Items.Add("All recent deletions");
+                foreach (var directory in directories)
                 {
-                    if (string.Equals(lstDirectories.Items[i]?.ToString(), selected, StringComparison.OrdinalIgnoreCase))
+                    lstDirectories.Items.Add(directory);
+                }
+
+                var preferredIndex = 0;
+                if (!string.IsNullOrWhiteSpace(selected))
+                {
+                    for (var i = 0; i < lstDirectories.Items.Count; i++)
                     {
-                        preferredIndex = i;
-                        break;
+                        if (string.Equals(
+                            lstDirectories.Items[i]?.ToString(),
+                            selected,
+                            StringComparison.OrdinalIgnoreCase))
+                        {
+                            preferredIndex = i;
+                            break;
+                        }
                     }
                 }
+
+                lstDirectories.SelectedIndex = preferredIndex;
+            }
+            finally
+            {
+                lstDirectories.EndUpdate();
+                _suppressDirectorySelectionChanged = false;
             }
 
-            lstDirectories.SelectedIndex = preferredIndex;
+            // Rebind the grid once per refresh. The directory selection event above
+            // is intentionally suppressed so it cannot trigger a second rebind.
+            ShowHistoryRows();
         }
         finally
         {
-            lstDirectories.EndUpdate();
+            _refreshInProgress = false;
+        }
+    }
+
+    private void QueueHistoryRefresh()
+    {
+        if (IsDisposed || _historyRefreshPending)
+        {
+            return;
         }
 
-        ShowHistoryRows();
+        _historyRefreshPending = true;
+
+        BeginInvoke(new Action(() =>
+        {
+            _historyRefreshPending = false;
+
+            if (!IsDisposed)
+            {
+                RefreshFromHistory();
+            }
+        }));
     }
 
     public void SetMonitorStatus(string message)
@@ -95,16 +139,16 @@ public partial class Form1 : Form
 
     private void History_Changed(object? sender, EventArgs e)
     {
-        if (IsDisposed)
-        {
-            return;
-        }
-
-        BeginInvoke(RefreshFromHistory);
+        QueueHistoryRefresh();
     }
 
     private void lstDirectories_SelectedIndexChanged(object? sender, EventArgs e)
     {
+        if (_suppressDirectorySelectionChanged)
+        {
+            return;
+        }
+
         ShowHistoryRows();
     }
 
@@ -115,22 +159,52 @@ public partial class Form1 : Form
 
     private void ShowHistoryRows()
     {
+        if (IsDisposed)
+        {
+            return;
+        }
+
         var selectedDirectory = GetSelectedDirectory();
 
         var records = _history.GetRecent()
-            .Where(record => selectedDirectory is null || IsDirectoryMatch(record.DirectoryPath, selectedDirectory))
+            .Where(record => selectedDirectory is null ||
+                             IsDirectoryMatch(record.DirectoryPath, selectedDirectory))
             .Select(record => new RecoveryDisplayRow
             {
                 Name = record.FileName,
                 DeletedOn = record.DeletedAtUtc.ToLocalTime().ToString("g"),
-                FileSize = record.FileSizeBytes.HasValue ? FormatSize(record.FileSizeBytes.Value) : "Unknown",
+                FileSize = record.FileSizeBytes.HasValue
+                    ? FormatSize(record.FileSizeBytes.Value)
+                    : "Unknown",
                 RecoveryStrength = record.RecoveryStrength
             })
             .ToList();
 
-        dgvResults.DataSource = records;
-        btnRecover.Enabled = false;
-        lblFiles.Text = $"Deleted files ({records.Count:N0})";
+        _suppressGridSelectionChanged = true;
+        try
+        {
+            btnRecover.Enabled = false;
+
+            SuspendLayout();
+            dgvResults.SuspendLayout();
+            try
+            {
+                dgvResults.DataSource = records;
+                lblFiles.Text = $"Deleted files ({records.Count:N0})";
+            }
+            finally
+            {
+                dgvResults.ResumeLayout();
+                ResumeLayout(true);
+            }
+        }
+        finally
+        {
+            _suppressGridSelectionChanged = false;
+        }
+
+        // Apply the final button state once, after the grid has finished binding.
+        UpdateRecoverButton();
     }
 
     private async void btnScanDirectory_Click(object? sender, EventArgs e)
@@ -486,6 +560,11 @@ public partial class Form1 : Form
 
     private void dgvResults_SelectionChanged(object? sender, EventArgs e)
     {
+        if (_suppressGridSelectionChanged)
+        {
+            return;
+        }
+
         UpdateRecoverButton();
     }
 
