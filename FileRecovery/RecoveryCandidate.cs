@@ -14,6 +14,7 @@ public sealed class RecoveryCandidate
     public bool DataStreamResident { get; init; }
     public long FileSizeBytes { get; init; }
     public long ValidDataLengthBytes { get; init; }
+    public byte[]? ResidentData { get; init; }
     public IReadOnlyList<NtfsDataExtent> DataExtents { get; init; } = [];
     public IReadOnlyList<NtfsExtentAllocation> ExtentAllocations { get; init; } = [];
     public long FreeDataClusterCount { get; init; }
