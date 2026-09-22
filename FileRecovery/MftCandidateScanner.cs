@@ -58,7 +58,8 @@ public sealed class MftCandidateScanner
         string rootPath,
         IReadOnlyCollection<string> targetPaths,
         CancellationToken cancellationToken = default,
-        long maxBytesToScan = 512L * 1024L * 1024L)
+        long maxBytesToScan = 512L * 1024L * 1024L,
+        IProgress<long>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(targetPaths);
 
@@ -110,12 +111,21 @@ public sealed class MftCandidateScanner
             isAsync: true);
 
         var dataReader = new NtfsMftDataReader();
-        var bitmapReader = new NtfsVolumeBitmapReader();
 
-        var targetNames = normalizedTargets
-            .Select(Path.GetFileName)
-            .Where(name => !string.IsNullOrWhiteSpace(name))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var targetsByName = normalizedTargets
+            .Select(target => new
+            {
+                Target = target,
+                Name = Path.GetFileName(target)
+            })
+            .Where(item => !string.IsNullOrWhiteSpace(item.Name))
+            .GroupBy(item => item.Name!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Select(item => item.Target).ToList(),
+                StringComparer.OrdinalIgnoreCase);
+
+        var targetNames = targetsByName.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         var results = new List<RecoveryCandidate>();
         var seenReferences = new HashSet<ulong>();
@@ -179,40 +189,37 @@ public sealed class MftCandidateScanner
 
                 foreach (var entry in fileEntries)
                 {
-                    if (!targetNames.Contains(entry.Name))
+                    if (!targetsByName.TryGetValue(entry.Name, out var sameNameTargets))
                     {
                         continue;
                     }
 
-                    var directoryPath = NtfsParentPathResolver.Resolve(
-                        volumeHandle,
-                        entry.ParentFileReferenceNumber);
+                    // Most legacy history lookups have a unique filename. In that
+                    // case the historical directory is authoritative enough for the
+                    // fallback match, so do not call OpenFileById for every matching
+                    // MFT record. Parent resolution is reserved for ambiguous names.
+                    string directoryPath;
+                    string? matchingTarget;
 
-                    var matchingTarget = normalizedTargets.FirstOrDefault(target =>
+                    if (sameNameTargets.Count == 1)
                     {
-                        var targetName = Path.GetFileName(target);
-                        if (!string.Equals(
-                                targetName,
-                                entry.Name,
-                                StringComparison.OrdinalIgnoreCase))
-                        {
-                            return false;
-                        }
+                        matchingTarget = sameNameTargets[0];
+                        directoryPath = Path.GetDirectoryName(matchingTarget) ?? string.Empty;
+                    }
+                    else
+                    {
+                        directoryPath = NtfsParentPathResolver.Resolve(
+                            volumeHandle,
+                            entry.ParentFileReferenceNumber) ?? string.Empty;
 
-                        if (string.IsNullOrWhiteSpace(directoryPath))
-                        {
-                            return normalizedTargets.Count(target2 =>
+                        matchingTarget = string.IsNullOrWhiteSpace(directoryPath)
+                            ? null
+                            : sameNameTargets.FirstOrDefault(target =>
                                 string.Equals(
-                                    Path.GetFileName(target2),
-                                    entry.Name,
-                                    StringComparison.OrdinalIgnoreCase)) == 1;
-                        }
-
-                        return string.Equals(
-                            NormalizePath(Path.Combine(directoryPath, entry.Name)),
-                            target,
-                            StringComparison.OrdinalIgnoreCase);
-                    });
+                                    NormalizePath(Path.Combine(directoryPath, entry.Name)),
+                                    target,
+                                    StringComparison.OrdinalIgnoreCase));
+                    }
 
                     if (string.IsNullOrWhiteSpace(matchingTarget) ||
                         !seenReferences.Add(fileReferenceNumber))
@@ -220,37 +227,19 @@ public sealed class MftCandidateScanner
                         continue;
                     }
 
-                    var historicalDirectory = Path.GetDirectoryName(matchingTarget);
-                    directoryPath = string.IsNullOrWhiteSpace(directoryPath)
-                        ? historicalDirectory ?? string.Empty
-                        : directoryPath;
-
                     var data = dataReader.ReadDefaultDataStream(
                         volumeInfo,
                         mftDataHandle,
                         volumeHandle,
                         fileReferenceNumber);
 
+                    // Current cluster allocation is validated immediately before
+                    // bytes are recovered. Doing that expensive bitmap scan here
+                    // would duplicate the work and keep legacy MFT lookup busy
+                    // long after the 512 MB metadata scan has completed.
                     IReadOnlyList<NtfsExtentAllocation> allocations = [];
-                    var allocationEvidence = string.Empty;
-
-                    if (data.Found && !data.IsResident && data.Extents.Count > 0)
-                    {
-                        try
-                        {
-                            allocations = bitmapReader.CheckExtents(
-                                volumeHandle,
-                                data.Extents,
-                                cancellationToken);
-
-                            allocationEvidence = BuildAllocationEvidence(allocations);
-                        }
-                        catch (Exception ex)
-                        {
-                            allocationEvidence =
-                                $"Cluster allocation could not be verified: {ex.Message}";
-                        }
-                    }
+                    const string allocationEvidence =
+                        "Current NTFS cluster allocation will be verified immediately before recovery.";
 
                     results.Add(BuildCandidate(
                         fileReferenceNumber,
@@ -270,6 +259,7 @@ public sealed class MftCandidateScanner
             }
 
             scanned += usableBytes;
+            progress?.Report(scanned);
 
             if (bytesRead < requestBytes)
             {
@@ -277,6 +267,7 @@ public sealed class MftCandidateScanner
             }
         }
 
+        progress?.Report(scanned);
         return results;
     }
 
