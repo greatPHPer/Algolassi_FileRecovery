@@ -512,189 +512,201 @@ public partial class Form1 : Form
 
     private async Task RestoreHistoryRowsAsync(IReadOnlyList<RecoveryDisplayRow> rows)
     {
-        var selectedIds = rows
-            .Select(row => row.HistoryId)
-            .Where(id => id.HasValue)
-            .Select(id => id!.Value)
-            .ToHashSet();
-
-        if (selectedIds.Count == 0)
+    {
+        try
         {
-            MessageBox.Show(
-                this,
-                "The selected row is not currently associated with a recoverable history record.",
-                "Recovery Selection",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-            return;
-        }
+            var selectedIds = rows
+                .Select(row => row.HistoryId)
+                .Where(id => id.HasValue)
+                .Select(id => id!.Value)
+                .ToHashSet();
 
-        var historyRecords = _history.GetRecent()
-            .Where(record => selectedIds.Contains(record.Id))
-            .ToList();
-
-        if (historyRecords.Count == 0)
-        {
-            MessageBox.Show(
-                this,
-                "The selected deletion history record could not be found.",
-                "Recovery Selection",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-            return;
-        }
-
-        // First try the normal Windows Recycle Bin path. This covers ordinary
-        // Delete operations where the item was sent to the Recycle Bin.
-        SetBusy(true, "Checking the Windows Recycle Bin for the selected deleted file...");
-
-        var recycleResolutionTask = RunInStaAsync(() =>
-        {
-            var availableItems = _recycleBinService.Scan();
-            var matches = new Dictionary<Guid, RecoveryItem>();
-
-            foreach (var record in historyRecords)
+            if (selectedIds.Count == 0)
             {
-                var expectedFullPath = NormalizePath(record.FullPath);
-
-                var match = availableItems.FirstOrDefault(item =>
-                    string.Equals(
-                        NormalizePath(Path.Combine(item.OriginalLocation, item.Name)),
-                        expectedFullPath,
-                        StringComparison.OrdinalIgnoreCase));
-
-                if (match is not null)
-                {
-                    matches[record.Id] = match;
-                }
+                MessageBox.Show(
+                    this,
+                    "The selected row is not currently associated with a recoverable history record.",
+                    "Recovery Selection",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
             }
 
-            return matches;
-        });
+            var historyRecords = _history.GetRecent()
+                .Where(record => selectedIds.Contains(record.Id))
+                .ToList();
 
-        // Shell automation must never hold Recover Selected indefinitely. A Shift+Delete
-        // item is not in the Recycle Bin, so after a bounded lookup we continue with NTFS.
-        var completed = await Task.WhenAny(
-            recycleResolutionTask,
-            Task.Delay(TimeSpan.FromSeconds(5)));
-
-        Dictionary<Guid, RecoveryItem> recycleResolution;
-        if (completed == recycleResolutionTask)
-        {
-            recycleResolution = await recycleResolutionTask;
-        }
-        else
-        {
-            recycleResolution = [];
-        }
-
-        var recycleItems = historyRecords
-            .Where(record => recycleResolution.ContainsKey(record.Id))
-            .Select(record => recycleResolution[record.Id])
-            .ToList();
-
-        var missingRecords = historyRecords
-            .Where(record => !recycleResolution.ContainsKey(record.Id))
-            .ToList();
-
-        if (missingRecords.Count == 0)
-        {
-            await RestoreRecycleBinItemsAsync(recycleItems);
-            return;
-        }
-
-        SetBusy(true, "Searching NTFS metadata for Shift+Delete deleted-file data...");
-
-        // Items that were deleted with Shift+Delete do not exist in the Recycle
-        // Bin. Search the NTFS MFT for retained metadata/data-stream evidence.
-        var ntfsCandidates = new List<RecoveryCandidate>();
-        var unavailable = new List<DeletionRecord>();
-
-        foreach (var group in missingRecords.GroupBy(
-                     record => Path.GetPathRoot(record.FullPath),
-                     StringComparer.OrdinalIgnoreCase))
-        {
-            var root = group.Key;
-            if (string.IsNullOrWhiteSpace(root))
+            if (historyRecords.Count == 0)
             {
-                unavailable.AddRange(group);
-                continue;
+                MessageBox.Show(
+                    this,
+                    "The selected deletion history record could not be found.",
+                    "Recovery Selection",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
             }
 
-            try
-            {
-                var candidates = await Task.Run(() => _mftCandidateScanner.Scan(root));
+            // First try the normal Windows Recycle Bin path. This covers ordinary
+            // Delete operations where the item was sent to the Recycle Bin.
+            SetBusy(true, "Checking the Windows Recycle Bin for the selected deleted file...");
 
-                foreach (var record in group)
+            var recycleResolutionTask = RunInStaAsync(() =>
+            {
+                var availableItems = _recycleBinService.Scan();
+                var matches = new Dictionary<Guid, RecoveryItem>();
+
+                foreach (var record in historyRecords)
                 {
-                    var match = candidates.FirstOrDefault(candidate =>
+                    var expectedFullPath = NormalizePath(record.FullPath);
+
+                    var match = availableItems.FirstOrDefault(item =>
                         string.Equals(
-                            NormalizePath(candidate.FullPath),
-                            NormalizePath(record.FullPath),
+                            NormalizePath(Path.Combine(item.OriginalLocation, item.Name)),
+                            expectedFullPath,
                             StringComparison.OrdinalIgnoreCase));
 
                     if (match is not null)
                     {
-                        ntfsCandidates.Add(match);
-                    }
-                    else
-                    {
-                        unavailable.Add(record);
+                        matches[record.Id] = match;
                     }
                 }
+
+                return matches;
+            });
+
+            // Shell automation must never hold Recover Selected indefinitely. A Shift+Delete
+            // item is not in the Recycle Bin, so after a bounded lookup we continue with NTFS.
+            var completed = await Task.WhenAny(
+                recycleResolutionTask,
+                Task.Delay(TimeSpan.FromSeconds(5)));
+
+            Dictionary<Guid, RecoveryItem> recycleResolution;
+            if (completed == recycleResolutionTask)
+            {
+                recycleResolution = await recycleResolutionTask;
             }
-            catch (UnauthorizedAccessException)
+            else
+            {
+                recycleResolution = [];
+            }
+
+            var recycleItems = historyRecords
+                .Where(record => recycleResolution.ContainsKey(record.Id))
+                .Select(record => recycleResolution[record.Id])
+                .ToList();
+
+            var missingRecords = historyRecords
+                .Where(record => !recycleResolution.ContainsKey(record.Id))
+                .ToList();
+
+            if (missingRecords.Count == 0)
+            {
+                await RestoreRecycleBinItemsAsync(recycleItems);
+                return;
+            }
+
+            SetBusy(true, "Searching NTFS metadata for Shift+Delete deleted-file data...");
+
+            // Items that were deleted with Shift+Delete do not exist in the Recycle
+            // Bin. Search the NTFS MFT for retained metadata/data-stream evidence.
+            var ntfsCandidates = new List<RecoveryCandidate>();
+            var unavailable = new List<DeletionRecord>();
+
+            foreach (var group in missingRecords.GroupBy(
+                         record => Path.GetPathRoot(record.FullPath),
+                         StringComparer.OrdinalIgnoreCase))
+            {
+                var root = group.Key;
+                if (string.IsNullOrWhiteSpace(root))
+                {
+                    unavailable.AddRange(group);
+                    continue;
+                }
+
+                try
+                {
+                    var candidates = await Task.Run(() => _mftCandidateScanner.Scan(root));
+
+                    foreach (var record in group)
+                    {
+                        var match = candidates.FirstOrDefault(candidate =>
+                            string.Equals(
+                                NormalizePath(candidate.FullPath),
+                                NormalizePath(record.FullPath),
+                                StringComparison.OrdinalIgnoreCase));
+
+                        if (match is not null)
+                        {
+                            ntfsCandidates.Add(match);
+                        }
+                        else
+                        {
+                            unavailable.Add(record);
+                        }
+                    }
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    MessageBox.Show(
+                        this,
+                        $"NTFS recovery for {root} requires administrator privileges. Run AlgoLassi File Recovery as Administrator and try Recover Selected again.",
+                        "Administrator Access Required",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(
+                        this,
+                        $"NTFS recovery scan failed for {root}:{Environment.NewLine}{Environment.NewLine}{ex.Message}",
+                        "NTFS Recovery Scan Failed",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    return;
+                }
+            }
+
+            if (recycleItems.Count > 0 && ntfsCandidates.Count > 0)
             {
                 MessageBox.Show(
                     this,
-                    $"NTFS recovery for {root} requires administrator privileges. Run AlgoLassi File Recovery as Administrator and try Recover Selected again.",
-                    "Administrator Access Required",
+                    "The selected files contain both Recycle Bin items and Shift+Delete candidates. Recover these groups separately.",
+                    "Recovery Selection",
                     MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                    MessageBoxIcon.Information);
                 return;
             }
-            catch (Exception ex)
+
+            if (ntfsCandidates.Count > 0)
+            {
+                await RecoverNtfsCandidatesAsync(ntfsCandidates);
+                return;
+            }
+
+            if (unavailable.Count > 0)
             {
                 MessageBox.Show(
                     this,
-                    $"NTFS recovery scan failed for {root}:{Environment.NewLine}{Environment.NewLine}{ex.Message}",
-                    "NTFS Recovery Scan Failed",
+                    $"The selected deleted file(s) were not found in the Recycle Bin and no usable NTFS recovery candidate is currently available.{Environment.NewLine}{Environment.NewLine}" +
+                    "For Shift+Delete files, recovery depends on the NTFS metadata and data clusters still being intact.",
+                    "Recovery Not Available",
                     MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
+                    MessageBoxIcon.Information);
                 return;
             }
-        }
 
-        if (recycleItems.Count > 0 && ntfsCandidates.Count > 0)
+            await RestoreRecycleBinItemsAsync(recycleItems);
+        }
+        finally
         {
-            MessageBox.Show(
-                this,
-                "The selected files contain both Recycle Bin items and Shift+Delete candidates. Recover these groups separately.",
-                "Recovery Selection",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-            return;
+            if (!IsDisposed)
+            {
+                SetBusy(false);
+                UpdateRecoverButton();
+            }
         }
-
-        if (ntfsCandidates.Count > 0)
-        {
-            await RecoverNtfsCandidatesAsync(ntfsCandidates);
-            return;
-        }
-
-        if (unavailable.Count > 0)
-        {
-            MessageBox.Show(
-                this,
-                $"The selected deleted file(s) were not found in the Recycle Bin and no usable NTFS recovery candidate is currently available.{Environment.NewLine}{Environment.NewLine}" +
-                "For Shift+Delete files, recovery depends on the NTFS metadata and data clusters still being intact.",
-                "Recovery Not Available",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-            return;
-        }
-
-        await RestoreRecycleBinItemsAsync(recycleItems);
     }
     private async Task RecoverNtfsCandidatesAsync(IReadOnlyList<RecoveryCandidate> candidates)
     {
