@@ -39,6 +39,110 @@ public sealed class MftCandidateScanner
         return ScanInternal(rootPath, normalizedTargets, cancellationToken);
     }
 
+    public IReadOnlyList<RecoveryCandidate> ScanForFileReferences(
+        string rootPath,
+        IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, DateTime DeletedAtUtc)> targets,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+
+        var normalizedTargets = targets
+            .Where(target =>
+                !string.IsNullOrWhiteSpace(target.FullPath) &&
+                target.FileReferenceNumber != 0 &&
+                target.ParentFileReferenceNumber != 0)
+            .Select(target => (
+                FullPath: NormalizePath(target.FullPath),
+                target.FileReferenceNumber,
+                target.ParentFileReferenceNumber,
+                target.DeletedAtUtc))
+            .ToList();
+
+        if (normalizedTargets.Count == 0)
+        {
+            return [];
+        }
+
+        var root = Path.GetPathRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            throw new ArgumentException("A valid Windows volume path is required.", nameof(rootPath));
+        }
+
+        if (!string.Equals(new DriveInfo(root).DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Permanent deleted-file scanning currently supports NTFS volumes only.");
+        }
+
+        var fullRoot = Path.GetFullPath(root);
+        var volumeInfo = new NtfsVolumeInspector().Inspect(fullRoot);
+        using var volumeHandle = CreateVolumeHandle(fullRoot);
+        using var mftHandle = NtfsMftDataReader.OpenMftHandle(fullRoot);
+        var dataReader = new NtfsMftDataReader();
+        var bitmapReader = new NtfsVolumeBitmapReader();
+        var results = new List<RecoveryCandidate>();
+
+        foreach (var target in normalizedTargets)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var directoryPath = NtfsParentPathResolver.Resolve(
+                volumeHandle,
+                target.ParentFileReferenceNumber) ?? string.Empty;
+
+            var name = Path.GetFileName(target.FullPath);
+            if (string.IsNullOrWhiteSpace(directoryPath) ||
+                string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
+            var fullPath = NormalizePath(Path.Combine(directoryPath, name));
+            if (!string.Equals(fullPath, target.FullPath, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var data = dataReader.ReadDefaultDataStream(
+                volumeInfo,
+                mftHandle,
+                volumeHandle,
+                target.FileReferenceNumber);
+
+            IReadOnlyList<NtfsExtentAllocation> allocations = [];
+            string allocationEvidence = string.Empty;
+
+            if (data.Found && !data.IsResident && data.Extents.Count > 0)
+            {
+                try
+                {
+                    allocations = bitmapReader.CheckExtents(
+                        volumeHandle,
+                        data.Extents,
+                        cancellationToken);
+
+                    allocationEvidence = BuildAllocationEvidence(allocations);
+                }
+                catch (Exception ex)
+                {
+                    allocationEvidence = $"Cluster allocation could not be verified: {ex.Message}";
+                }
+            }
+
+            results.Add(BuildCandidate(
+                target.FileReferenceNumber,
+                target.ParentFileReferenceNumber,
+                name,
+                directoryPath,
+                target.DeletedAtUtc,
+                data,
+                allocations,
+                allocationEvidence));
+        }
+
+        return results;
+    }
+
     private IReadOnlyList<RecoveryCandidate> ScanInternal(
         string rootPath,
         IReadOnlySet<string>? targetPaths,
@@ -195,44 +299,15 @@ public sealed class MftCandidateScanner
                             }
                         }
 
-                        var freeClusters = allocations.Sum(x => x.FreeClusterCount);
-                        var allocatedClusters = allocations.Sum(x => x.AllocatedClusterCount);
-
-                        var strength =
-                            data.Found && data.IsResident ? RecoveryStrength.Medium :
-                            data.Found && allocations.Count > 0 && allocatedClusters == 0
-                                ? RecoveryStrength.Medium :
-                            data.Found && allocatedClusters > 0
-                                ? RecoveryStrength.Weak :
-                            string.IsNullOrWhiteSpace(directoryPath)
-                                ? RecoveryStrength.Weak
-                                : RecoveryStrength.Medium;
-
-                        results.Add(new RecoveryCandidate
-                        {
-                            FileReferenceNumber = fileReference,
-                            ParentFileReferenceNumber = parentReference,
-                            Name = name,
-                            DirectoryPath = directoryPath,
-                            LastUsnTimestampUtc = timestampUtc,
-                            Strength = strength,
-                            Evidence = string.IsNullOrWhiteSpace(directoryPath)
-                                ? "NTFS metadata shows a file-delete record, but the parent directory could not be resolved."
-                                : "NTFS metadata shows a file-delete record and the parent directory was resolved.",
-                            DataStreamFound = data.Found,
-                            DataStreamResident = data.IsResident,
-                            ResidentData = data.ResidentData,
-                            FileSizeBytes = data.FileSizeBytes,
-                            ValidDataLengthBytes = data.ValidDataLengthBytes,
-                            DataExtents = data.Extents,
-                            ExtentAllocations = allocations,
-                            FreeDataClusterCount = freeClusters,
-                            AllocatedDataClusterCount = allocatedClusters,
-                            DataEvidence = string.Join(
-                                " ",
-                                new[] { data.Evidence, allocationEvidence }
-                                    .Where(x => !string.IsNullOrWhiteSpace(x)))
-                        });
+                        results.Add(BuildCandidate(
+                            fileReference,
+                            parentReference,
+                            name,
+                            directoryPath,
+                            timestampUtc,
+                            data,
+                            allocations,
+                            allocationEvidence));
 
                         foundRecords++;
 
@@ -260,6 +335,56 @@ public sealed class MftCandidateScanner
 
     private static string NormalizePath(string path) =>
         path.Trim().Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+
+    private static RecoveryCandidate BuildCandidate(
+        ulong fileReferenceNumber,
+        ulong parentFileReferenceNumber,
+        string name,
+        string directoryPath,
+        DateTime timestampUtc,
+        NtfsDataStreamInfo data,
+        IReadOnlyList<NtfsExtentAllocation> allocations,
+        string allocationEvidence)
+    {
+        var freeClusters = allocations.Sum(x => x.FreeClusterCount);
+        var allocatedClusters = allocations.Sum(x => x.AllocatedClusterCount);
+
+        var strength =
+            data.Found && data.IsResident ? RecoveryStrength.Medium :
+            data.Found && allocations.Count > 0 && allocatedClusters == 0
+                ? RecoveryStrength.Medium :
+            data.Found && allocatedClusters > 0
+                ? RecoveryStrength.Weak :
+            string.IsNullOrWhiteSpace(directoryPath)
+                ? RecoveryStrength.Weak
+                : RecoveryStrength.Medium;
+
+        return new RecoveryCandidate
+        {
+            FileReferenceNumber = fileReferenceNumber,
+            ParentFileReferenceNumber = parentFileReferenceNumber,
+            Name = name,
+            DirectoryPath = directoryPath,
+            LastUsnTimestampUtc = timestampUtc,
+            Strength = strength,
+            Evidence = string.IsNullOrWhiteSpace(directoryPath)
+                ? "NTFS metadata shows a file-delete record, but the parent directory could not be resolved."
+                : "NTFS metadata shows a file-delete record and the parent directory was resolved.",
+            DataStreamFound = data.Found,
+            DataStreamResident = data.IsResident,
+            ResidentData = data.ResidentData,
+            FileSizeBytes = data.FileSizeBytes,
+            ValidDataLengthBytes = data.ValidDataLengthBytes,
+            DataExtents = data.Extents,
+            ExtentAllocations = allocations,
+            FreeDataClusterCount = freeClusters,
+            AllocatedDataClusterCount = allocatedClusters,
+            DataEvidence = string.Join(
+                " ",
+                new[] { data.Evidence, allocationEvidence }
+                    .Where(x => !string.IsNullOrWhiteSpace(x)))
+        };
+    }
 
     private static string BuildAllocationEvidence(IReadOnlyList<NtfsExtentAllocation> allocations)
     {
