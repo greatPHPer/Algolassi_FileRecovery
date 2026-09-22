@@ -113,10 +113,78 @@ public sealed class DeletionHistoryStore
 
     private void Save()
     {
-        var temp = _path + ".tmp";
-        var json = JsonSerializer.Serialize(_records, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(temp, json);
-        File.Move(temp, _path, overwrite: true);
+        var directory = Path.GetDirectoryName(_path)!;
+        Directory.CreateDirectory(directory);
+
+        if (Directory.Exists(_path))
+        {
+            throw new InvalidOperationException(
+                $"The deletion history path is a directory instead of a file: {_path}");
+        }
+
+        var temp = Path.Combine(
+            directory,
+            $".{Path.GetFileName(_path)}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            var json = JsonSerializer.Serialize(
+                _records,
+                new JsonSerializerOptions { WriteIndented = true });
+
+            File.WriteAllText(temp, json);
+
+            if (File.Exists(_path))
+            {
+                var attributes = File.GetAttributes(_path);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                {
+                    File.SetAttributes(_path, attributes & ~FileAttributes.ReadOnly);
+                }
+            }
+
+            const int maxAttempts = 3;
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    File.Move(temp, _path, overwrite: true);
+                    return;
+                }
+                catch (UnauthorizedAccessException) when (attempt < maxAttempts)
+                {
+                    Thread.Sleep(100);
+                }
+                catch (IOException) when (attempt < maxAttempts)
+                {
+                    Thread.Sleep(100);
+                }
+            }
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Deletion history is non-critical. Keep the monitor alive if Windows
+            // temporarily blocks replacement of the local history file.
+        }
+        catch (IOException)
+        {
+            // Deletion history is non-critical. Keep the monitor alive if the
+            // history file is temporarily unavailable or locked.
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(temp))
+                {
+                    File.Delete(temp);
+                }
+            }
+            catch
+            {
+                // Best-effort cleanup only.
+            }
+        }
     }
 
     private static DeletionRecord Clone(DeletionRecord item) => new()
