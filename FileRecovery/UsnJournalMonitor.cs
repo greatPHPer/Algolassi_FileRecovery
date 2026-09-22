@@ -104,7 +104,7 @@ public sealed class UsnJournalMonitor : IDisposable
             try
             {
                 using var volumeHandle = CreateFile(
-                    $@"\\.\\{volumeKey[..2]}",
+                    $@"\\.\{volumeKey[..2]}",
                     GenericRead,
                     FileShareRead | FileShareWrite | FileShareDelete,
                     IntPtr.Zero,
