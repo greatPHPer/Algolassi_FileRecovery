@@ -13,7 +13,6 @@ public sealed class NtfsMftDataReader
     private const uint FileShareDelete = 0x00000004;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
-    private const uint FileFlagOverlapped = 0x40000000;
 
     private const uint NtfsAttributeList = 0x20;
     private const uint NtfsAttributeData = 0x80;
@@ -24,7 +23,6 @@ public sealed class NtfsMftDataReader
 
     public NtfsDataStreamInfo ReadDefaultDataStream(
         NtfsVolumeInfo volumeInfo,
-        SafeFileHandle mftHandle,
         SafeFileHandle volumeHandle,
         ulong fileReferenceNumber)
     {
@@ -48,7 +46,7 @@ public sealed class NtfsMftDataReader
         }
 
         var record = ReadRecord(
-            mftHandle,
+            volumeHandle,
             volumeInfo,
             segmentNumber,
             sequenceNumber,
@@ -100,7 +98,7 @@ public sealed class NtfsMftDataReader
             var extensionSequence = (ushort)(entry.SegmentReference >> 48);
 
             var extensionRecord = ReadRecord(
-                mftHandle,
+                volumeHandle,
                 volumeInfo,
                 extensionSegment,
                 extensionSequence,
@@ -558,7 +556,6 @@ public sealed class NtfsMftDataReader
     }
 
     private static byte[]? ReadRecord(
-        SafeFileHandle mftHandle,
         NtfsVolumeInfo volumeInfo,
         ulong segmentNumber,
         ushort expectedSequenceNumber,
@@ -573,8 +570,14 @@ public sealed class NtfsMftDataReader
             return null;
         }
 
+        var mftStartOffset = checked(
+            volumeInfo.MftStartLcn * (long)volumeInfo.BytesPerCluster);
+
         var record = new byte[checked((int)volumeInfo.BytesPerFileRecordSegment)];
-        ReadAt(mftHandle, relativeOffset, record);
+        ReadAt(
+            volumeHandle,
+            checked(mftStartOffset + relativeOffset),
+            record);
 
         if (record.Length < 48 ||
             record[0] != (byte)'F' ||
@@ -607,11 +610,6 @@ public sealed class NtfsMftDataReader
         }
 
         return record;
-    }
-
-    internal static SafeFileHandle OpenMftHandle(string rootPath, bool asynchronous = false)
-    {
-        return CreateMftHandle(rootPath, asynchronous);
     }
 
     private static NtfsDataStreamInfo NotFound(string evidence) =>
@@ -659,36 +657,6 @@ public sealed class NtfsMftDataReader
 
             BinaryPrimitives.WriteUInt16LittleEndian(record.Slice(endOffset, 2), replacement);
         }
-    }
-
-    private static SafeFileHandle CreateMftHandle(string rootPath, bool asynchronous = false)
-    {
-        var normalizedRoot = Path.GetPathRoot(rootPath);
-        if (string.IsNullOrWhiteSpace(normalizedRoot))
-        {
-            throw new InvalidOperationException("The NTFS source volume root could not be determined.");
-        }
-
-        var mftPath = Path.Combine(normalizedRoot, "$MFT");
-        var handle = CreateFile(
-            mftPath,
-            GenericRead,
-            FileShareRead | FileShareWrite | FileShareDelete,
-            IntPtr.Zero,
-            OpenExisting,
-            FileFlagBackupSemantics | (asynchronous ? FileFlagOverlapped : 0),
-            IntPtr.Zero);
-
-        if (handle.IsInvalid)
-        {
-            var error = Marshal.GetLastWin32Error();
-            handle.Dispose();
-            throw new Win32Exception(
-                error,
-                $"Could not open the NTFS MFT at {mftPath}.");
-        }
-
-        return handle;
     }
 
     private static void ReadAt(SafeFileHandle handle, long offset, byte[] buffer)
