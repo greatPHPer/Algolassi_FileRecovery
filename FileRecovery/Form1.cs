@@ -646,6 +646,9 @@ public partial class Form1 : Form
                                 DeletedAtUtc: record.DeletedAtUtc))
                             .ToList();
 
+                        lblStatus.Text =
+                            $"Reading exact NTFS MFT records on {root} for {directRecords.Count:N0} selected item(s)...";
+
                         var directCandidates = await Task.Run(() =>
                             _mftCandidateScanner.ScanForFileReferences(root, directTargets));
 
@@ -680,6 +683,9 @@ public partial class Form1 : Form
                         using var fallbackCts = new CancellationTokenSource(
                             TimeSpan.FromSeconds(20));
 
+                        lblStatus.Text =
+                            $"Scanning the NTFS $MFT directly on {root} (up to 512 MB) for {legacyRecords.Count:N0} selected item(s)...";
+
                         var fallbackCandidates = await Task.Run(
                             () => _mftCandidateScanner.ScanRawMftForPaths(
                                 root,
@@ -708,21 +714,38 @@ public partial class Form1 : Form
                         }
                     }
                 }
-                catch (UnauthorizedAccessException)
+                catch (UnauthorizedAccessException ex)
                 {
+                    lblStatus.Text = $"NTFS recovery access denied on {root}: {ex.Message}";
+
                     MessageBox.Show(
                         this,
-                        $"NTFS recovery for {root} requires administrator privileges. Run AlgoLassi File Recovery as Administrator and try Recover Selected again.",
+                        $"NTFS recovery for {root} requires administrator privileges or the SeBackupPrivilege could not be enabled.{Environment.NewLine}{Environment.NewLine}{ex.Message}",
                         "Administrator Access Required",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);
                     return;
                 }
-                catch (Exception ex)
+                catch (OperationCanceledException)
                 {
+                    lblStatus.Text = $"NTFS recovery scan timed out on {root}.";
                     MessageBox.Show(
                         this,
-                        $"NTFS recovery scan failed for {root}:{Environment.NewLine}{Environment.NewLine}{ex.Message}",
+                        $"The bounded NTFS recovery scan on {root} was cancelled after its safety time limit. No unbounded filesystem scan was performed.",
+                        "NTFS Recovery Timeout",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    lblStatus.Text =
+                        $"NTFS recovery scan failed on {root}: {ex.GetType().Name}: {ex.Message}";
+
+                    MessageBox.Show(
+                        this,
+                        $"NTFS recovery scan failed for {root}:{Environment.NewLine}{Environment.NewLine}" +
+                        $"{ex.GetType().Name}: {ex.Message}",
                         "NTFS Recovery Scan Failed",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);
