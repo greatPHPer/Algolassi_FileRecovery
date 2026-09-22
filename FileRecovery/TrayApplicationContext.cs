@@ -96,22 +96,34 @@ public sealed class TrayApplicationContext : ApplicationContext
         _mainForm.Activate();
     }
 
-    private void OnDeletionDetected(object? sender, DeletionDetectedEventArgs e)
+    private async void OnDeletionDetected(object? sender, DeletionDetectedEventArgs e)
     {
-        _uiContext.Post(_ =>
+        bool wasExisting;
+
+        try
         {
-            var wasExisting = _history.Upsert(e.Record);
+            // Keep JSON serialization and file replacement off the WinForms UI thread.
+            // DeletionHistoryStore raises Changed after the background update, which
+            // queues the Recovery Center refresh through its UI synchronization path.
+            wasExisting = await Task.Run(() => _history.Upsert(e.Record));
+        }
+        catch
+        {
+            // The history store is non-critical. Monitoring and notifications should
+            // continue even if a background history update fails unexpectedly.
+            return;
+        }
 
-            if (!e.Historical && !wasExisting && !_settings.NotificationsMuted)
+        if (!e.Historical && !wasExisting && !_settings.NotificationsMuted)
+        {
+            _uiContext.Post(_ =>
             {
-                ShowDeletionNotification(e.Record);
-            }
-
-            if (_mainForm is not null && !_mainForm.IsDisposed)
-            {
-                _mainForm.RefreshFromHistory();
-            }
-        }, null);
+                if (!_exiting && !_settings.NotificationsMuted)
+                {
+                    ShowDeletionNotification(e.Record);
+                }
+            }, null);
+        }
     }
 
     private void ShowDeletionNotification(DeletionRecord record)
