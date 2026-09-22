@@ -481,7 +481,82 @@ public partial class Form1 : Form
             return;
         }
 
-        await RestoreRecycleBinItemsAsync(recycleItems);
+        if (recycleItems.Count > 0)
+        {
+            await RestoreRecycleBinItemsAsync(recycleItems);
+            return;
+        }
+
+        // History rows contain only the persisted deletion record. Resolve the
+        // selected record against the current Recycle Bin before attempting restore.
+        await RestoreHistoryRowsAsync(rows);
+    }
+
+    private async Task RestoreHistoryRowsAsync(IReadOnlyList<RecoveryDisplayRow> rows)
+    {
+        var selectedIds = rows
+            .Select(row => row.HistoryId)
+            .Where(id => id.HasValue)
+            .Select(id => id!.Value)
+            .ToHashSet();
+
+        if (selectedIds.Count == 0)
+        {
+            MessageBox.Show(
+                this,
+                "The selected row is not currently associated with a recoverable item.",
+                "Recovery Selection",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        var historyRecords = _history.GetRecent()
+            .Where(record => selectedIds.Contains(record.Id))
+            .ToList();
+
+        var selectedItems = await RunInStaAsync(() =>
+        {
+            var availableItems = _recycleBinService.Scan();
+
+            return historyRecords
+                .Select(record =>
+                {
+                    var expectedFullPath = NormalizePath(record.FullPath);
+                    return availableItems.FirstOrDefault(item =>
+                        string.Equals(
+                            NormalizePath(Path.Combine(item.OriginalLocation, item.Name)),
+                            expectedFullPath,
+                            StringComparison.OrdinalIgnoreCase));
+                })
+                .Where(item => item is not null)
+                .Cast<RecoveryItem>()
+                .ToList();
+        });
+
+        if (selectedItems.Count == 0)
+        {
+            MessageBox.Show(
+                this,
+                "The selected deleted file is no longer available in the Windows Recycle Bin.",
+                "Recovery Selection",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        if (selectedItems.Count != historyRecords.Count)
+        {
+            MessageBox.Show(
+                this,
+                $"Only {selectedItems.Count:N0} of {historyRecords.Count:N0} selected history item(s) are currently available in the Windows Recycle Bin.",
+                "Recovery Selection",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        await RestoreRecycleBinItemsAsync(selectedItems);
     }
 
     private async Task RecoverNtfsCandidatesAsync(IReadOnlyList<RecoveryCandidate> candidates)
