@@ -366,9 +366,19 @@ public sealed class UsnJournalMonitor : IDisposable
         }
 
         var normalizedTarget = NormalizePath(fullPath);
-        var searchStart = Math.Max(
-            journal.FirstUsn,
-            journal.NextUsn - 8L * 1024L * 1024L);
+
+        // StartUsn must be an actual USN from the journal; USNs are sequence
+        // numbers, not byte offsets. Prefer the monitor's last valid cursor;
+        // otherwise start at the first readable journal USN.
+        var searchStart = journal.FirstUsn;
+
+        if (_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) &&
+            cursor.JournalId == journal.JournalId &&
+            cursor.NextUsn >= journal.FirstUsn &&
+            cursor.NextUsn < journal.NextUsn)
+        {
+            searchStart = cursor.NextUsn;
+        }
 
         var nextUsn = searchStart;
         var iterations = 0;
