@@ -5,6 +5,7 @@ public partial class Form1 : Form
     private readonly DeletionHistoryStore _history;
     private readonly RecycleBinService _recycleBinService;
     private readonly MftCandidateScanner _mftCandidateScanner = new();
+    private readonly NtfsByteRecoveryService _ntfsRecoveryService = new();
     private bool _allowClose;
 
     public void CloseFromApplication()
@@ -225,7 +226,8 @@ public partial class Form1 : Form
                         ? FormatSize(candidate.FileSizeBytes)
                         : "Unknown",
                     RecoveryStrength = candidate.Strength.ToString(),
-                    Evidence = BuildCandidateEvidence(candidate)
+                    Evidence = BuildCandidateEvidence(candidate),
+                    RecoveryCandidate = candidate
                 })
                 .ToList();
 
@@ -291,21 +293,126 @@ public partial class Form1 : Form
 
     private void btnRecover_Click(object? sender, EventArgs e)
     {
-        var selected = dgvResults.SelectedRows
+        var rows = dgvResults.SelectedRows
             .Cast<DataGridViewRow>()
             .Select(row => row.DataBoundItem as RecoveryDisplayRow)
-            .Where(row => row?.RecoverableItem is not null)
-            .Select(row => row!.RecoverableItem!)
+            .Where(row => row is not null)
+            .Cast<RecoveryDisplayRow>()
             .ToList();
 
-        if (selected.Count == 0)
+        if (rows.Count == 0)
         {
             return;
         }
 
+        var candidates = rows
+            .Where(row => row.RecoveryCandidate is not null)
+            .Select(row => row.RecoveryCandidate!)
+            .ToList();
+
+        var recycleItems = rows
+            .Where(row => row.RecoverableItem is not null)
+            .Select(row => row.RecoverableItem!)
+            .ToList();
+
+        if (candidates.Count > 0 && recycleItems.Count > 0)
+        {
+            MessageBox.Show(
+                this,
+                "Select either NTFS candidates or Windows Recycle Bin items, not both at once.",
+                "Recovery Selection",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        if (candidates.Count > 0)
+        {
+            RecoverNtfsCandidates(candidates);
+            return;
+        }
+
+        RestoreRecycleBinItems(recycleItems);
+    }
+
+    private void RecoverNtfsCandidates(IReadOnlyList<RecoveryCandidate> candidates)
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Choose a recovery destination on a different drive or volume from the deleted files.",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = true
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK ||
+            string.IsNullOrWhiteSpace(dialog.SelectedPath))
+        {
+            return;
+        }
+
+        SetBusy(true, "Recovering selected deleted-file data to the chosen destination...");
+
+        var failures = new List<string>();
+        var successes = new List<RecoveryResult>();
+
+        try
+        {
+            foreach (var candidate in candidates)
+            {
+                try
+                {
+                    successes.Add(_ntfsRecoveryService.Recover(
+                        candidate,
+                        dialog.SelectedPath));
+                }
+                catch (Exception ex)
+                {
+                    failures.Add($"{candidate.Name}: {ex.Message}");
+                }
+            }
+
+            if (failures.Count > 0)
+            {
+                var message = $"Recovered: {successes.Count:N0}" +
+                              Environment.NewLine +
+                              $"Failed: {failures.Count:N0}" +
+                              Environment.NewLine +
+                              Environment.NewLine +
+                              string.Join(Environment.NewLine, failures.Take(8));
+
+                MessageBox.Show(
+                    this,
+                    message,
+                    "NTFS Recovery Results",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+            else
+            {
+                MessageBox.Show(
+                    this,
+                    $"Recovered {successes.Count:N0} item(s) to:{Environment.NewLine}{dialog.SelectedPath}",
+                    "NTFS Recovery Results",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+
+            lblStatus.Text = failures.Count == 0
+                ? $"Recovered {successes.Count:N0} NTFS item(s) to the selected destination."
+                : $"Recovered {successes.Count:N0} NTFS item(s); {failures.Count:N0} item(s) failed.";
+        }
+        finally
+        {
+            SetBusy(false);
+            UpdateRecoverButton();
+        }
+    }
+
+    private void RestoreRecycleBinItems(IReadOnlyList<RecoveryItem> items)
+    {
         var answer = MessageBox.Show(
             this,
-            $"Restore {selected.Count:N0} selected item(s) to their original Windows locations?",
+            $"Restore {items.Count:N0} selected item(s) to their original Windows locations?",
             "Confirm Restore",
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Question);
@@ -317,11 +424,11 @@ public partial class Form1 : Form
 
         SetBusy(true, "Restoring selected items...");
 
+        var failures = new List<string>();
+
         try
         {
-            var failures = new List<string>();
-
-            foreach (var item in selected)
+            foreach (var item in items)
             {
                 try
                 {
@@ -335,7 +442,7 @@ public partial class Form1 : Form
 
             if (failures.Count == 0)
             {
-                lblStatus.Text = $"Restored {selected.Count:N0} item(s).";
+                lblStatus.Text = $"Restored {items.Count:N0} item(s).";
             }
             else
             {
@@ -346,7 +453,6 @@ public partial class Form1 : Form
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
             }
-
         }
         finally
         {
@@ -385,9 +491,19 @@ public partial class Form1 : Form
 
     private void UpdateRecoverButton()
     {
-        btnRecover.Enabled = !IsBusy && dgvResults.SelectedRows
+        var rows = dgvResults.SelectedRows
             .Cast<DataGridViewRow>()
-            .Any(row => row.DataBoundItem is RecoveryDisplayRow { RecoverableItem: not null });
+            .Select(row => row.DataBoundItem as RecoveryDisplayRow)
+            .Where(row => row is not null)
+            .Cast<RecoveryDisplayRow>()
+            .ToList();
+
+        var hasCandidates = rows.Any(row => row.RecoveryCandidate is not null);
+        var hasRecycleItems = rows.Any(row => row.RecoverableItem is not null);
+
+        btnRecover.Enabled = !IsBusy
+            && rows.Count > 0
+            && !(hasCandidates && hasRecycleItems);
     }
 
     private void SetBusy(bool busy, string? status = null)
