@@ -257,7 +257,7 @@ public sealed class MftCandidateScanner
 
             scanned += usableBytes;
 
-            if (bytesRead < requestBytes)
+            if (bytesRead < (uint)requestBytes)
             {
                 break;
             }
