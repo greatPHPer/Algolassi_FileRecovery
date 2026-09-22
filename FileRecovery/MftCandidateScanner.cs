@@ -173,6 +173,7 @@ public sealed class MftCandidateScanner
                                 : "NTFS metadata shows a file-delete record and the parent directory was resolved.",
                             DataStreamFound = data.Found,
                             DataStreamResident = data.IsResident,
+                            ResidentData = data.ResidentData,
                             FileSizeBytes = data.FileSizeBytes,
                             ValidDataLengthBytes = data.ValidDataLengthBytes,
                             DataExtents = data.Extents,

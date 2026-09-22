@@ -162,7 +162,7 @@ partial class Form1
         btnRecover.Enabled = false;
         btnRecover.Location = new Point(846, 582);
         btnRecover.Size = new Size(160, 36);
-        btnRecover.Text = "Restore Selected";
+        btnRecover.Text = "Recover Selected";
         btnRecover.UseVisualStyleBackColor = true;
         btnRecover.Click += btnRecover_Click;
 

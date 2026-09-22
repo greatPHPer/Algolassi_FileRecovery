@@ -4,7 +4,7 @@ Windows file-recovery utility written in C# / .NET 9 WinForms.
 
 ## Current branch
 
-`0.6-ntfs-cluster-safety`
+`0.7-byte-recovery-foundation`
 
 ## Background monitor
 
@@ -61,6 +61,12 @@ The app therefore stays conservative: all currently free former clusters can sup
 
 Recovery output is intentionally designed around a different destination volume. The destination policy rejects a recovery target on the same drive as the source, which reduces the risk of overwriting clusters that might still contain recoverable data.
 
+### Byte recovery
+
+The Recovery Center now supports the first byte-level recovery path. A selected NTFS candidate can be written to a folder on another volume. Resident `$DATA` bytes are copied directly from the retained MFT record. Nonresident candidates are copied from the retained VCN-to-LCN data runs only when the current NTFS bitmap confirms that every referenced data cluster is free.
+
+The source NTFS volume is opened for read-only access. A failed recovery removes the partial destination file. This stage does not recover arbitrary carved data and does not write to the source volume.
+
 The current branch does not yet perform raw-cluster reads, file-signature carving, or byte-level reconstruction.
 
 ## Standalone EXE
@@ -86,8 +92,9 @@ FileRecovery\bin\Release\net9.0-windows\win-x64\publish\
 5. NTFS deleted-file discovery
 6. NTFS volume/record inspection
 7. NTFS candidate-to-cluster mapping
-8. Deep file-signature scanning
-9. Preview and recover-to-another-drive workflow
-10. Code signing and public release packaging
+8. Byte-level NTFS recovery
+9. Deep file-signature scanning
+10. Preview and recover-to-another-drive workflow
+11. Code signing and public release packaging
 
 Recovery software cannot guarantee recovery of every deleted file. SSD TRIM and overwritten data can make deleted data unrecoverable.
