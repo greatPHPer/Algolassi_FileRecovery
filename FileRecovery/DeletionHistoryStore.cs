@@ -6,6 +6,7 @@ public sealed class DeletionHistoryStore
 {
     private const int MaxRecords = 500;
     private readonly object _gate = new();
+    private readonly object _saveGate = new();
     private readonly string _path;
     private List<DeletionRecord> _records;
 
@@ -53,29 +54,40 @@ public sealed class DeletionHistoryStore
     {
         bool existed;
 
-        lock (_gate)
+        // Serialize persistence operations without holding _gate during disk I/O.
+        lock (_saveGate)
         {
-            var index = _records.FindIndex(x =>
-                x.Id == record.Id ||
-                (string.Equals(x.FullPath, record.FullPath, StringComparison.OrdinalIgnoreCase) &&
-                 Math.Abs((x.DeletedAtUtc - record.DeletedAtUtc).TotalSeconds) <= 5));
+            List<DeletionRecord> snapshot;
 
-            existed = index >= 0;
-
-            if (existed)
+            lock (_gate)
             {
-                _records[index] = record;
-            }
-            else
-            {
-                _records.Add(record);
+                var index = _records.FindIndex(x =>
+                    x.Id == record.Id ||
+                    (string.Equals(x.FullPath, record.FullPath, StringComparison.OrdinalIgnoreCase) &&
+                     Math.Abs((x.DeletedAtUtc - record.DeletedAtUtc).TotalSeconds) <= 5));
+
+                existed = index >= 0;
+
+                if (existed)
+                {
+                    _records[index] = record;
+                }
+                else
+                {
+                    _records.Add(record);
+                }
+
+                _records = _records
+                    .OrderByDescending(x => x.DeletedAtUtc)
+                    .Take(MaxRecords)
+                    .ToList();
+
+                snapshot = _records
+                    .Select(Clone)
+                    .ToList();
             }
 
-            _records = _records
-                .OrderByDescending(x => x.DeletedAtUtc)
-                .Take(MaxRecords)
-                .ToList();
-            Save();
+            Save(snapshot);
         }
 
         Changed?.Invoke(this, EventArgs.Empty);
@@ -84,10 +96,18 @@ public sealed class DeletionHistoryStore
 
     public void Clear()
     {
-        lock (_gate)
+        // Serialize persistence operations without holding _gate during disk I/O.
+        lock (_saveGate)
         {
-            _records.Clear();
-            Save();
+            List<DeletionRecord> snapshot;
+
+            lock (_gate)
+            {
+                _records.Clear();
+                snapshot = [];
+            }
+
+            Save(snapshot);
         }
 
         Changed?.Invoke(this, EventArgs.Empty);
@@ -111,7 +131,7 @@ public sealed class DeletionHistoryStore
         }
     }
 
-    private void Save()
+    private void Save(IReadOnlyList<DeletionRecord> snapshot)
     {
         var directory = Path.GetDirectoryName(_path)!;
         Directory.CreateDirectory(directory);
@@ -129,7 +149,7 @@ public sealed class DeletionHistoryStore
         try
         {
             var json = JsonSerializer.Serialize(
-                _records,
+                snapshot,
                 new JsonSerializerOptions { WriteIndented = true });
 
             File.WriteAllText(temp, json);
