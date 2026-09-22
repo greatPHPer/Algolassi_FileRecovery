@@ -21,7 +21,28 @@ public sealed class MftCandidateScanner
 
     public IReadOnlyList<RecoveryCandidate> Scan(
         string rootPath,
+        CancellationToken cancellationToken = default) =>
+        ScanInternal(rootPath, targetPaths: null, cancellationToken);
+
+    public IReadOnlyList<RecoveryCandidate> ScanForPaths(
+        string rootPath,
+        IReadOnlyCollection<string> targetPaths,
         CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(targetPaths);
+
+        var normalizedTargets = targetPaths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(NormalizePath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        return ScanInternal(rootPath, normalizedTargets, cancellationToken);
+    }
+
+    private IReadOnlyList<RecoveryCandidate> ScanInternal(
+        string rootPath,
+        IReadOnlySet<string>? targetPaths,
+        CancellationToken cancellationToken)
     {
         var root = Path.GetPathRoot(rootPath);
         if (string.IsNullOrWhiteSpace(root))
@@ -42,6 +63,13 @@ public sealed class MftCandidateScanner
         var bitmapReader = new NtfsVolumeBitmapReader();
 
         var results = new List<RecoveryCandidate>();
+        var targetFileNames = targetPaths is null
+            ? null
+            : targetPaths
+                .Select(Path.GetFileName)
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         ulong startFileReferenceNumber = 0;
 
         while (!cancellationToken.IsCancellationRequested)
@@ -110,6 +138,13 @@ public sealed class MftCandidateScanner
                         var name = System.Text.Encoding.Unicode.GetString(
                             recordSpan.Slice(nameOffset, nameLength));
 
+                        if (targetFileNames is not null &&
+                            !targetFileNames.Contains(name))
+                        {
+                            offset += checked((int)recordLength);
+                            continue;
+                        }
+
                         var timestampUtc = DateTime.UtcNow;
                         try
                         {
@@ -122,6 +157,17 @@ public sealed class MftCandidateScanner
                         var directoryPath = NtfsParentPathResolver.Resolve(
                             volumeHandle,
                             parentReference) ?? string.Empty;
+
+                        var fullPath = string.IsNullOrWhiteSpace(directoryPath)
+                            ? name
+                            : Path.Combine(directoryPath, name);
+
+                        if (targetPaths is not null &&
+                            !targetPaths.Contains(NormalizePath(fullPath)))
+                        {
+                            offset += checked((int)recordLength);
+                            continue;
+                        }
 
                         var data = dataReader.ReadDefaultDataStream(
                             volumeInfo,
@@ -189,6 +235,12 @@ public sealed class MftCandidateScanner
                         });
 
                         foundRecords++;
+
+                        if (targetPaths is not null &&
+                            results.Count >= targetPaths.Count)
+                        {
+                            return results;
+                        }
                     }
                 }
 
@@ -205,6 +257,9 @@ public sealed class MftCandidateScanner
 
         return results;
     }
+
+    private static string NormalizePath(string path) =>
+        path.Trim().Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
 
     private static string BuildAllocationEvidence(IReadOnlyList<NtfsExtentAllocation> allocations)
     {
