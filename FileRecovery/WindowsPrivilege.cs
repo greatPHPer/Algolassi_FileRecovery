@@ -66,9 +66,11 @@ internal static class WindowsPrivilege
                 TokenAdjustPrivileges | TokenQuery,
                 out var token))
         {
+            var error = Marshal.GetLastWin32Error();
             token.Dispose();
+
             throw new Win32Exception(
-                Marshal.GetLastWin32Error(),
+                error,
                 "Could not open the current process token.");
         }
 
