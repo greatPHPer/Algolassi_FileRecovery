@@ -582,8 +582,21 @@ public partial class Form1 : Form
             // Keep the timeout decision off the WinForms synchronization context.
             // Shell automation may become slow or unresponsive; the timeout must
             // still fire even when the UI thread is busy processing messages.
-            var recycleResolution = await ResolveRecycleBinMatchesWithTimeoutAsync(
+            var recycleOutcome = await ResolveRecycleBinMatchesWithTimeoutAsync(
                 recycleResolutionTask);
+
+            var recycleResolution = recycleOutcome.Matches;
+
+            if (recycleOutcome.TimedOut)
+            {
+                lblStatus.Text =
+                    "Recycle Bin lookup timed out after 15 seconds; continuing with NTFS recovery.";
+            }
+            else if (recycleOutcome.Error is not null)
+            {
+                lblStatus.Text =
+                    $"Recycle Bin lookup failed ({recycleOutcome.Error.GetType().Name}); continuing with NTFS recovery.";
+            }
 
             var recycleItems = historyRecords
                 .Where(record => recycleResolution.ContainsKey(record.Id))
@@ -803,8 +816,11 @@ public partial class Form1 : Form
         }
     }
     
-    private static async Task<Dictionary<Guid, RecoveryItem>> ResolveRecycleBinMatchesWithTimeoutAsync(
-        Task<Dictionary<Guid, RecoveryItem>> recycleResolutionTask)
+    private static async Task<(
+        Dictionary<Guid, RecoveryItem> Matches,
+        bool TimedOut,
+        Exception? Error)> ResolveRecycleBinMatchesWithTimeoutAsync(
+            Task<Dictionary<Guid, RecoveryItem>> recycleResolutionTask)
     {
         var timeoutTask = Task.Delay(TimeSpan.FromSeconds(15));
 
@@ -815,18 +831,19 @@ public partial class Form1 : Form
 
         if (completed != recycleResolutionTask)
         {
-            return [];
+            return ([], true, null);
         }
 
         try
         {
-            return await recycleResolutionTask.ConfigureAwait(false);
+            return (await recycleResolutionTask.ConfigureAwait(false), false, null);
         }
-        catch
+        catch (Exception ex)
         {
             // A failed or unavailable Shell lookup must not block Shift+Delete
-            // recovery. Continue with the NTFS path instead.
-            return [];
+            // recovery. Continue with the NTFS path instead, but expose the
+            // failure stage to the Recovery Center status text.
+            return ([], false, ex);
         }
     }
 
