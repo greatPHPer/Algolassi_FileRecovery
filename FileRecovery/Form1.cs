@@ -11,6 +11,7 @@ public partial class Form1 : Form
 
     private readonly DeletionHistoryStore _history;
     private readonly RecycleBinService _recycleBinService;
+    private readonly UsnJournalMonitor _usnMonitor;
     private readonly MftCandidateScanner _mftCandidateScanner = new();
     private readonly NtfsByteRecoveryService _ntfsRecoveryService = new();
     private bool _allowClose;
@@ -28,10 +29,12 @@ public partial class Form1 : Form
 
     public Form1(
         DeletionHistoryStore history,
-        RecycleBinService recycleBinService)
+        RecycleBinService recycleBinService,
+        UsnJournalMonitor usnMonitor)
     {
         _history = history;
         _recycleBinService = recycleBinService;
+        _usnMonitor = usnMonitor;
 
         InitializeComponent();
         _history.Changed += History_Changed;
@@ -545,6 +548,57 @@ public partial class Form1 : Form
         }
     }
 
+    private async Task<List<DeletionRecord>> ResolveMissingNtfsReferencesAsync(
+        IReadOnlyList<DeletionRecord> records)
+    {
+        if (records.Count == 0)
+        {
+            return [];
+        }
+
+        var resolved = await Task.Run(() =>
+        {
+            var found = new List<DeletionRecord>();
+
+            foreach (var record in records)
+            {
+                if (record.FileReferenceNumber.HasValue &&
+                    record.ParentFileReferenceNumber.HasValue)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (_usnMonitor.TryResolveRecentDeletedFile(
+                            record.FullPath,
+                            record.DeletedAtUtc,
+                            out var fileReferenceNumber,
+                            out var parentFileReferenceNumber))
+                    {
+                        record.FileReferenceNumber = fileReferenceNumber;
+                        record.ParentFileReferenceNumber = parentFileReferenceNumber;
+                        found.Add(record);
+                    }
+                }
+                catch
+                {
+                    // Reference resolution is best-effort. The normal bounded
+                    // MFT fallback remains available when USN cannot resolve it.
+                }
+            }
+
+            return found;
+        }).ConfigureAwait(true);
+
+        foreach (var record in resolved)
+        {
+            await Task.Run(() => _history.Upsert(record)).ConfigureAwait(true);
+        }
+
+        return resolved;
+    }
+
     private async Task RestoreHistoryRowsAsync(
         IReadOnlyList<RecoveryDisplayRow> rows,
         bool skipRecycleBin = false)
@@ -680,6 +734,45 @@ public partial class Form1 : Form
 
                 try
                 {
+                    // The FileSystemWatcher row is persisted immediately, while
+                    // USN enrichment happens in the background. Re-check missing
+                    // NTFS references here before treating the deletion as legacy.
+                    var unresolvedReferenceRecords = group
+                        .Where(record =>
+                            !record.FileReferenceNumber.HasValue ||
+                            !record.ParentFileReferenceNumber.HasValue)
+                        .ToList();
+
+                    if (unresolvedReferenceRecords.Count > 0)
+                    {
+                        lblStatus.Text =
+                            $"Resolving NTFS references on {root} for {unresolvedReferenceRecords.Count:N0} selected item(s)...";
+
+                        var resolvedRecords = await ResolveMissingNtfsReferencesAsync(
+                            unresolvedReferenceRecords);
+
+                        if (resolvedRecords.Count > 0)
+                        {
+                            var resolvedIds = resolvedRecords
+                                .Select(record => record.Id)
+                                .ToHashSet();
+
+                            foreach (var resolvedRecord in resolvedRecords)
+                            {
+                                var original = missingRecords
+                                    .FirstOrDefault(record => record.Id == resolvedRecord.Id);
+
+                                if (original is not null)
+                                {
+                                    original.FileReferenceNumber =
+                                        resolvedRecord.FileReferenceNumber;
+                                    original.ParentFileReferenceNumber =
+                                        resolvedRecord.ParentFileReferenceNumber;
+                                }
+                            }
+                        }
+                    }
+
                     var directRecords = group
                         .Where(record =>
                             record.FileReferenceNumber.HasValue &&
@@ -692,7 +785,9 @@ public partial class Form1 : Form
                             !record.ParentFileReferenceNumber.HasValue)
                         .ToList();
 
-                    // Do not perform a recovery-time scan of the USN journal.
+                    // Do not perform an unbounded recovery-time scan of the USN journal.
+                    // The re-check above only asks the already-running monitor for a
+                    // recent deletion reference before using the raw MFT fallback.
                     // A historical lookup can enumerate a large journal and make
                     // Recover Selected appear hung. NTFS references are captured by
                     // the background USN monitor and merged into history separately.
