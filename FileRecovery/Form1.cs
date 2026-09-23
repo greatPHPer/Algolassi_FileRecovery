@@ -561,11 +561,11 @@ public partial class Form1 : Form
                 continue;
             }
 
-            // Do not perform a recovery-time journal enumeration here. The
-            // background USN monitor already caches recent deletion records.
-            // Give that monitor a short window to observe the deletion, then
-            // let the bounded raw MFT fallback handle anything still unresolved.
-            for (var attempt = 0; attempt < 5; attempt++)
+            // Do not perform an unbounded recovery-time journal enumeration here.
+            // The background USN monitor owns the journal cursor and caches recent
+            // deletion records. Give it a short window to observe a fresh deletion,
+            // while keeping the Recovery Center UI responsive.
+            for (var attempt = 0; attempt < 10; attempt++)
             {
                 if (_usnMonitor.TryResolveRecentDeletedFileBounded(
                         record.FullPath,
@@ -579,9 +579,9 @@ public partial class Form1 : Form
                     break;
                 }
 
-                if (attempt < 4)
+                if (attempt < 9)
                 {
-                    await Task.Delay(250).ConfigureAwait(true);
+                    await Task.Delay(300).ConfigureAwait(true);
                 }
             }
         }
