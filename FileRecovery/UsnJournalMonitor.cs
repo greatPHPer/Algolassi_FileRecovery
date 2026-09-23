@@ -520,7 +520,7 @@ public sealed class UsnJournalMonitor : IDisposable
         return true;
     }
 
-    public bool TryResolveRecentDeletedFile(
+    public bool TryResolveCachedRecentDeletedFile(
         string fullPath,
         DateTime deletedAtUtc,
         out ulong fileReferenceNumber,
@@ -531,12 +531,10 @@ public sealed class UsnJournalMonitor : IDisposable
 
         var normalizedTarget = NormalizePath(fullPath);
 
-        // Prefer records already observed by the background USN monitor. This
-        // avoids a race with FileSystemWatcher and avoids another native journal
-        // read when the record is already available.
         var cached = _recentDeletedRecords
             .ToArray()
-            .OrderBy(item => Math.Abs((item.TimestampUtc - deletedAtUtc).TotalMilliseconds))
+            .OrderBy(item =>
+                Math.Abs((item.TimestampUtc - deletedAtUtc).TotalMilliseconds))
             .FirstOrDefault(item =>
             {
                 if (deletedAtUtc != default &&
@@ -547,7 +545,9 @@ public sealed class UsnJournalMonitor : IDisposable
 
                 var candidatePath = item.DirectoryPath is null
                     ? string.Empty
-                    : NormalizePath(Path.Combine(item.DirectoryPath, item.FileName));
+                    : NormalizePath(Path.Combine(
+                        item.DirectoryPath,
+                        item.FileName));
 
                 return string.Equals(
                     candidatePath,
@@ -560,11 +560,33 @@ public sealed class UsnJournalMonitor : IDisposable
                             StringComparison.OrdinalIgnoreCase));
             });
 
-        if (cached.FileReferenceNumber != 0 &&
-            cached.ParentFileReferenceNumber != 0)
+        if (cached.FileReferenceNumber == 0 ||
+            cached.ParentFileReferenceNumber == 0)
         {
-            fileReferenceNumber = cached.FileReferenceNumber;
-            parentFileReferenceNumber = cached.ParentFileReferenceNumber;
+            return false;
+        }
+
+        fileReferenceNumber = cached.FileReferenceNumber;
+        parentFileReferenceNumber = cached.ParentFileReferenceNumber;
+        return true;
+    }
+
+    public bool TryResolveRecentDeletedFile(
+        string fullPath,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        // Prefer records already observed by the background USN monitor.
+        if (TryResolveCachedRecentDeletedFile(
+                fullPath,
+                deletedAtUtc,
+                out fileReferenceNumber,
+                out parentFileReferenceNumber))
+        {
             return true;
         }
 
