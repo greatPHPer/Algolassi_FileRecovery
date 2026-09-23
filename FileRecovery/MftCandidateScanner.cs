@@ -138,6 +138,12 @@ public sealed class MftCandidateScanner
             volumeInfo.MftValidDataLength,
             maxBytesToScan);
 
+        // Prefer the newest portion of the MFT for the bounded fallback.
+        // Recently-created files are often represented near the current end
+        // of the valid MFT range, while keeping the same overall safety bound.
+        var scanStartRelative = checked(
+            volumeInfo.MftValidDataLength - bytesToScan);
+
         var scanBufferSize = bufferSize - bufferSize % recordSize;
         scanBufferSize = Math.Max(recordSize, scanBufferSize);
         var buffer = new byte[scanBufferSize];
@@ -145,7 +151,10 @@ public sealed class MftCandidateScanner
         var mftStartOffset = checked(
             volumeInfo.MftStartLcn * (long)volumeInfo.BytesPerCluster);
 
-        if (mftStartOffset % volumeInfo.BytesPerSector != 0)
+        var scanStartOffset = checked(
+            mftStartOffset + scanStartRelative);
+
+        if (scanStartOffset % volumeInfo.BytesPerSector != 0)
         {
             throw new InvalidOperationException(
                 "The NTFS MFT start offset is not aligned to the volume sector size.");
@@ -170,7 +179,7 @@ public sealed class MftCandidateScanner
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            var readOffset = checked(mftStartOffset + scanned);
+            var readOffset = checked(scanStartOffset + scanned);
 
             // FileStream's async layer does not handle this raw NTFS volume
             // handle reliably on Windows. Issue the overlapped volume read
@@ -200,7 +209,7 @@ public sealed class MftCandidateScanner
                 if (!TryParseDeletedFileNameEntries(
                         buffer.AsSpan(offset, recordSize),
                         volumeInfo.BytesPerSector,
-                        (ulong)((scanned + offset) / recordSize),
+                        checked((ulong)((scanStartRelative + scanned + offset) / recordSize)),
                         out var fileReferenceNumber,
                         out var fileEntries))
                 {
@@ -278,7 +287,8 @@ public sealed class MftCandidateScanner
             }
 
             scanned += usableBytes;
-            progress?.Report(scanned);
+            progress?.Report(
+                checked(scanStartRelative + scanned));
 
             if (bytesRead < requestBytes)
             {
@@ -286,7 +296,8 @@ public sealed class MftCandidateScanner
             }
         }
 
-        progress?.Report(scanned);
+        progress?.Report(
+            checked(scanStartRelative + scanned));
         return results;
     }
 
