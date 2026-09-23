@@ -302,8 +302,7 @@ public sealed class MftCandidateScanner
         var normalizedTargets = targets
             .Where(target =>
                 !string.IsNullOrWhiteSpace(target.FullPath) &&
-                target.FileReferenceNumber != 0 &&
-                target.ParentFileReferenceNumber != 0)
+                target.FileReferenceNumber != 0)
             .Select(target => (
                 FullPath: NormalizePath(target.FullPath),
                 target.FileReferenceNumber,
@@ -338,9 +337,11 @@ public sealed class MftCandidateScanner
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var directoryPath = NtfsParentPathResolver.Resolve(
-                volumeHandle,
-                target.ParentFileReferenceNumber) ?? string.Empty;
+            var directoryPath = target.ParentFileReferenceNumber == 0
+                ? string.Empty
+                : NtfsParentPathResolver.Resolve(
+                    volumeHandle,
+                    target.ParentFileReferenceNumber) ?? string.Empty;
 
             var name = Path.GetFileName(target.FullPath);
             if (string.IsNullOrWhiteSpace(name))
