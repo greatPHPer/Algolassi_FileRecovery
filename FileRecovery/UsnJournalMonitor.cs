@@ -595,6 +595,7 @@ public sealed class UsnJournalMonitor : IDisposable
             return false;
         }
 
+        var normalizedTarget = NormalizePath(fullPath);
         var root = Path.GetPathRoot(fullPath);
         if (string.IsNullOrWhiteSpace(root) ||
             !string.Equals(
