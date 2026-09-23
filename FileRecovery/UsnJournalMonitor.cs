@@ -790,96 +790,112 @@ public sealed class UsnJournalMonitor : IDisposable
             return false;
         }
 
-        var records = ReadRecords(
-            volumeHandle,
-            journal.JournalId,
-            searchStart,
-            out var returnedNextUsn);
+        var nextUsn = searchStart;
+        const int maxBatches = 8;
 
-        System.Diagnostics.Debug.WriteLine(
-            $"Bounded USN lookup: target={normalizedTarget}, start={searchStart}, " +
-            $"journalNext={journal.NextUsn}, records={records.Count}, returnedNext={returnedNextUsn}.");
-
-        foreach (var record in records)
+        for (var batch = 0;
+             batch < maxBatches &&
+             nextUsn < journal.NextUsn;
+             batch++)
         {
-            if ((record.Reason & UsnReasonFileDelete) == 0 ||
-                (record.FileAttributes & 0x10) != 0 ||
-                string.IsNullOrWhiteSpace(record.FileName))
+            var records = ReadRecords(
+                volumeHandle,
+                journal.JournalId,
+                nextUsn,
+                out var returnedNextUsn);
+
+            System.Diagnostics.Debug.WriteLine(
+                $"Bounded USN lookup: target={normalizedTarget}, batch={batch + 1}, " +
+                $"start={nextUsn}, journalNext={journal.NextUsn}, " +
+                $"records={records.Count}, returnedNext={returnedNextUsn}.");
+
+            if (returnedNextUsn <= nextUsn)
             {
-                continue;
+                break;
             }
 
-            if (deletedAtUtc != default &&
-                Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes) > 5)
+            foreach (var record in records)
             {
-                continue;
-            }
+                if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                    (record.FileAttributes & 0x10) != 0 ||
+                    string.IsNullOrWhiteSpace(record.FileName))
+                {
+                    continue;
+                }
 
-            var cache = _parentPathCaches.GetOrAdd(
-                volumeKey,
-                _ => new ConcurrentDictionary<ulong, string>());
+                if (deletedAtUtc != default &&
+                    Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes) > 5)
+                {
+                    continue;
+                }
 
-            var directory = cache.TryGetValue(
-                record.ParentFileReferenceNumber,
-                out var knownPath)
-                ? knownPath
-                : ResolveParentDirectory(
-                    volumeHandle,
-                    record.ParentFileReferenceNumber);
+                var cache = _parentPathCaches.GetOrAdd(
+                    volumeKey,
+                    _ => new ConcurrentDictionary<ulong, string>());
 
-            if (!string.IsNullOrWhiteSpace(directory))
-            {
-                cache[record.ParentFileReferenceNumber] = directory;
-            }
+                var directory = cache.TryGetValue(
+                    record.ParentFileReferenceNumber,
+                    out var knownPath)
+                    ? knownPath
+                    : ResolveParentDirectory(
+                        volumeHandle,
+                        record.ParentFileReferenceNumber);
 
-            if (string.IsNullOrWhiteSpace(directory))
-            {
-                if (!string.Equals(
+                if (!string.IsNullOrWhiteSpace(directory))
+                {
+                    cache[record.ParentFileReferenceNumber] = directory;
+                }
+
+                if (string.IsNullOrWhiteSpace(directory))
+                {
+                    if (!string.Equals(
+                            record.FileName,
+                            Path.GetFileName(normalizedTarget),
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                }
+                else
+                {
+                    var candidatePath = NormalizePath(
+                        Path.Combine(directory, record.FileName));
+
+                    if (!string.Equals(
+                            candidatePath,
+                            normalizedTarget,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                }
+
+                fileReferenceNumber = record.FileReferenceNumber;
+                parentFileReferenceNumber = record.ParentFileReferenceNumber;
+
+                _recentDeletedRecords.Enqueue(
+                    new RecentDeletedRecord(
+                        fileReferenceNumber,
+                        parentFileReferenceNumber,
                         record.FileName,
-                        Path.GetFileName(normalizedTarget),
-                        StringComparison.OrdinalIgnoreCase))
+                        directory,
+                        record.TimestampUtc));
+
+                while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+                       _recentDeletedRecords.TryDequeue(out _))
                 {
-                    continue;
                 }
-            }
-            else
-            {
-                var candidatePath = NormalizePath(
-                    Path.Combine(directory, record.FileName));
 
-                if (!string.Equals(
-                        candidatePath,
-                        normalizedTarget,
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
+                return true;
             }
 
-            fileReferenceNumber = record.FileReferenceNumber;
-            parentFileReferenceNumber = record.ParentFileReferenceNumber;
-
-            _recentDeletedRecords.Enqueue(
-                new RecentDeletedRecord(
-                    fileReferenceNumber,
-                    parentFileReferenceNumber,
-                    record.FileName,
-                    directory,
-                    record.TimestampUtc));
-
-            while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
-                   _recentDeletedRecords.TryDequeue(out _))
-            {
-            }
-
-            return true;
+            nextUsn = returnedNextUsn;
         }
 
         // The recovery-time bounded lookup is read-only with respect to the
         // monitor cursor. The background USN monitor owns cursor advancement;
         // otherwise a failed lookup could skip journal records before the monitor
         // has had a chance to cache them.
-        _ = returnedNextUsn;
 
         return false;
     }
