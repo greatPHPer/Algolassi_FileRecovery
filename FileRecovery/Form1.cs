@@ -754,7 +754,7 @@ public partial class Form1 : Form
                     var directRecords = group
                         .Where(record =>
                             record.FileReferenceNumber.HasValue &&
-                            record.ParentFileReferenceNumber.HasValue)
+                            record.FileReferenceNumber.Value != 0)
                         .ToList();
 
                     var legacyRecords = group
@@ -775,7 +775,7 @@ public partial class Form1 : Form
                             .Select(record => (
                                 FullPath: NormalizePath(record.FullPath),
                                 FileReferenceNumber: record.FileReferenceNumber!.Value,
-                                ParentFileReferenceNumber: record.ParentFileReferenceNumber!.Value,
+                                ParentFileReferenceNumber: record.ParentFileReferenceNumber ?? 0,
                                 DeletedAtUtc: record.DeletedAtUtc))
                             .ToList();
 
