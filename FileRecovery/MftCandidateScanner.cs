@@ -127,6 +127,10 @@ public sealed class MftCandidateScanner
         var results = new List<RecoveryCandidate>();
         var seenReferences = new HashSet<ulong>();
         var recordSize = checked((int)volumeInfo.BytesPerFileRecordSegment);
+        var fileSignatureCount = 0L;
+        var deletedRecordCount = 0L;
+        var fileNameEntryCount = 0L;
+        var targetNameMatchCount = 0L;
 
         if (recordSize <= 0 ||
             volumeInfo.MftValidDataLength <= 0)
@@ -138,11 +142,16 @@ public sealed class MftCandidateScanner
             volumeInfo.MftValidDataLength,
             maxBytesToScan);
 
-        // Prefer the newest portion of the MFT for the bounded fallback.
-        // Recently-created files are often represented near the current end
-        // of the valid MFT range, while keeping the same overall safety bound.
+        // Prefer the newest portion of the MFT for the bounded fallback,
+        // but always start on an exact MFT record boundary.
         var scanStartRelative = checked(
             volumeInfo.MftValidDataLength - bytesToScan);
+
+        scanStartRelative -= scanStartRelative % recordSize;
+        bytesToScan = Math.Min(
+            maxBytesToScan,
+            checked(volumeInfo.MftValidDataLength - scanStartRelative));
+        bytesToScan -= bytesToScan % recordSize;
 
         var scanBufferSize = bufferSize - bufferSize % recordSize;
         scanBufferSize = Math.Max(recordSize, scanBufferSize);
@@ -204,8 +213,18 @@ public sealed class MftCandidateScanner
 
                 // Parse the FILE record directly from the read buffer. Avoid
                 // copying every MFT record into a second array.
+                var recordSpan = buffer.AsSpan(offset, recordSize);
+                if (recordSpan.Length >= 4 &&
+                    recordSpan[0] == (byte)'F' &&
+                    recordSpan[1] == (byte)'I' &&
+                    recordSpan[2] == (byte)'L' &&
+                    recordSpan[3] == (byte)'E')
+                {
+                    fileSignatureCount++;
+                }
+
                 if (!TryParseDeletedFileNameEntries(
-                        buffer.AsSpan(offset, recordSize),
+                        recordSpan,
                         volumeInfo.BytesPerSector,
                         checked((ulong)((scanStartRelative + scanned + offset) / recordSize)),
                         out var fileReferenceNumber,
@@ -214,12 +233,17 @@ public sealed class MftCandidateScanner
                     continue;
                 }
 
+                deletedRecordCount++;
+                fileNameEntryCount += fileEntries.Count;
+
                 foreach (var entry in fileEntries)
                 {
                     if (!targetsByName.TryGetValue(entry.Name, out var sameNameTargets))
                     {
                         continue;
                     }
+
+                    targetNameMatchCount++;
 
                     // Most legacy history lookups have a unique filename. In that
                     // case the historical directory is authoritative enough for the
@@ -294,6 +318,43 @@ public sealed class MftCandidateScanner
         }
 
         progress?.Report(scanned);
+
+        System.Diagnostics.Debug.WriteLine(
+            $"Raw MFT fallback: scanned={scanned:N0} bytes, " +
+            $"recordSize={recordSize:N0}, FILE signatures={fileSignatureCount:N0}, " +
+            $"deletedRecords={deletedRecordCount:N0}, FILE_NAME entries={fileNameEntryCount:N0}, " +
+            $"targetNameMatches={targetNameMatchCount:N0}, results={results.Count:N0}.");
+
+        if (results.Count == 0)
+        {
+            // Fresh deletions are usually represented in the bounded USN/MFT
+            // enumeration even when the raw MFT window did not contain the
+            // target record. Keep this lookup bounded; raw MFT remains the
+            // fallback for volumes/history predating the journal.
+            try
+            {
+                var usnCandidates = ScanForPaths(
+                    root,
+                    normalizedTargets.ToList(),
+                    cancellationToken,
+                    maxPages: 128);
+
+                if (usnCandidates.Count > 0)
+                {
+                    return usnCandidates;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"Bounded USN fallback failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         return results;
     }
 
