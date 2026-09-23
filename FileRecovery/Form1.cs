@@ -828,13 +828,13 @@ public partial class Form1 : Form
                         lblStatus.Text =
                             $"Scanning the NTFS $MFT directly on {root} (up to 512 MB) for {legacyRecords.Count:N0} selected item(s)...";
 
-                        var fallbackCandidates = await Task.Run(
-                            () => _mftCandidateScanner.ScanRawMftForPathsAsync(
+                        var fallbackCandidates =
+                            await _mftCandidateScanner.ScanRawMftForPathsAsync(
                                 root,
                                 targetPaths,
                                 fallbackCts.Token,
                                 maxBytesToScan: maxFallbackBytes,
-                                progress: fallbackProgress));
+                                progress: fallbackProgress);
 
                         foreach (var record in legacyRecords)
                         {
