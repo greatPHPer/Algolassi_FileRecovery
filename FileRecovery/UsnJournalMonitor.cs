@@ -335,8 +335,15 @@ public sealed class UsnJournalMonitor : IDisposable
         }
 
         var nextUsn = cursor.NextUsn;
-        while (!_cts.IsCancellationRequested && nextUsn < journal.NextUsn)
+        const int maxBatchesPerVolumePerCycle = 8;
+        var batchesRead = 0;
+
+        while (!_cts.IsCancellationRequested &&
+               nextUsn < journal.NextUsn &&
+               batchesRead < maxBatchesPerVolumePerCycle)
         {
+            batchesRead++;
+
             var records = ReadRecords(volumeHandle, journal.JournalId, nextUsn, out var returnedNextUsn);
 
             if (returnedNextUsn <= nextUsn)
@@ -410,6 +417,15 @@ public sealed class UsnJournalMonitor : IDisposable
             {
                 break;
             }
+        }
+
+        if (!_cts.IsCancellationRequested &&
+            batchesRead >= maxBatchesPerVolumePerCycle &&
+            nextUsn < journal.NextUsn)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"USN monitor yielding {volumeKey} after {batchesRead} read batch(es); " +
+                $"cursor={nextUsn}, journalNext={journal.NextUsn}.");
         }
     }
 
@@ -847,15 +863,11 @@ public sealed class UsnJournalMonitor : IDisposable
             return true;
         }
 
-        if (returnedNextUsn > searchStart)
-        {
-            _settings.UsnCursors[volumeKey] = new VolumeJournalCursor
-            {
-                JournalId = journal.JournalId,
-                NextUsn = returnedNextUsn
-            };
-            _settings.Save();
-        }
+        // The recovery-time bounded lookup is read-only with respect to the
+        // monitor cursor. The background USN monitor owns cursor advancement;
+        // otherwise a failed lookup could skip journal records before the monitor
+        // has had a chance to cache them.
+        _ = returnedNextUsn;
 
         return false;
     }
