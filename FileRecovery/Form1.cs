@@ -551,45 +551,40 @@ public partial class Form1 : Form
     private async Task<List<DeletionRecord>> ResolveMissingNtfsReferencesAsync(
         IReadOnlyList<DeletionRecord> records)
     {
-        if (records.Count == 0)
-        {
-            return [];
-        }
+        var resolved = new List<DeletionRecord>();
 
-        var resolved = await Task.Run(() =>
+        foreach (var record in records)
         {
-            var found = new List<DeletionRecord>();
-
-            foreach (var record in records)
+            if (record.FileReferenceNumber.HasValue &&
+                record.ParentFileReferenceNumber.HasValue)
             {
-                if (record.FileReferenceNumber.HasValue &&
-                    record.ParentFileReferenceNumber.HasValue)
-                {
-                    continue;
-                }
-
-                try
-                {
-                    if (_usnMonitor.TryResolveRecentDeletedFile(
-                            record.FullPath,
-                            record.DeletedAtUtc,
-                            out var fileReferenceNumber,
-                            out var parentFileReferenceNumber))
-                    {
-                        record.FileReferenceNumber = fileReferenceNumber;
-                        record.ParentFileReferenceNumber = parentFileReferenceNumber;
-                        found.Add(record);
-                    }
-                }
-                catch
-                {
-                    // Reference resolution is best-effort. The normal bounded
-                    // MFT fallback remains available when USN cannot resolve it.
-                }
+                continue;
             }
 
-            return found;
-        }).ConfigureAwait(true);
+            // Do not perform a recovery-time journal enumeration here. The
+            // background USN monitor already caches recent deletion records.
+            // Give that monitor a short window to observe the deletion, then
+            // let the bounded raw MFT fallback handle anything still unresolved.
+            for (var attempt = 0; attempt < 5; attempt++)
+            {
+                if (_usnMonitor.TryResolveCachedRecentDeletedFile(
+                        record.FullPath,
+                        record.DeletedAtUtc,
+                        out var fileReferenceNumber,
+                        out var parentFileReferenceNumber))
+                {
+                    record.FileReferenceNumber = fileReferenceNumber;
+                    record.ParentFileReferenceNumber = parentFileReferenceNumber;
+                    resolved.Add(record);
+                    break;
+                }
+
+                if (attempt < 4)
+                {
+                    await Task.Delay(250).ConfigureAwait(true);
+                }
+            }
+        }
 
         foreach (var record in resolved)
         {
