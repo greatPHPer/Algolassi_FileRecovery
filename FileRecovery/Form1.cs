@@ -751,26 +751,9 @@ public partial class Form1 : Form
                         var resolvedRecords = await ResolveMissingNtfsReferencesAsync(
                             unresolvedReferenceRecords);
 
-                        if (resolvedRecords.Count > 0)
-                        {
-                            var resolvedIds = resolvedRecords
-                                .Select(record => record.Id)
-                                .ToHashSet();
-
-                            foreach (var resolvedRecord in resolvedRecords)
-                            {
-                                var original = missingRecords
-                                    .FirstOrDefault(record => record.Id == resolvedRecord.Id);
-
-                                if (original is not null)
-                                {
-                                    original.FileReferenceNumber =
-                                        resolvedRecord.FileReferenceNumber;
-                                    original.ParentFileReferenceNumber =
-                                        resolvedRecord.ParentFileReferenceNumber;
-                                }
-                            }
-                        }
+                        // ResolveMissingNtfsReferencesAsync mutates the matching
+                        // records in this grouped list, so the direct/legacy split
+                        // below sees the newly resolved references immediately.
                     }
 
                     var directRecords = group
@@ -785,9 +768,9 @@ public partial class Form1 : Form
                             !record.ParentFileReferenceNumber.HasValue)
                         .ToList();
 
-                    // Do not perform an unbounded recovery-time scan of the USN journal.
-                    // The re-check above only asks the already-running monitor for a
-                    // recent deletion reference before using the raw MFT fallback.
+                    // Keep the normal raw MFT fallback bounded. The USN re-check
+                    // above is performed through the already-running monitor before
+                    // legacy scanning is attempted.
                     // A historical lookup can enumerate a large journal and make
                     // Recover Selected appear hung. NTFS references are captured by
                     // the background USN monitor and merged into history separately.
