@@ -775,15 +775,15 @@ public sealed class UsnJournalMonitor : IDisposable
         }
 
         var normalizedTarget = NormalizePath(fullPath);
-        var searchStart = journal.FirstUsn;
 
-        if (_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) &&
-            cursor.JournalId == journal.JournalId &&
-            cursor.NextUsn >= journal.FirstUsn &&
-            cursor.NextUsn <= journal.NextUsn)
-        {
-            searchStart = cursor.NextUsn;
-        }
+        // Recovery must still be able to find a deletion when the background
+        // monitor has already advanced its cursor past that USN. Start from a
+        // recent USN window instead of depending exclusively on the shared
+        // monitor cursor. A recent Shift+Delete should be near the journal tail.
+        const long recentUsnWindow = 10_000_000;
+        var searchStart = Math.Max(
+            journal.FirstUsn,
+            journal.NextUsn - recentUsnWindow);
 
         if (searchStart >= journal.NextUsn)
         {
@@ -795,6 +795,10 @@ public sealed class UsnJournalMonitor : IDisposable
             journal.JournalId,
             searchStart,
             out var returnedNextUsn);
+
+        System.Diagnostics.Debug.WriteLine(
+            $"Bounded USN lookup: target={normalizedTarget}, start={searchStart}, " +
+            $"journalNext={journal.NextUsn}, records={records.Count}, returnedNext={returnedNextUsn}.");
 
         foreach (var record in records)
         {
@@ -830,18 +834,26 @@ public sealed class UsnJournalMonitor : IDisposable
 
             if (string.IsNullOrWhiteSpace(directory))
             {
-                continue;
+                if (!string.Equals(
+                        record.FileName,
+                        Path.GetFileName(normalizedTarget),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
             }
-
-            var candidatePath = NormalizePath(
-                Path.Combine(directory, record.FileName));
-
-            if (!string.Equals(
-                    candidatePath,
-                    normalizedTarget,
-                    StringComparison.OrdinalIgnoreCase))
+            else
             {
-                continue;
+                var candidatePath = NormalizePath(
+                    Path.Combine(directory, record.FileName));
+
+                if (!string.Equals(
+                        candidatePath,
+                        normalizedTarget,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
             }
 
             fileReferenceNumber = record.FileReferenceNumber;
