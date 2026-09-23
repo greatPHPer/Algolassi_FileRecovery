@@ -287,8 +287,7 @@ public sealed class MftCandidateScanner
             }
 
             scanned += usableBytes;
-            progress?.Report(
-                checked(scanStartRelative + scanned));
+            progress?.Report(scanned);
 
             if (bytesRead < requestBytes)
             {
@@ -296,8 +295,7 @@ public sealed class MftCandidateScanner
             }
         }
 
-        progress?.Report(
-            checked(scanStartRelative + scanned));
+        progress?.Report(scanned);
         return results;
     }
 
