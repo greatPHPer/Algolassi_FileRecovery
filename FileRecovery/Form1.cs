@@ -817,13 +817,15 @@ public partial class Form1 : Form
                             TimeSpan.FromSeconds(20));
 
                         const long maxFallbackBytes = 512L * 1024L * 1024L;
-                        var fallbackProgress = new Progress<long>(bytesScanned =>
-                        {
-                            var scannedMb = bytesScanned / (1024d * 1024d);
-                            var totalMb = maxFallbackBytes / (1024d * 1024d);
-                            lblStatus.Text =
-                                $"Scanning the NTFS $MFT on {root}: {scannedMb:0} / {totalMb:0} MB for {legacyRecords.Count:N0} selected item(s)...";
-                        });
+                        var fallbackProgress = new SynchronousProgress<long>(
+                            this,
+                            bytesScanned =>
+                            {
+                                var scannedMb = bytesScanned / (1024d * 1024d);
+                                var totalMb = maxFallbackBytes / (1024d * 1024d);
+                                lblStatus.Text =
+                                    $"Scanning the NTFS $MFT on {root}: {scannedMb:0} / {totalMb:0} MB for {legacyRecords.Count:N0} selected item(s)...";
+                            });
 
                         lblStatus.Text =
                             $"Scanning the NTFS $MFT directly on {root} (up to 512 MB) for {legacyRecords.Count:N0} selected item(s)...";
@@ -1312,5 +1314,15 @@ public partial class Form1 : Form
 
         e.Cancel = true;
         Hide();
+    }
+}
+public sealed class SynchronousProgress<T>(Control control, Action<T> handler) : IProgress<T>
+{
+    public void Report(T value)
+    {
+        if (control.IsHandleCreated && !control.IsDisposed)
+        {
+            control.Invoke(() => handler(value));
+        }
     }
 }
