@@ -184,14 +184,12 @@ public sealed class MftCandidateScanner
             // FileStream's async layer does not handle this raw NTFS volume
             // handle reliably on Windows. Issue the overlapped volume read
             // directly so cancellation can call CancelIoEx on the pending I/O.
-            var bytesRead = await Task.Run(
-                () => ReadRawVolumeChunk(
-                    mftScanVolumeHandle,
-                    buffer,
-                    requestBytes,
-                    readOffset,
-                    cancellationToken),
-                CancellationToken.None).ConfigureAwait(false);
+            var bytesRead = ReadRawVolumeChunk(
+                mftScanVolumeHandle,
+                buffer,
+                requestBytes,
+                readOffset,
+                cancellationToken);
 
             if (bytesRead <= 0)
             {
