@@ -76,7 +76,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             _mainForm = new Form1(
                 _history,
-                new RecycleBinService());
+                new RecycleBinService(),
+                _usnMonitor);
             _mainForm.FormClosed += (_, _) =>
             {
                 if (!_exiting)
