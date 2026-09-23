@@ -567,7 +567,7 @@ public partial class Form1 : Form
             // let the bounded raw MFT fallback handle anything still unresolved.
             for (var attempt = 0; attempt < 5; attempt++)
             {
-                if (_usnMonitor.TryResolveCachedRecentDeletedFile(
+                if (_usnMonitor.TryResolveRecentDeletedFileBounded(
                         record.FullPath,
                         record.DeletedAtUtc,
                         out var fileReferenceNumber,
