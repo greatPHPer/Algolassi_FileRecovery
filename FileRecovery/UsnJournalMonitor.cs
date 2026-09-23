@@ -709,6 +709,157 @@ public sealed class UsnJournalMonitor : IDisposable
         return false;
     }
 
+    public bool TryResolveRecentDeletedFileBounded(
+        string fullPath,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        if (TryResolveCachedRecentDeletedFile(
+                fullPath,
+                deletedAtUtc,
+                out fileReferenceNumber,
+                out parentFileReferenceNumber))
+        {
+            return true;
+        }
+
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        if (!IsAdministrator())
+        {
+            return false;
+        }
+
+        var root = Path.GetPathRoot(fullPath);
+        if (string.IsNullOrWhiteSpace(root) ||
+            !string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        using var volumeHandle = CreateFile(
+            $@"\\.\{volumeKey[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (volumeHandle.IsInvalid ||
+            !TryQueryJournal(volumeHandle, out var journal, out _))
+        {
+            return false;
+        }
+
+        var normalizedTarget = NormalizePath(fullPath);
+        var searchStart = journal.FirstUsn;
+
+        if (_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) &&
+            cursor.JournalId == journal.JournalId &&
+            cursor.NextUsn >= journal.FirstUsn &&
+            cursor.NextUsn <= journal.NextUsn)
+        {
+            searchStart = cursor.NextUsn;
+        }
+
+        if (searchStart >= journal.NextUsn)
+        {
+            return false;
+        }
+
+        var records = ReadRecords(
+            volumeHandle,
+            journal.JournalId,
+            searchStart,
+            out var returnedNextUsn);
+
+        foreach (var record in records)
+        {
+            if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                (record.FileAttributes & 0x10) != 0 ||
+                string.IsNullOrWhiteSpace(record.FileName))
+            {
+                continue;
+            }
+
+            if (deletedAtUtc != default &&
+                Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes) > 5)
+            {
+                continue;
+            }
+
+            var cache = _parentPathCaches.GetOrAdd(
+                volumeKey,
+                _ => new ConcurrentDictionary<ulong, string>());
+
+            var directory = cache.TryGetValue(
+                record.ParentFileReferenceNumber,
+                out var knownPath)
+                ? knownPath
+                : ResolveParentDirectory(
+                    volumeHandle,
+                    record.ParentFileReferenceNumber);
+
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                cache[record.ParentFileReferenceNumber] = directory;
+            }
+
+            if (string.IsNullOrWhiteSpace(directory))
+            {
+                continue;
+            }
+
+            var candidatePath = NormalizePath(
+                Path.Combine(directory, record.FileName));
+
+            if (!string.Equals(
+                    candidatePath,
+                    normalizedTarget,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            fileReferenceNumber = record.FileReferenceNumber;
+            parentFileReferenceNumber = record.ParentFileReferenceNumber;
+
+            _recentDeletedRecords.Enqueue(
+                new RecentDeletedRecord(
+                    fileReferenceNumber,
+                    parentFileReferenceNumber,
+                    record.FileName,
+                    directory,
+                    record.TimestampUtc));
+
+            while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+                   _recentDeletedRecords.TryDequeue(out _))
+            {
+            }
+
+            return true;
+        }
+
+        if (returnedNextUsn > searchStart)
+        {
+            _settings.UsnCursors[volumeKey] = new VolumeJournalCursor
+            {
+                JournalId = journal.JournalId,
+                NextUsn = returnedNextUsn
+            };
+            _settings.Save();
+        }
+
+        return false;
+    }
+
     private static string NormalizePath(string path) =>
         path.Trim().Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
 
