@@ -685,6 +685,88 @@ public partial class Form1 : Form
                 }
             }
 
+            // A live deletion can be observed reliably by AlgoLassi while the
+            // application is running even when the original MFT record is already
+            // reused, moved to the Recycle Bin, or otherwise no longer matches the
+            // historical file-reference sequence. Do not weaken MFT sequence checks
+            // to force such a record through. Instead, retain the trusted live event
+            // as a metadata-only candidate so the NTFS scan still shows the evidence.
+            var liveEvidenceSources = recentHistoryRecords
+                .Where(record =>
+                    record.FileReferenceNumber.HasValue &&
+                    record.ParentFileReferenceNumber.HasValue)
+                .Select(record => new
+                {
+                    FullPath = NormalizePath(record.FullPath),
+                    FileReferenceNumber = record.FileReferenceNumber!.Value,
+                    ParentFileReferenceNumber = record.ParentFileReferenceNumber!.Value,
+                    FileName = record.FileName,
+                    DirectoryPath = record.DirectoryPath,
+                    DeletedAtUtc = record.DeletedAtUtc
+                })
+                .Concat(
+                    recentLiveUsnDeletes
+                        .Where(record =>
+                            record.FileReferenceNumber != 0 &&
+                            record.ParentFileReferenceNumber != 0)
+                        .Select(record => new
+                        {
+                            FullPath = NormalizePath(record.FullPath),
+                            record.FileReferenceNumber,
+                            record.ParentFileReferenceNumber,
+                            record.FileName,
+                            record.DirectoryPath,
+                            record.DeletedAtUtc
+                        }))
+                .GroupBy(
+                    source => source.FullPath,
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group => group
+                    .OrderByDescending(source => source.DeletedAtUtc)
+                    .First())
+                .ToList();
+
+            var liveEvidenceCandidateCount = 0;
+
+            foreach (var source in liveEvidenceSources)
+            {
+                var candidatePath = NormalizePath(source.FullPath);
+                if (!candidatePaths.Add(candidatePath))
+                {
+                    continue;
+                }
+
+                var directoryPath = string.IsNullOrWhiteSpace(source.DirectoryPath)
+                    ? Path.GetDirectoryName(source.FullPath) ?? string.Empty
+                    : NormalizePath(source.DirectoryPath);
+
+                candidates.Add(new RecoveryCandidate
+                {
+                    FileReferenceNumber = source.FileReferenceNumber,
+                    ParentFileReferenceNumber = source.ParentFileReferenceNumber,
+                    Name = source.FileName,
+                    DirectoryPath = directoryPath,
+                    LastUsnTimestampUtc = source.DeletedAtUtc,
+                    Strength = RecoveryStrength.Weak,
+                    Evidence =
+                        "AlgoLassi observed this deletion while the application was running, " +
+                        "but the current NTFS MFT record could not be safely matched to the " +
+                        "historical file reference.",
+                    DataStreamFound = false,
+                    DataEvidence =
+                        "No current NTFS $DATA stream was retained under the original " +
+                        "file reference. The file may have been moved to the Recycle Bin, " +
+                        "its MFT entry may have been reused, or its deleted metadata may " +
+                        "no longer be available.",
+                });
+
+                liveEvidenceCandidateCount++;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live evidence candidates: added={liveEvidenceCandidateCount:N0}, " +
+                $"trustedSources={liveEvidenceSources.Count:N0}, totalCandidates={candidates.Count:N0}.");
+
             var liveHistoryByPath = recentHistoryRecords
                 .Where(record => record.FileReferenceNumber.HasValue)
                 .GroupBy(
@@ -759,9 +841,12 @@ public partial class Form1 : Form
             lblFiles.Text = $"NTFS candidates ({filtered.Count:N0})";
             lblStatus.Text = filtered.Count == 0
                 ? $"No deleted-file metadata candidates were found under {scanDirectory}."
-                : mergedLiveHistoryCount > 0 || mergedLiveUsnCount > 0 || directLiveCandidates.Count > 0
+                : mergedLiveHistoryCount > 0 ||
+                  mergedLiveUsnCount > 0 ||
+                  directLiveCandidates.Count > 0 ||
+                  liveEvidenceCandidateCount > 0
                     ? $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}; " +
-                      $"{mergedLiveUsnCount + mergedLiveHistoryCount + directLiveCandidates.Count:N0} recent live deletion evidence item(s) were included."
+                      $"{mergedLiveUsnCount + mergedLiveHistoryCount + directLiveCandidates.Count + liveEvidenceCandidateCount:N0} recent live deletion evidence item(s) were included."
                     : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}.";
         }
         catch (UnauthorizedAccessException)
