@@ -45,6 +45,12 @@ public sealed class NtfsMftDataReader
             return NotFound("The deleted file's MFT segment is outside the current valid MFT range.");
         }
 
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS $DATA lookup: fileRef={fileReferenceNumber}, " +
+            $"segment={segmentNumber}, sequence={sequenceNumber}, " +
+            $"recordSize={volumeInfo.BytesPerFileRecordSegment}, " +
+            $"mftValidLength={volumeInfo.MftValidDataLength}.");
+
         var record = ReadRecord(
             volumeHandle,
             volumeInfo,
@@ -54,10 +60,25 @@ public sealed class NtfsMftDataReader
 
         if (record is null)
         {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $DATA lookup: ReadRecord returned null for fileRef={fileReferenceNumber}.");
             return NotFound("The referenced MFT segment no longer contains a valid deleted-file record.");
         }
 
+        var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
         var dataAttributes = FindUnnamedDataAttributes(record, volumeInfo);
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS $DATA lookup: MFT record flags=0x{flags:X4}, " +
+            $"unnamedDataAttributes={dataAttributes.Count}.");
+
+        foreach (var dataAttribute in dataAttributes)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $DATA attribute: resident={dataAttribute.IsResident}, " +
+                $"lowestVcn={dataAttribute.LowestVcn}, fileSize={dataAttribute.FileSizeBytes}, " +
+                $"validLength={dataAttribute.ValidDataLengthBytes}, extents={dataAttribute.Extents.Count}.");
+        }
 
         var attributeList = FindAttributeList(record, volumeInfo, volumeHandle);
         if (!attributeList.Found)
@@ -126,6 +147,9 @@ public sealed class NtfsMftDataReader
         var result = new List<DataAttributeDescriptor>();
         foreach (var attribute in EnumerateAttributes(record))
         {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS attribute: type=0x{attribute.Type:X8}, form={attribute.FormCode}, " +
+                $"nameLength={attribute.NameLength}, offset={attribute.Offset}, length={attribute.Length}.");
             if (attribute.Type != NtfsAttributeData || attribute.NameLength != 0)
             {
                 continue;
@@ -586,6 +610,8 @@ public sealed class NtfsMftDataReader
             record[2] != (byte)'L' ||
             record[3] != (byte)'E')
         {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS ReadRecord: invalid FILE signature for segment={segmentNumber}.");
             return null;
         }
 
@@ -596,19 +622,31 @@ public sealed class NtfsMftDataReader
 
         if (expectedSequenceNumber != 0 && sequenceNumber != expectedSequenceNumber)
         {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS ReadRecord: sequence mismatch segment={segmentNumber}, " +
+                $"expected={expectedSequenceNumber}, actual={sequenceNumber}.");
             return null;
         }
 
         if ((flags & 0x0001) != 0)
         {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS ReadRecord: record is still marked in-use; flags=0x{flags:X4}, segment={segmentNumber}.");
             return null;
         }
 
         var baseFileReference = BinaryPrimitives.ReadUInt64LittleEndian(record.AsSpan(32, 8));
         if (baseFileReference != 0 && baseFileReference != expectedBaseFileReference)
         {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS ReadRecord: base reference mismatch segment={segmentNumber}, " +
+                $"baseRef={baseFileReference}, expected={expectedBaseFileReference}.");
             return null;
         }
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS ReadRecord: valid deleted record segment={segmentNumber}, " +
+            $"sequence={sequenceNumber}, flags=0x{flags:X4}, baseRef={baseFileReference}.");
 
         return record;
     }
