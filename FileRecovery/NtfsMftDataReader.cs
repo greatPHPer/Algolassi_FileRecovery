@@ -30,7 +30,8 @@ public sealed class NtfsMftDataReader
         SafeFileHandle volumeHandle,
         ulong fileReferenceNumber,
         string? expectedFileName = null,
-        ulong? expectedParentFileReferenceNumber = null)
+        ulong? expectedParentFileReferenceNumber = null,
+        string? expectedFullPath = null)
     {
         var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
         var sequenceNumber = (ushort)(fileReferenceNumber >> 48);
@@ -94,9 +95,11 @@ public sealed class NtfsMftDataReader
 
             if (relaxedRecord is not null &&
                 HasMatchingFileNameEntry(
+                    rawMftVolumeHandle,
                     relaxedRecord,
                     expectedFileName,
                     expectedParentFileReferenceNumber.Value,
+                    expectedFullPath,
                     expectedSequenceNumber: sequenceNumber))
             {
                 System.Diagnostics.Debug.WriteLine(
@@ -954,9 +957,11 @@ public sealed class NtfsMftDataReader
     }
 
     private static bool HasMatchingFileNameEntry(
+        SafeFileHandle volumeHandle,
         byte[] record,
         string expectedFileName,
         ulong expectedParentFileReferenceNumber,
+        string? expectedFullPath,
         ushort expectedSequenceNumber = 0)
     {
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(
@@ -1010,11 +1015,6 @@ public sealed class NtfsMftDataReader
             var parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
                 record.AsSpan(valueStart, 8));
 
-            if (parentReference != expectedParentFileReferenceNumber)
-            {
-                continue;
-            }
-
             var nameLength = record[valueStart + 64];
             var nameBytes = checked(nameLength * 2);
 
@@ -1027,12 +1027,53 @@ public sealed class NtfsMftDataReader
             var name = System.Text.Encoding.Unicode.GetString(
                 record.AsSpan(valueStart + 66, nameBytes));
 
-            if (string.Equals(
+            if (!string.Equals(
                     name,
                     normalizedName,
                     StringComparison.OrdinalIgnoreCase))
             {
+                continue;
+            }
+
+            if (parentReference == expectedParentFileReferenceNumber)
+            {
                 return true;
+            }
+
+            // The USN parent reference can become stale after the parent
+            // directory's own MFT sequence changes. When the historical full
+            // path is available, validate the retained FILE_NAME against the
+            // current parent path instead of requiring the old 64-bit parent
+            // reference to match byte-for-byte.
+            if (!string.IsNullOrWhiteSpace(expectedFullPath))
+            {
+                try
+                {
+                    var currentParentPath = NtfsParentPathResolver.Resolve(
+                        volumeHandle,
+                        parentReference);
+
+                    var currentFullPath = string.IsNullOrWhiteSpace(currentParentPath)
+                        ? name
+                        : Path.Combine(currentParentPath, name);
+
+                    if (string.Equals(
+                            NormalizePath(currentFullPath),
+                            NormalizePath(expectedFullPath),
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"NTFS $DATA lookup: accepted FILE_NAME path match despite stale parent reference. " +
+                            $"expectedParent={expectedParentFileReferenceNumber}, actualParent={parentReference}, " +
+                            $"path={currentFullPath}.");
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS $DATA lookup: FILE_NAME path validation failed for parentRef={parentReference}: {ex.Message}");
+                }
             }
         }
 
