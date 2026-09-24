@@ -14,6 +14,7 @@ public partial class Form1 : Form
     private readonly UsnJournalMonitor _usnMonitor;
     private readonly MftCandidateScanner _mftCandidateScanner = new();
     private readonly NtfsByteRecoveryService _ntfsRecoveryService = new();
+    private readonly NtfsDeepFileRecoveryService _ntfsDeepFileRecoveryService = new();
     private bool _allowClose;
     private bool _refreshInProgress;
     private bool _historyRefreshPending;
@@ -461,13 +462,14 @@ public partial class Form1 : Form
             if (missingDataPaths.Count > 0)
             {
                 lblStatus.Text =
-                    $"Found {candidates.Count:N0} candidate(s); resolving NTFS $DATA evidence for {missingDataPaths.Count:N0} item(s)...";
+                    $"Found {candidates.Count:N0} candidate(s); exhaustively scanning the NTFS $MFT for retained deleted records ({missingDataPaths.Count:N0} item(s))...";
 
                 var fallbackCandidates =
                     await _mftCandidateScanner.ScanRawMftForPathsAsync(
                         rootPath,
                         missingDataPaths,
-                        CancellationToken.None);
+                        CancellationToken.None,
+                        maxBytesToScan: long.MaxValue);
 
                 if (fallbackCandidates.Count > 0)
                 {
@@ -1158,9 +1160,27 @@ public partial class Form1 : Form
         {
             try
             {
-                successes.Add(_ntfsRecoveryService.Recover(
-                    candidate,
-                    destinationDirectory));
+                if (candidate.DataStreamFound)
+                {
+                    successes.Add(_ntfsRecoveryService.Recover(
+                        candidate,
+                        destinationDirectory));
+                    continue;
+                }
+
+                // The retained MFT metadata is insufficient for this candidate.
+                // Move the deep free-space scan off the UI thread because it can
+                // inspect hundreds of megabytes of unallocated NTFS clusters.
+                lblStatus.Text =
+                    $"Deep-scanning NTFS free space for {candidate.Name}...";
+
+                var carved = await Task.Run(
+                    () => _ntfsDeepFileRecoveryService.Recover(
+                        candidate,
+                        destinationDirectory,
+                        CancellationToken.None));
+
+                successes.Add(carved);
             }
             catch (Exception ex)
             {
