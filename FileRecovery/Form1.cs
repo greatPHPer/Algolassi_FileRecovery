@@ -397,8 +397,7 @@ public partial class Form1 : Form
         if (string.IsNullOrWhiteSpace(root))
         {
             MessageBox.Show(
-                this,
-                "The selected directory is not on a valid Windows volume.",
+                this,                "The selected directory is not on a valid Windows volume.",
                 "NTFS Scan",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
@@ -579,7 +578,7 @@ public partial class Form1 : Form
             : Path.GetPathRoot(firstDirectory);
     }
 
-    private void btnSkipRecycleBin_Click(object? sender, EventArgs e)
+    private async void btnSkipRecycleBin_Click(object? sender, EventArgs e)
     {
         var rows = dgvResults.SelectedRows
             .Cast<DataGridViewRow>()
@@ -597,18 +596,34 @@ public partial class Form1 : Form
             .Where(row => row.HistoryId.HasValue)
             .ToList();
 
-        if (historyRows.Count != rows.Count)
+        var ntfsRows = rows
+            .Where(row => row.RecoveryCandidate is not null)
+            .ToList();
+
+        // In NTFS deleted-files-scan mode the item has already bypassed
+        // the Windows Recycle Bin, so "Skip Recycle Bin" acts as the
+        // direct NTFS recovery action for the selected candidates.
+        if (ntfsRows.Count == rows.Count)
         {
-            MessageBox.Show(
-                this,
-                "Skip Recycle Bin is available for deletion history rows only.",
-                "Recovery Selection",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+            await RecoverNtfsCandidatesAsync(
+                ntfsRows
+                    .Select(row => row.RecoveryCandidate!)
+                    .ToList());
             return;
         }
 
-        _ = RestoreHistoryRowsAsync(historyRows, skipRecycleBin: true);
+        if (historyRows.Count == rows.Count)
+        {
+            await RestoreHistoryRowsAsync(historyRows, skipRecycleBin: true);
+            return;
+        }
+
+        MessageBox.Show(
+            this,
+            "Select either deletion-history items or NTFS deleted-file candidates, not a mixture of both.",
+            "Recovery Selection",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information);
     }
 
     private async void btnRecover_Click(object? sender, EventArgs e)
@@ -798,7 +813,6 @@ public partial class Form1 : Form
                                 NormalizePath(Path.Combine(item.OriginalLocation, item.Name)),
                                 expectedFullPath,
                                 StringComparison.OrdinalIgnoreCase));
-
                         if (match is not null)
                         {
                             matches[record.Id] = match;
@@ -1197,8 +1211,7 @@ public partial class Form1 : Form
         finally
         {
             SetBusy(false);
-            UpdateRecoverButton();
-        }
+            UpdateRecoverButton();        }
     }
 
     private async Task RestoreRecycleBinItemsAsync(IReadOnlyList<RecoveryItem> items)
@@ -1380,13 +1393,15 @@ public partial class Form1 : Form
         var hasRecycleItems = rows.Any(row => row.RecoverableItem is not null);
         var allHistoryRows = rows.Count > 0 &&
                              rows.All(row => row.HistoryId.HasValue);
+        var allNtfsRows = rows.Count > 0 &&
+                          rows.All(row => row.RecoveryCandidate is not null);
 
         btnRecover.Enabled = !_operationInProgress
             && rows.Count > 0
             && !(hasCandidates && hasRecycleItems);
 
         btnSkipRecycleBin.Enabled = !_operationInProgress
-            && allHistoryRows;
+            && (allHistoryRows || allNtfsRows);
     }
 
     private void SetBusy(bool busy, string? status = null)
@@ -1394,13 +1409,20 @@ public partial class Form1 : Form
         _operationInProgress = busy;
 
         lstDirectories.Enabled = !busy;
-        btnSkipRecycleBin.Enabled = !busy && dgvResults.SelectedRows.Count > 0 &&
-                                    dgvResults.SelectedRows
-                                        .Cast<DataGridViewRow>()
-                                        .Select(row => row.DataBoundItem as RecoveryDisplayRow)
-                                        .Where(row => row is not null)
-                                        .Cast<RecoveryDisplayRow>()
-                                        .All(row => row.HistoryId.HasValue);
+        var selectedRows = dgvResults.SelectedRows
+            .Cast<DataGridViewRow>()
+            .Select(row => row.DataBoundItem as RecoveryDisplayRow)
+            .Where(row => row is not null)
+            .Cast<RecoveryDisplayRow>()
+            .ToList();
+
+        var allHistoryRows = selectedRows.Count > 0 &&
+                             selectedRows.All(row => row.HistoryId.HasValue);
+        var allNtfsRows = selectedRows.Count > 0 &&
+                          selectedRows.All(row => row.RecoveryCandidate is not null);
+
+        btnSkipRecycleBin.Enabled = !busy &&
+                                    (allHistoryRows || allNtfsRows);
         btnScanDirectory.Enabled = !busy;
         btnShowHistory.Enabled = !busy;
         btnClearHistory.Enabled = !busy;
