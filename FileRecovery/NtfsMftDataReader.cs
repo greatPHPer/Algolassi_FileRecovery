@@ -788,6 +788,40 @@ public sealed class NtfsMftDataReader
         return dataAttribute.Extents;
     }
 
+    internal int ReadMftLogicalBytes(
+        SafeFileHandle volumeHandle,
+        NtfsVolumeInfo volumeInfo,
+        long fileOffset,
+        byte[] destination)
+    {
+        if (volumeInfo.MftValidDataLength <= 0 ||
+            fileOffset < 0 ||
+            destination.Length == 0)
+        {
+            return 0;
+        }
+
+        if (fileOffset >= volumeInfo.MftValidDataLength)
+        {
+            return 0;
+        }
+
+        var bytesToRead = (int)Math.Min(
+            destination.Length,
+            volumeInfo.MftValidDataLength - fileOffset);
+
+        _mftExtents ??= ReadMftDataExtents(
+            volumeHandle,
+            volumeInfo);
+
+        return ReadMappedFileBytes(
+            volumeHandle,
+            volumeInfo.BytesPerCluster,
+            _mftExtents,
+            fileOffset,
+            destination.AsSpan(0, bytesToRead).ToArray());
+    }
+
     private static int ReadMappedFileBytes(
         SafeFileHandle volumeHandle,
         uint bytesPerCluster,
