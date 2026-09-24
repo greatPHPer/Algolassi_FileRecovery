@@ -75,7 +75,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
 
         var volumeInfo = new NtfsVolumeInspector().Inspect(sourceRoot);
         var totalVolumeBytes = checked(
-            volumeInfo.NumberSectors * (long)volumeInfo.BytesPerSector);
+            volumeInfo.TotalClusters * (long)volumeInfo.BytesPerCluster);
 
         if (totalVolumeBytes <= 0)
         {
@@ -102,17 +102,74 @@ public sealed class NtfsWholeVolumeTextRecoveryService
 
             var remaining = totalVolumeBytes - scannedBytes;
             var bytesToRead = (int)Math.Min(IoBufferSize, remaining);
+            bytesToRead -= bytesToRead % checked((int)volumeInfo.BytesPerCluster);
 
-            var buffer = new byte[bytesToRead];
+            if (bytesToRead < volumeInfo.BytesPerCluster)
+            {
+                break;
+            }
+
             var physicalOffset = scannedBytes;
+            byte[]? buffer = null;
+            var attemptedBytes = bytesToRead;
 
-            ReadAt(
-                volumeHandle,
-                physicalOffset,
-                buffer,
-                cancellationToken);
+            // Raw volume reads can occasionally fail on a small protected or
+            // otherwise unreadable region near filesystem metadata. Do not abort
+            // a forensic scan of the entire volume because one large read failed.
+            // Reduce the request geometrically until the problematic range can be
+            // isolated to a single cluster.
+            while (attemptedBytes >= volumeInfo.BytesPerCluster)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
 
-            var window = new byte[checked(previousTail.Length + buffer.Length)];
+                try
+                {
+                    buffer = new byte[attemptedBytes];
+                    ReadAt(
+                        volumeHandle,
+                        physicalOffset,
+                        buffer,
+                        cancellationToken);
+                    break;
+                }
+                catch (Win32Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS whole-volume target scan read retry: " +
+                        $"offset={physicalOffset:N0}, requested={attemptedBytes:N0}, " +
+                        $"error={ex.NativeErrorCode}, message={ex.Message}.");
+
+                    attemptedBytes /= 2;
+                    attemptedBytes -=
+                        attemptedBytes % checked((int)volumeInfo.BytesPerCluster);
+                }
+            }
+
+            if (buffer is null)
+            {
+                var skippedBytes = Math.Min(
+                    checked((long)volumeInfo.BytesPerCluster),
+                    remaining);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS whole-volume target scan skipped unreadable cluster: " +
+                    $"offset={physicalOffset:N0}, bytes={skippedBytes:N0}.");
+
+                scannedBytes = checked(scannedBytes + skippedBytes);
+                previousTail = [];
+
+                if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
+                    scannedBytes == totalVolumeBytes)
+                {
+                    lastReportedBytes = scannedBytes;
+                    progress?.Report(scannedBytes);
+                }
+
+                continue;
+            }
+
+            var bytesRead = buffer.Length;
+            var window = new byte[checked(previousTail.Length + bytesRead)];
 
             if (previousTail.Length > 0)
             {
@@ -129,10 +186,10 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 0,
                 window,
                 previousTail.Length,
-                buffer.Length);
+                bytesRead);
 
             var markerOffsetInWindow = window.AsSpan().IndexOf(markerBytes);
-            scannedBytes = checked(scannedBytes + bytesToRead);
+            scannedBytes = checked(scannedBytes + bytesRead);
 
             if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
                 scannedBytes == totalVolumeBytes)
