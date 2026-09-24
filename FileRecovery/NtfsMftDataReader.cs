@@ -13,6 +13,8 @@ public sealed class NtfsMftDataReader
     private const uint FileShareDelete = 0x00000004;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOverlapped = 0x40000000;
+    private const int ErrorIoPending = 997;
 
     private const uint NtfsAttributeList = 0x20;
     private const uint NtfsAttributeData = 0x80;
@@ -53,8 +55,12 @@ public sealed class NtfsMftDataReader
             $"recordSize={volumeInfo.BytesPerFileRecordSegment}, " +
             $"mftValidLength={volumeInfo.MftValidDataLength}.");
 
+        using var rawMftVolumeHandle = CreateVolumeHandle(
+            volumeInfo.RootPath,
+            overlapped: true);
+
         var record = ReadRecord(
-            volumeHandle,
+            rawMftVolumeHandle,
             volumeInfo,
             segmentNumber,
             sequenceNumber,
@@ -69,7 +75,7 @@ public sealed class NtfsMftDataReader
             // without strict sequence/base checks, but only accept it when the
             // retained $FILE_NAME still identifies the expected parent/name.
             var relaxedRecord = ReadRawRecord(
-                volumeHandle,
+                rawMftVolumeHandle,
                 volumeInfo,
                 segmentNumber);
 
@@ -161,7 +167,7 @@ public sealed class NtfsMftDataReader
             var extensionSequence = (ushort)(entry.SegmentReference >> 48);
 
             var extensionRecord = ReadRecord(
-                volumeHandle,
+                rawMftVolumeHandle,
                 volumeInfo,
                 extensionSegment,
                 extensionSequence,
@@ -641,7 +647,7 @@ public sealed class NtfsMftDataReader
             volumeInfo.MftStartLcn * (long)volumeInfo.BytesPerCluster);
 
         var record = new byte[checked((int)volumeInfo.BytesPerFileRecordSegment)];
-        ReadAt(
+        ReadRawExact(
             volumeHandle,
             checked(mftStartOffset + relativeOffset),
             record);
@@ -768,7 +774,7 @@ public sealed class NtfsMftDataReader
             volumeInfo.MftStartLcn * (long)volumeInfo.BytesPerCluster);
 
         var record = new byte[checked((int)volumeInfo.BytesPerFileRecordSegment)];
-        ReadAt(
+        ReadRawExact(
             volumeHandle,
             checked(mftStartOffset + relativeOffset),
             record);
@@ -873,6 +879,125 @@ public sealed class NtfsMftDataReader
         }
     }
 
+    private static void ReadRawExact(
+        SafeFileHandle volumeHandle,
+        long fileOffset,
+        byte[] buffer)
+    {
+        using var completionEvent = new ManualResetEvent(initialState: false);
+
+        var overlapped = new NativeOverlapped
+        {
+            OffsetLow = unchecked((int)(fileOffset & 0xFFFFFFFF)),
+            OffsetHigh = unchecked((int)(fileOffset >> 32)),
+            HEvent = completionEvent.SafeWaitHandle.DangerousGetHandle()
+        };
+
+        var overlappedPtr = Marshal.AllocHGlobal(
+            Marshal.SizeOf<NativeOverlapped>());
+
+        try
+        {
+            Marshal.StructureToPtr(
+                overlapped,
+                overlappedPtr,
+                fDeleteOld: false);
+
+            var bufferHandle = GCHandle.Alloc(
+                buffer,
+                GCHandleType.Pinned);
+
+            try
+            {
+                var started = ReadFile(
+                    volumeHandle,
+                    bufferHandle.AddrOfPinnedObject(),
+                    checked((uint)buffer.Length),
+                    IntPtr.Zero,
+                    overlappedPtr);
+
+                if (!started)
+                {
+                    var error = Marshal.GetLastWin32Error();
+
+                    if (error != ErrorIoPending)
+                    {
+                        throw new Win32Exception(
+                            error,
+                            $"Raw NTFS MFT read failed at offset {fileOffset:N0}.");
+                    }
+                }
+
+                completionEvent.WaitOne();
+
+                if (!GetOverlappedResult(
+                        volumeHandle,
+                        overlappedPtr,
+                        out var bytesRead,
+                        bWait: false))
+                {
+                    throw new Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        $"Raw NTFS MFT read completion failed at offset {fileOffset:N0}.");
+                }
+
+                if (bytesRead != (uint)buffer.Length)
+                {
+                    throw new IOException(
+                        $"Raw NTFS MFT read returned {bytesRead:N0} bytes; expected {buffer.Length:N0}.");
+                }
+            }
+            finally
+            {
+                bufferHandle.Free();
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(overlappedPtr);
+        }
+    }
+
+    private static SafeFileHandle CreateVolumeHandle(
+        string root,
+        bool overlapped)
+    {
+        var volumeName = root.TrimEnd(Path.DirectorySeparatorChar);
+        var flags = FileFlagBackupSemantics |
+                    (overlapped ? FileFlagOverlapped : 0);
+
+        var handle = CreateFile(
+            $@"\\.\{volumeName[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            flags,
+            IntPtr.Zero);
+
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+
+            throw new Win32Exception(
+                error,
+                $"Could not open NTFS volume {root} for raw MFT access.");
+        }
+
+        return handle;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeOverlapped
+    {
+        public IntPtr Internal;
+        public IntPtr InternalHigh;
+        public int OffsetLow;
+        public int OffsetHigh;
+        public IntPtr HEvent;
+    }
+
     private static void ReadAt(SafeFileHandle handle, long offset, byte[] buffer)
     {
         if (!SetFilePointerEx(handle, offset, out _, 0))
@@ -895,6 +1020,21 @@ public sealed class NtfsMftDataReader
                 "Could not read the NTFS MFT record.");
         }
     }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadFile(
+        SafeFileHandle hFile,
+        IntPtr lpBuffer,
+        uint nNumberOfBytesToRead,
+        IntPtr lpNumberOfBytesRead,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetOverlappedResult(
+        SafeFileHandle hFile,
+        IntPtr lpOverlapped,
+        out uint lpNumberOfBytesTransferred,
+        [MarshalAs(UnmanagedType.Bool)] bool bWait);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFile(
