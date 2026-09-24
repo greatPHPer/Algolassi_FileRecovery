@@ -67,6 +67,16 @@ The Recovery Center now supports the first byte-level recovery path. A selected 
 
 The source NTFS volume is opened for read-only access. A failed recovery removes the partial destination file. This stage does not recover arbitrary carved data and does not write to the source volume.
 
+### Deep free-space file carving
+
+When a deleted candidate is still visible in USN history but its current MFT record no longer retains a usable unnamed `$DATA` stream, **Recover Selected** now has a second recovery path: a bounded deep scan of clusters currently marked free by the NTFS volume bitmap.
+
+The deep scanner is deliberately conservative. It only attempts file types with recognizable structure and a self-delimiting end condition: JPEG, PNG, GIF, BMP, WAV, WebP, PDF, ZIP, and ZIP-based Office Open XML files (`.docx`, `.xlsx`, `.pptx`). A candidate is written only after the exact clusters containing the carved bytes are rechecked and remain free.
+
+This is file carving, not restoration of the original NTFS file record. The original filename and directory come from the retained deletion metadata; the carved byte stream is inferred from the file-format structure. Fragmented files, partially overwritten files, and arbitrary text files such as plain `.txt` are not reliably reconstructable by this layer and are intentionally not treated as high-confidence recoveries.
+
+The deep scan is read-only on the source volume and uses a bounded 512 MiB free-space scan per selected metadata-only candidate.
+
 ### MFT extent correctness
 
 The MFT reader now opens the NTFS `$MFT` system file and reads the required record by its logical byte offset instead of converting the record number directly into one physical LCN range. This avoids assuming that `$MFT` is contiguous; NTFS can fragment the MFT as it grows.
@@ -75,7 +85,7 @@ The MFT reader now opens the NTFS `$MFT` system file and reads the required reco
 
 The recovery reader follows an NTFS `$ATTRIBUTE_LIST` and loads unnamed `$DATA` attributes from referenced extension MFT records. Both resident and bounded nonresident attribute-list data are supported; retained VCN mappings are merged in order, with VCN gaps or overlaps rejected.
 
-The current branch does not yet perform raw-cluster reads, file-signature carving, or byte-level reconstruction.
+The current branch now also performs a bounded raw free-space scan for selected structured file signatures when the retained MFT record no longer supplies a usable data stream.
 
 ## Standalone EXE
 
@@ -106,7 +116,7 @@ FileRecovery\bin\Release\net9.0-windows\win-x64\publish\
 11. Nonresident `$ATTRIBUTE_LIST` reconstruction
 12. NTFS parser regression tests
 13. Deep file-signature scanning
-10. Preview and recover-to-another-drive workflow
-11. Code signing and public release packaging
+14. Preview and recover-to-another-drive workflow
+15. Code signing and public release packaging
 
 Recovery software cannot guarantee recovery of every deleted file. SSD TRIM and overwritten data can make deleted data unrecoverable.
