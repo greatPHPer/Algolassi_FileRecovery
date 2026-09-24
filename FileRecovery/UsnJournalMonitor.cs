@@ -900,6 +900,42 @@ public sealed class UsnJournalMonitor : IDisposable
         return false;
     }
 
+    public IReadOnlyList<UsnDeletedFileRecord> GetRecentDeletedFiles(
+        string targetDirectory,
+        bool includeSubdirectories,
+        TimeSpan maxAge)
+    {
+        var normalizedDirectory = NormalizePath(targetDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar);
+        var cutoffUtc = DateTime.UtcNow - maxAge;
+
+        return _recentDeletedRecords
+            .Where(record =>
+                record.TimestampUtc >= cutoffUtc &&
+                !string.IsNullOrWhiteSpace(record.DirectoryPath))
+            .Select(record =>
+            {
+                var fullPath = Path.Combine(
+                    record.DirectoryPath!,
+                    record.FileName);
+
+                return new UsnDeletedFileRecord(
+                    NormalizePath(fullPath),
+                    record.FileReferenceNumber,
+                    record.ParentFileReferenceNumber,
+                    record.FileName,
+                    record.DirectoryPath!,
+                    record.TimestampUtc);
+            })
+            .Where(record =>
+                MatchesDirectory(
+                    record.DirectoryPath,
+                    normalizedDirectory,
+                    includeSubdirectories))
+            .OrderByDescending(record => record.DeletedAtUtc)
+            .ToList();
+    }
+
     public bool TryResolveRecentDeletedFileBounded(
         string fullPath,
         DateTime deletedAtUtc,
