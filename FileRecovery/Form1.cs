@@ -15,6 +15,7 @@ public partial class Form1 : Form
     private readonly MftCandidateScanner _mftCandidateScanner = new();
     private readonly NtfsByteRecoveryService _ntfsRecoveryService = new();
     private readonly NtfsDeepFileRecoveryService _ntfsDeepFileRecoveryService = new();
+    private readonly NtfsWholeVolumeTextRecoveryService _ntfsWholeVolumeTextRecoveryService = new();
     private bool _allowClose;
     private bool _refreshInProgress;
     private bool _historyRefreshPending;
@@ -1688,6 +1689,8 @@ public partial class Form1 : Form
     {
         var failures = new List<string>();
         var successes = new List<RecoveryResult>();
+        var forensicMarkers = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var forensicMarkerDeclined = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         if (string.IsNullOrWhiteSpace(destinationDirectory))
         {
@@ -1903,6 +1906,85 @@ public partial class Form1 : Form
                         });
 
                         continue;
+                    }
+                }
+
+                // For an unknown-size .txt candidate, offer a marker-driven
+                // whole-volume forensic scan before the broad free-space heuristic.
+                // The marker is deliberately required so allocated live-file bytes are
+                // never accepted merely because they happen to look printable.
+                if (candidate.FileSizeBytes <= 0 &&
+                    Path.GetExtension(candidate.Name).Equals(
+                        ".txt",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    var markerKey = NormalizePath(candidate.FullPath);
+                    string? forensicMarker = null;
+
+                    if (!forensicMarkers.TryGetValue(markerKey, out forensicMarker) &&
+                        !forensicMarkerDeclined.Contains(markerKey))
+                    {
+                        var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
+                            $"The original size of '{candidate.Name}' is unknown.\\r\\n\\r\\n" +
+                            "Enter a unique text string that was definitely contained in this " +
+                            "deleted file. AlgoLassi will search every byte of the source volume " +
+                            "for that exact UTF-8 marker before attempting broader carving.\\r\\n\\r\\n" +
+                            "Leave this blank to skip the whole-volume forensic scan.",
+                            "Full-volume forensic text scan",
+                            "");
+
+                        if (string.IsNullOrWhiteSpace(enteredMarker))
+                        {
+                            forensicMarkerDeclined.Add(markerKey);
+                        }
+                        else
+                        {
+                            forensicMarker = enteredMarker;
+                            forensicMarkers[markerKey] = enteredMarker;
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(forensicMarker))
+                    {
+                        var wholeVolumeRoot = GetSourceVolumeRoot(candidate.FullPath);
+                        if (string.IsNullOrWhiteSpace(wholeVolumeRoot))
+                        {
+                            failures.Add(
+                                $"{candidate.Name}: the source volume could not be determined for the whole-volume forensic scan.");
+                            continue;
+                        }
+
+                        var totalVolumeBytes = new DriveInfo(wholeVolumeRoot).TotalSize;
+                        var forensicProgress = new SynchronousProgress<long>(
+                            this,
+                            bytesScanned =>
+                            {
+                                lblStatus.Text =
+                                    $"Forensic full-volume scan for {candidate.Name}... " +
+                                    $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
+                                    $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
+                            });
+
+                        try
+                        {
+                            forensicProgress.Report(0);
+
+                            var forensicRecovery = _ntfsWholeVolumeTextRecoveryService.Recover(
+                                candidate,
+                                destinationDirectory,
+                                forensicMarker,
+                                CancellationToken.None,
+                                forensicProgress);
+
+                            successes.Add(forensicRecovery);
+                            continue;
+                        }
+                        catch (Exception ex)
+                        {
+                            failures.Add(
+                                $"{candidate.Name}: whole-volume forensic scan failed: {ex.Message}");
+                            continue;
+                        }
                     }
                 }
 
