@@ -429,6 +429,7 @@ public partial class Form1 : Form
                 CancellationToken.None);
 
             var candidates = _mftCandidateScanner.ScanForFileReferences(
+                Path.GetPathRoot(scanDirectory)!,
                 deletedRecords
                     .Select(record => (
                         record.FullPath,
