@@ -236,6 +236,7 @@ public sealed class UsnJournalMonitor : IDisposable
 
         var parentPathCache = new Dictionary<ulong, string?>();
         var latestDeletes = new Dictionary<ulong, UsnRecord>();
+        var results = new List<UsnDeletedFileRecord>();
         var nextUsn = journal.FirstUsn;
 
         while (!cancellationToken.IsCancellationRequested &&
