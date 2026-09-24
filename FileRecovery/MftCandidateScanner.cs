@@ -165,18 +165,9 @@ public sealed class MftCandidateScanner
         scanBufferSize = Math.Max(recordSize, scanBufferSize);
         var buffer = new byte[scanBufferSize];
 
-        var mftStartOffset = checked(
-            volumeInfo.MftStartLcn * (long)volumeInfo.BytesPerCluster);
-
-        var scanStartOffset = checked(
-            mftStartOffset + scanStartRelative);
-
-        if (scanStartOffset % volumeInfo.BytesPerSector != 0)
-        {
-            throw new InvalidOperationException(
-                "The NTFS MFT start offset is not aligned to the volume sector size.");
-        }
-
+        // The $MFT can be fragmented. scanStartRelative is a logical
+        // offset inside $MFT and must be translated through record 0's
+        // $DATA mapping pairs rather than added to MftStartLcn.
         long scanned = 0;
 
         while (scanned < bytesToScan)
@@ -196,17 +187,16 @@ public sealed class MftCandidateScanner
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            var readOffset = checked(scanStartOffset + scanned);
+            var readOffset = checked(scanStartRelative + scanned);
 
-            // FileStream's async layer does not handle this raw NTFS volume
-            // handle reliably on Windows. Issue the overlapped volume read
-            // directly so cancellation can call CancelIoEx on the pending I/O.
-            var bytesRead = ReadRawVolumeChunk(
+            // Read logical $MFT bytes through the extent map. The dedicated
+            // overlapped handle is retained because the extent-aware reader
+            // performs raw asynchronous volume reads.
+            var bytesRead = dataReader.ReadMftLogicalBytes(
                 mftScanVolumeHandle,
-                buffer,
-                requestBytes,
+                volumeInfo,
                 readOffset,
-                cancellationToken);
+                buffer);
 
             if (bytesRead <= 0)
             {
