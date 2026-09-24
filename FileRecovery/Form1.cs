@@ -347,6 +347,98 @@ public partial class Form1 : Form
 
 
 
+    private async void btnRawVolumeMarker_Click(object? sender, EventArgs e)
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = "Select the live text file to verify against the raw volume",
+            Filter = "Text files (*.txt)|*.txt|All files (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var marker = Microsoft.VisualBasic.Interaction.InputBox(
+            "Enter the exact marker text that is currently inside the selected file.",
+            "Raw volume marker diagnostic",
+            "");
+
+        if (string.IsNullOrWhiteSpace(marker))
+        {
+            return;
+        }
+
+        SetBusy(true, "Testing the raw NTFS volume for the live file marker...");
+
+        try
+        {
+            var root = Path.GetPathRoot(dialog.FileName);
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                throw new InvalidOperationException(
+                    "The selected file is not on a valid Windows volume.");
+            }
+
+            var totalVolumeBytes = new DriveInfo(root).TotalSize;
+            var progress = new SynchronousProgress<long>(
+                this,
+                bytesScanned =>
+                {
+                    lblStatus.Text =
+                        $"Raw volume marker test... " +
+                        $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
+                        $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
+                });
+
+            var result = await Task.Run(
+                () => _ntfsWholeVolumeTextRecoveryService.FindMarkerOnVolume(
+                    dialog.FileName,
+                    marker,
+                    CancellationToken.None,
+                    progress));
+
+            if (result.Found)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Marker FOUND in the raw E: volume.\r\n\r\n" +
+                    $"Encoding: {result.Encoding}\r\n" +
+                    $"Byte offset: {result.Offset:N0}\r\n" +
+                    $"Scanned: {result.ScannedBytes:N0} bytes",
+                    "Raw Volume Marker Test",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            else
+            {
+                MessageBox.Show(
+                    this,
+                    $"Marker was NOT found in the raw NTFS volume.\r\n\r\n" +
+                    $"Scanned: {result.ScannedBytes:N0} bytes",
+                    "Raw Volume Marker Test",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                this,
+                ex.Message,
+                "Raw Volume Marker Test Failed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
     private void btnBrowseScanPath_Click(object? sender, EventArgs e)
     {
         using var dialog = new FolderBrowserDialog
