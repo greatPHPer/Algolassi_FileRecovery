@@ -70,7 +70,8 @@ public sealed class MftCandidateScanner
         IReadOnlyCollection<string> targetPaths,
         CancellationToken cancellationToken = default,
         long maxBytesToScan = 512L * 1024L * 1024L,
-        IProgress<long>? progress = null)
+        IProgress<long>? progress = null,
+        IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, DateTime DeletedAtUtc)>? targetReferences = null)
     {
         ArgumentNullException.ThrowIfNull(targetPaths);
 
@@ -131,6 +132,21 @@ public sealed class MftCandidateScanner
                 StringComparer.OrdinalIgnoreCase);
 
         var targetNames = targetsByName.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var historicalTargetsBySegment = (targetReferences ?? [])
+            .Where(target =>
+                !string.IsNullOrWhiteSpace(target.FullPath) &&
+                target.FileReferenceNumber != 0)
+            .Select(target => (
+                FullPath: NormalizePath(target.FullPath),
+                FileReferenceNumber: target.FileReferenceNumber,
+                ParentFileReferenceNumber: target.ParentFileReferenceNumber,
+                DeletedAtUtc: target.DeletedAtUtc,
+                SegmentNumber: target.FileReferenceNumber & 0x0000FFFFFFFFFFFFUL))
+            .GroupBy(target => target.SegmentNumber)
+            .ToDictionary(
+                group => group.Key,
+                group => group.ToList());
 
         var results = new List<RecoveryCandidate>();
         var seenReferences = new HashSet<ulong>();
@@ -242,45 +258,91 @@ public sealed class MftCandidateScanner
 
                 foreach (var entry in fileEntries)
                 {
-                    if (!targetsByName.TryGetValue(entry.Name, out var sameNameTargets))
+                    targetsByName.TryGetValue(entry.Name, out var sameNameTargets);
+
+                    var currentDirectoryPath = string.Empty;
+                    string directoryPath = string.Empty;
+                    string? matchingTarget = null;
+                    string? matchingEvidence = null;
+
+                    if (sameNameTargets is not null)
                     {
-                        continue;
+                        targetNameMatchCount++;
+
+                        // Prefer validating the actual FILE_NAME parent against the
+                        // historical target path. This prevents a same-named deleted
+                        // file in another directory from being promoted accidentally.
+                        currentDirectoryPath = NtfsParentPathResolver.Resolve(
+                            volumeHandle,
+                            entry.ParentFileReferenceNumber) ?? string.Empty;
+
+                        if (!string.IsNullOrWhiteSpace(currentDirectoryPath))
+                        {
+                            directoryPath = currentDirectoryPath;
+                            matchingTarget = sameNameTargets.FirstOrDefault(target =>
+                                string.Equals(
+                                    NormalizePath(Path.Combine(directoryPath, entry.Name)),
+                                    target,
+                                    StringComparison.OrdinalIgnoreCase));
+                        }
+                        else if (sameNameTargets.Count == 1)
+                        {
+                            // The parent itself may also have been deleted. For a
+                            // unique target filename, retain the historical directory
+                            // as the conservative fallback when the current parent
+                            // cannot be resolved.
+                            matchingTarget = sameNameTargets[0];
+                            directoryPath = Path.GetDirectoryName(matchingTarget) ?? string.Empty;
+                        }
                     }
 
-                    targetNameMatchCount++;
-
-                    // Prefer validating the actual FILE_NAME parent against the
-                    // historical target path. This prevents a same-named deleted
-                    // file in another directory from being promoted accidentally.
-                    var currentDirectoryPath = NtfsParentPathResolver.Resolve(
-                        volumeHandle,
-                        entry.ParentFileReferenceNumber) ?? string.Empty;
-
-                    string directoryPath;
-                    string? matchingTarget;
-
-                    if (!string.IsNullOrWhiteSpace(currentDirectoryPath))
+                    // Historical USN file-reference sequences can be stale after
+                    // the same MFT segment is reused. When the current deleted
+                    // record's name no longer matches, allow a much narrower
+                    // forensic fallback: the segment must be the same, the parent
+                    // must still identify the historical directory, and the current
+                    // $FILE_NAME modification timestamp must be very close to the
+                    // historical delete timestamp. This avoids treating an arbitrary
+                    // reused deleted record as the target.
+                    if (matchingTarget is null &&
+                        historicalTargetsBySegment.TryGetValue(
+                            fileReferenceNumber & 0x0000FFFFFFFFFFFFUL,
+                            out var segmentTargets))
                     {
-                        directoryPath = currentDirectoryPath;
-                        matchingTarget = sameNameTargets.FirstOrDefault(target =>
-                            string.Equals(
-                                NormalizePath(Path.Combine(directoryPath, entry.Name)),
-                                target,
-                                StringComparison.OrdinalIgnoreCase));
-                    }
-                    else if (sameNameTargets.Count == 1)
-                    {
-                        // The parent itself may also have been deleted. For a
-                        // unique target filename, retain the historical directory
-                        // as the conservative fallback when the current parent
-                        // cannot be resolved.
-                        matchingTarget = sameNameTargets[0];
-                        directoryPath = Path.GetDirectoryName(matchingTarget) ?? string.Empty;
-                    }
-                    else
-                    {
-                        matchingTarget = null;
-                        directoryPath = string.Empty;
+                        if (string.IsNullOrWhiteSpace(currentDirectoryPath))
+                        {
+                            currentDirectoryPath = NtfsParentPathResolver.Resolve(
+                                volumeHandle,
+                                entry.ParentFileReferenceNumber) ?? string.Empty;
+                        }
+
+                        var entryParentSegment =
+                            entry.ParentFileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
+
+                        var timeMatched = segmentTargets
+                            .Where(target =>
+                                target.ParentFileReferenceNumber == 0 ||
+                                (target.ParentFileReferenceNumber & 0x0000FFFFFFFFFFFFUL) ==
+                                entryParentSegment)
+                            .OrderBy(target =>
+                                Math.Abs((entry.TimestampUtc - target.DeletedAtUtc).TotalSeconds))
+                            .FirstOrDefault(target =>
+                                target.DeletedAtUtc != default &&
+                                entry.TimestampUtc != default &&
+                                Math.Abs((entry.TimestampUtc - target.DeletedAtUtc).TotalSeconds) <= 60 &&
+                                (string.IsNullOrWhiteSpace(currentDirectoryPath) ||
+                                 string.Equals(
+                                     NormalizePath(currentDirectoryPath),
+                                     NormalizePath(Path.GetDirectoryName(target.FullPath) ?? string.Empty),
+                                     StringComparison.OrdinalIgnoreCase)));
+
+                        if (timeMatched.FullPath is not null)
+                        {
+                            matchingTarget = timeMatched.FullPath;
+                            directoryPath = Path.GetDirectoryName(matchingTarget) ?? currentDirectoryPath;
+                            matchingEvidence =
+                                "Retained deleted MFT record matched the historical USN MFT segment, parent context, and deletion-time window despite a stale file-reference sequence.";
+                        }
                     }
 
                     if (string.IsNullOrWhiteSpace(matchingTarget) ||
@@ -289,10 +351,8 @@ public sealed class MftCandidateScanner
                         continue;
                     }
 
-                    // Use the exact MFT record already found by the bounded raw
-                    // scan. Do not re-read it through the historical USN reference;
-                    // that reference may contain a stale sequence number when the
-                    // file was deleted before AlgoLassi started.
+                    // Use the exact MFT record already found by the raw scan.
+                    // Never re-read it through the older USN file reference.
                     var data = dataReader.ReadDefaultDataStreamFromScannedMftRecord(
                         volumeInfo,
                         volumeHandle,
@@ -304,10 +364,6 @@ public sealed class MftCandidateScanner
                         continue;
                     }
 
-                    // Current cluster allocation is validated immediately before
-                    // bytes are recovered. Doing that expensive bitmap scan here
-                    // would duplicate the work and keep legacy MFT lookup busy
-                    // long after the bounded metadata scan has completed.
                     IReadOnlyList<NtfsExtentAllocation> allocations = [];
                     const string allocationEvidence =
                         "Current NTFS cluster allocation will be verified immediately before recovery.";
@@ -315,12 +371,18 @@ public sealed class MftCandidateScanner
                     results.Add(BuildCandidate(
                         fileReferenceNumber,
                         entry.ParentFileReferenceNumber,
-                        entry.Name,
+                        Path.GetFileName(matchingTarget),
                         directoryPath,
                         entry.TimestampUtc,
                         data,
                         allocations,
-                        allocationEvidence));
+                        string.Join(
+                            " ",
+                            new[]
+                            {
+                                allocationEvidence,
+                                matchingEvidence
+                            }.Where(x => !string.IsNullOrWhiteSpace(x)))));
 
                     if (results.Count >= normalizedTargets.Count)
                     {
