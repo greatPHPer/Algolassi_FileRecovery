@@ -423,9 +423,19 @@ public partial class Form1 : Form
 
         try
         {
-            var candidates = _mftCandidateScanner.ScanDeletedDirectory(
+            var deletedRecords = _usnMonitor.ScanDeletedDirectory(
                 scanDirectory,
                 includeSubdirectories,
+                CancellationToken.None);
+
+            var candidates = _mftCandidateScanner.ScanForFileReferences(
+                deletedRecords
+                    .Select(record => (
+                        record.FullPath,
+                        record.FileReferenceNumber,
+                        record.ParentFileReferenceNumber,
+                        record.DeletedAtUtc))
+                    .ToList(),
                 CancellationToken.None);
 
             var filtered = candidates
