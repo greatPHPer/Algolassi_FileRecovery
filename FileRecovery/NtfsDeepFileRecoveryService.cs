@@ -23,7 +23,8 @@ public sealed class NtfsDeepFileRecoveryService
         string destinationDirectory,
         CancellationToken cancellationToken = default,
         long maxBytesToScan = DefaultMaxBytesToScan,
-        IProgress<long>? progress = null)
+        IProgress<long>? progress = null,
+        long knownFileSizeBytes = 0)
     {
         ArgumentNullException.ThrowIfNull(candidate);
 
@@ -170,6 +171,7 @@ public sealed class NtfsDeepFileRecoveryService
                 if (!TryCarve(
                         extension,
                         scanWindow,
+                        knownFileSizeBytes,
                         out var startOffset,
                         out var carvedLength,
                         out var format))
@@ -272,7 +274,9 @@ public sealed class NtfsDeepFileRecoveryService
                     DestinationPath = destinationPath,
                     BytesRecovered = carvedLength,
                     Evidence =
-                        $"Deep NTFS file carving recovered {carvedLength:N0} byte(s) as a structurally valid {format} file from currently free clusters."
+                        string.Equals(format, "Plain text", StringComparison.OrdinalIgnoreCase)
+                            ? $"Deep NTFS heuristic text carving recovered exactly {carvedLength:N0} byte(s) from currently free clusters using the known original file length. The content match is heuristic because plain-text files do not carry a self-delimiting file boundary."
+                            : $"Deep NTFS file carving recovered {carvedLength:N0} byte(s) as a structurally valid {format} file from currently free clusters."
                 };
             }
 
@@ -290,8 +294,20 @@ public sealed class NtfsDeepFileRecoveryService
             $"{scannedBytes:N0} free-space byte(s) scanned.");
     }
 
-    public static bool SupportsDeepCarving(string fileName) =>
-        SupportsExtension(Path.GetExtension(fileName));
+    public static bool SupportsDeepCarving(
+        string fileName,
+        long knownFileSizeBytes = 0)
+    {
+        var extension = Path.GetExtension(fileName);
+
+        if (extension.Equals(".txt", StringComparison.OrdinalIgnoreCase))
+        {
+            return knownFileSizeBytes > 0 &&
+                   knownFileSizeBytes <= MaxCarvedFileBytes;
+        }
+
+        return SupportsExtension(extension);
+    }
 
     private static bool SupportsExtension(string extension) =>
         extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
@@ -305,11 +321,13 @@ public sealed class NtfsDeepFileRecoveryService
         extension.Equals(".zip", StringComparison.OrdinalIgnoreCase) ||
         extension.Equals(".docx", StringComparison.OrdinalIgnoreCase) ||
         extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase) ||
-        extension.Equals(".pptx", StringComparison.OrdinalIgnoreCase);
+        extension.Equals(".pptx", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".txt", StringComparison.OrdinalIgnoreCase);
 
     private static bool TryCarve(
         string extension,
         byte[] buffer,
+        long knownFileSizeBytes,
         out int startOffset,
         out int length,
         out string format)
@@ -317,6 +335,20 @@ public sealed class NtfsDeepFileRecoveryService
         startOffset = 0;
         length = 0;
         format = string.Empty;
+
+        if (extension.Equals(".txt", StringComparison.OrdinalIgnoreCase))
+        {
+            if (knownFileSizeBytes <= 0 ||
+                knownFileSizeBytes > MaxCarvedFileBytes ||
+                !TryFindText(buffer, checked((int)knownFileSizeBytes), out startOffset))
+            {
+                return false;
+            }
+
+            length = checked((int)knownFileSizeBytes);
+            format = "Plain text";
+            return true;
+        }
 
         if (extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
             extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
@@ -411,6 +443,96 @@ public sealed class NtfsDeepFileRecoveryService
         }
 
         return false;
+    }
+
+    private static bool TryFindText(
+        byte[] buffer,
+        int expectedLength,
+        out int start)
+    {
+        start = -1;
+
+        if (expectedLength <= 0 ||
+            expectedLength > MaxCarvedFileBytes ||
+            expectedLength > buffer.Length)
+        {
+            return false;
+        }
+
+        // Plain text has no intrinsic end marker. Restrict this fallback to the
+        // exact known byte length and require every byte to be valid printable
+        // UTF-8/ASCII text (plus common whitespace). This deliberately remains
+        // heuristic and should never be presented as exact file identity.
+        for (var i = 0; i <= buffer.Length - expectedLength; i++)
+        {
+            var span = buffer.AsSpan(i, expectedLength);
+
+            if (span.IndexOf((byte)0) >= 0 ||
+                !LooksLikeText(span))
+            {
+                continue;
+            }
+
+            start = i;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool LooksLikeText(ReadOnlySpan<byte> data)
+    {
+        if (data.Length == 0)
+        {
+            return false;
+        }
+
+        var printable = 0;
+        for (var i = 0; i < data.Length; i++)
+        {
+            var value = data[i];
+
+            if (value is 0x09 or 0x0A or 0x0D)
+            {
+                printable++;
+                continue;
+            }
+
+            if (value is >= 0x20 and <= 0x7E)
+            {
+                printable++;
+                continue;
+            }
+
+            // Basic validation for UTF-8 multibyte sequences.
+            if (value is >= 0xC2 and <= 0xF4)
+            {
+                var sequenceLength =
+                    value <= 0xDF ? 2 :
+                    value <= 0xEF ? 3 : 4;
+
+                if (i + sequenceLength > data.Length)
+                {
+                    return false;
+                }
+
+                for (var j = 1; j < sequenceLength; j++)
+                {
+                    if (data[i + j] < 0x80 || data[i + j] > 0xBF)
+                    {
+                        return false;
+                    }
+                }
+
+                printable += sequenceLength;
+                i += sequenceLength - 1;
+                continue;
+            }
+
+            return false;
+        }
+
+        return printable == data.Length;
     }
 
     private static bool TryFindJpeg(
