@@ -1834,6 +1834,76 @@ public partial class Form1 : Form
                     }
                 }
 
+                // Before broad free-space carving, inspect slack in currently
+                // allocated files under the deleted file's original directory.
+                // This can retain fragments of recently deleted small text files
+                // after their clusters were reallocated, without scanning/reading
+                // the active file bodies as candidate data.
+                var slackDirectory = candidate.DirectoryPath;
+                if (string.IsNullOrWhiteSpace(slackDirectory))
+                {
+                    slackDirectory = Path.GetDirectoryName(candidate.FullPath);
+                }
+
+                if (!string.IsNullOrWhiteSpace(slackDirectory) &&
+                    Directory.Exists(slackDirectory))
+                {
+                    var slackReader = new NtfsMftDataReader();
+
+                    if (slackReader.TryReadAllocatedFileSlack(
+                        rootPath,
+                        slackDirectory,
+                        Path.GetExtension(candidate.Name),
+                        long.MaxValue,
+                        progress: null,
+                        CancellationToken.None,
+                        out var slackData,
+                        out var slackSourceFile) &&
+                        slackData.Length > 0)
+                    {
+                        var destinationPath =
+                            RecoveryDestinationPolicy.CreateSafeFilePath(
+                                destinationDirectory,
+                                candidate.Name);
+
+                        try
+                        {
+                            File.WriteAllBytes(destinationPath, slackData);
+                        }
+                        catch
+                        {
+                            try
+                            {
+                                File.Delete(destinationPath);
+                            }
+                            catch
+                            {
+                                // Preserve the original recovery failure.
+                            }
+
+                            throw;
+                        }
+
+                        candidate.FileSizeBytes = slackData.Length;
+
+                        successes.Add(new RecoveryResult
+                        {
+                            Success = true,
+                            SourcePath = candidate.FullPath,
+                            DestinationPath = destinationPath,
+                            BytesRecovered = slackData.Length,
+                            Evidence =
+                                $"Recovered {slackData.Length:N0} byte(s) from allocated " +
+                                $"file slack in '{slackSourceFile}'. The bytes were found " +
+                                "after the current file's logical EOF, so this is heuristic " +
+                                "evidence of retained deleted data rather than an exact " +
+                                "historical file-identity match."
+                        });
+
+                        continue;
+                    }
+                }
+
                 // The retained MFT metadata may be insufficient for this candidate,
                 // but structural carving can still recover many formats without an
                 // original size. Plain text now has a deliberately heuristic fallback
