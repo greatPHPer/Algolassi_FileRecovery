@@ -58,19 +58,23 @@ public sealed class NtfsMftDataReader
             $"recordSize={volumeInfo.BytesPerFileRecordSegment}, " +
             $"mftValidLength={volumeInfo.MftValidDataLength}.");
 
-        // Ask NTFS itself for the exact MFT record represented by the USN file reference.
-        // This avoids opening the protected $MFT namespace and avoids reconstructing
-        // the physical MFT extent map ourselves.
-        var record = ReadMftRecordByFileReference(
+        // FSCTL_GET_NTFS_FILE_RECORD ignores the sequence-number portion of the
+        // file reference and only returns an in-use record at or below the requested
+        // MFT index. Deleted MFT records are therefore not recoverable through that
+        // FSCTL. Read the physical $MFT data through the mapping stored in MFT record 0
+        // and validate the exact sequence number instead.
+        var record = ReadMftRecordByExtentMap(
             volumeHandle,
+            volumeInfo,
+            segmentNumber,
+            sequenceNumber,
             fileReferenceNumber);
 
         if (record is null)
         {
             System.Diagnostics.Debug.WriteLine(
-                $"NTFS $DATA lookup: FSCTL_GET_NTFS_FILE_RECORD could not return exact " +
-                $"fileRef={fileReferenceNumber}.");
-            return NotFound("NTFS could not return the exact MFT record for this file reference.");
+                $"NTFS $DATA lookup: could not read the exact MFT record for fileRef={fileReferenceNumber}.");
+            return NotFound("NTFS could not read and validate the exact deleted MFT record for this file reference.");
         }
 
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
@@ -139,9 +143,12 @@ public sealed class NtfsMftDataReader
             var extensionSegment = entry.SegmentReference & 0x0000FFFFFFFFFFFFUL;
             var extensionSequence = (ushort)(entry.SegmentReference >> 48);
 
-            var extensionRecord = ReadMftRecordByFileReference(
+            var extensionRecord = ReadMftRecordByExtentMap(
                 volumeHandle,
-                entry.SegmentReference);
+                volumeInfo,
+                extensionSegment,
+                extensionSequence,
+                fileReferenceNumber);
 
             if (extensionRecord is null)
             {
@@ -1222,70 +1229,10 @@ public sealed class NtfsMftDataReader
         }
     }
 
-    private static byte[]? ReadMftRecordByFileReference(
-        SafeFileHandle volumeHandle,
-        ulong fileReferenceNumber)
-    {
-        Span<byte> input = stackalloc byte[8];
-        BinaryPrimitives.WriteUInt64LittleEndian(input, fileReferenceNumber);
-
-        // NTFS_FILE_RECORD_OUTPUT_BUFFER contains:
-        //   FileReferenceNumber (8 bytes)
-        //   FileRecordLength   (4 bytes)
-        //   FileRecord          (variable)
-        var output = new byte[4 * 1024];
-
-        if (!DeviceIoControl(
-                volumeHandle,
-                FsctlGetNtfsFileRecord,
-                input.ToArray(),
-                (uint)input.Length,
-                output,
-                (uint)output.Length,
-                out var bytesReturned,
-                IntPtr.Zero))
-        {
-            var error = Marshal.GetLastWin32Error();
-            System.Diagnostics.Debug.WriteLine(
-                $"NTFS FSCTL_GET_NTFS_FILE_RECORD failed for fileRef={fileReferenceNumber}, error={error}.");
-            return null;
-        }
-
-        if (bytesReturned < 12)
-        {
-            return null;
-        }
-
-        var returnedReference = BinaryPrimitives.ReadUInt64LittleEndian(output.AsSpan(0, 8));
-        var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(output.AsSpan(8, 4));
-
-        // The FSCTL can return the first record at or below the requested reference.
-        // Recovery must have the exact reference; never accept a neighbouring/reused record.
-        if (returnedReference != fileReferenceNumber ||
-            recordLength < 24 ||
-            recordLength > output.Length - 12 ||
-            12 + recordLength > bytesReturned)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"NTFS FSCTL_GET_NTFS_FILE_RECORD returned ref={returnedReference}, " +
-                $"length={recordLength} for requested ref={fileReferenceNumber}.");
-            return null;
-        }
-
-        var record = new byte[recordLength];
-        Buffer.BlockCopy(output, 12, record, 0, (int)recordLength);
-
-        if (record.Length < 8 ||
-            record[0] != (byte)'F' ||
-            record[1] != (byte)'I' ||
-            record[2] != (byte)'L' ||
-            record[3] != (byte)'E')
-        {
-            return null;
-        }
-
-        return record;
-    }
+    // FSCTL_GET_NTFS_FILE_RECORD is intentionally not used for deleted-file
+    // recovery. It ignores the sequence-number portion of a file reference and
+    // returns an in-use record at or below the requested MFT index. The physical
+    // MFT mapping above is required when the target record itself is deleted.
 
     private static SafeFileHandle CreateVolumeHandle(
         string root,
