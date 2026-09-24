@@ -452,8 +452,11 @@ public partial class Form1 : Form
                 CancellationToken.None)
                 .ToList();
 
-            var missingDataPaths = candidates
+            var missingDataCandidates = candidates
                 .Where(candidate => !candidate.DataStreamFound)
+                .ToList();
+
+            var missingDataPaths = missingDataCandidates
                 .Select(candidate => candidate.FullPath)
                 .Where(path => !string.IsNullOrWhiteSpace(path))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -469,7 +472,15 @@ public partial class Form1 : Form
                         rootPath,
                         missingDataPaths,
                         CancellationToken.None,
-                        maxBytesToScan: long.MaxValue);
+                        maxBytesToScan: long.MaxValue,
+                        targetReferences: missingDataCandidates
+                            .Where(candidate => candidate.FileReferenceNumber != 0)
+                            .Select(candidate => (
+                                FullPath: candidate.FullPath,
+                                FileReferenceNumber: candidate.FileReferenceNumber,
+                                ParentFileReferenceNumber: candidate.ParentFileReferenceNumber,
+                                DeletedAtUtc: candidate.LastUsnTimestampUtc))
+                            .ToList());
 
                 if (fallbackCandidates.Count > 0)
                 {
