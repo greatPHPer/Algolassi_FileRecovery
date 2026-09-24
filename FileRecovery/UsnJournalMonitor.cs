@@ -1425,12 +1425,15 @@ public sealed class UsnJournalMonitor : IDisposable
 
     private static string NormalizeFinalPath(string path)
     {
-        if (path.StartsWith(@"\\?\\UNC\\", StringComparison.OrdinalIgnoreCase))
+        // GetFinalPathNameByHandle returns device-style paths such as
+        // "\\?\E:\TestRecovery". Convert them to ordinary Win32 paths so
+        // they compare correctly with FileSystemWatcher/history paths.
+        if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
         {
             return @"\\" + path[8..];
         }
 
-        if (path.StartsWith(@"\\?\\", StringComparison.OrdinalIgnoreCase))
+        if (path.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
         {
             return path[4..];
         }
