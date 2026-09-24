@@ -300,12 +300,12 @@ public sealed class MftCandidateScanner
 
                     // Historical USN file-reference sequences can be stale after
                     // the same MFT segment is reused. When the current deleted
-                    // record's name no longer matches, allow a much narrower
-                    // forensic fallback: the segment must be the same, the parent
-                    // must still identify the historical directory, and the current
-                    // $FILE_NAME modification timestamp must be very close to the
-                    // historical delete timestamp. This avoids treating an arbitrary
-                    // reused deleted record as the target.
+                    // record's sequence or direct path no longer matches, allow a
+                    // much narrower forensic fallback: the segment and FILE_NAME must
+                    // be the same, the parent must still identify the historical
+                    // directory, and the current $FILE_NAME modification timestamp
+                    // must be very close to the historical delete timestamp. This
+                    // avoids treating an unrelated reused deleted record as the target.
                     if (matchingTarget is null &&
                         historicalTargetsBySegment.TryGetValue(
                             fileReferenceNumber & 0x0000FFFFFFFFFFFFUL,
@@ -325,9 +325,13 @@ public sealed class MftCandidateScanner
 
                         var timeMatched = segmentTargets
                             .Where(target =>
-                                target.ParentFileReferenceNumber == 0 ||
-                                (target.ParentFileReferenceNumber & 0x0000FFFFFFFFFFFFUL) ==
-                                entryParentSegment)
+                                string.Equals(
+                                    Path.GetFileName(target.FullPath),
+                                    entry.Name,
+                                    StringComparison.OrdinalIgnoreCase) &&
+                                (target.ParentFileReferenceNumber == 0 ||
+                                 (target.ParentFileReferenceNumber & 0x0000FFFFFFFFFFFFUL) ==
+                                 entryParentSegment))
                             .OrderBy(target =>
                                 Math.Abs((entry.TimestampUtc - target.DeletedAtUtc).TotalSeconds))
                             .FirstOrDefault(target =>
