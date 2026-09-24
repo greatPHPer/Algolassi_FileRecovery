@@ -478,6 +478,265 @@ public sealed class NtfsMftDataReader
         return -1;
     }
 
+    public bool TryReadAllocatedFileSlack(
+        string rootPath,
+        string scanDirectory,
+        string expectedExtension,
+        long maxBytesToScan,
+        IProgress<long>? progress,
+        CancellationToken cancellationToken,
+        out byte[] data,
+        out string? sourceFile)
+    {
+        data = [];
+        sourceFile = null;
+
+        if (string.IsNullOrWhiteSpace(rootPath) ||
+            string.IsNullOrWhiteSpace(scanDirectory) ||
+            maxBytesToScan <= 0)
+        {
+            return false;
+        }
+
+        var root = GetNtfsVolumeRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return false;
+        }
+
+        try
+        {
+            WindowsPrivilege.EnableSeBackupPrivilege();
+
+            var volumeInfo = new NtfsVolumeInspector().Inspect(root);
+            using var volumeHandle = CreateVolumeHandle(
+                volumeInfo.RootPath,
+                overlapped: false);
+
+            var normalizedDirectory = Path.GetFullPath(scanDirectory)
+                .TrimEnd(Path.DirectorySeparatorChar);
+            var extension = expectedExtension ?? string.Empty;
+
+            long scannedBytes = 0;
+
+            foreach (var path in Directory.EnumerateFiles(
+                         normalizedDirectory,
+                         "*",
+                         SearchOption.AllDirectories))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (!string.IsNullOrWhiteSpace(extension) &&
+                    !Path.GetExtension(path).Equals(
+                        extension,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var fileInfo = new FileInfo(path);
+                if (fileInfo.Length <= 0)
+                {
+                    continue;
+                }
+
+                var fileReferenceNumber = TryGetFileReferenceNumber(path);
+                if (fileReferenceNumber == 0)
+                {
+                    continue;
+                }
+
+                var stream = ReadDefaultDataStream(
+                    volumeInfo,
+                    volumeHandle,
+                    fileReferenceNumber,
+                    expectedFileName: Path.GetFileName(path),
+                    expectedParentFileReferenceNumber: null,
+                    expectedFullPath: path);
+
+                if (!stream.Found ||
+                    stream.IsResident ||
+                    stream.FileSizeBytes <= 0 ||
+                    stream.Extents.Count == 0)
+                {
+                    continue;
+                }
+
+                var remainder = stream.FileSizeBytes % volumeInfo.BytesPerCluster;
+                if (remainder == 0)
+                {
+                    continue;
+                }
+
+                var slackLength = checked(
+                    (int)(volumeInfo.BytesPerCluster - remainder));
+
+                if (slackLength <= 0)
+                {
+                    continue;
+                }
+
+                var lastDataCluster = (stream.FileSizeBytes - 1) /
+                                      volumeInfo.BytesPerCluster;
+
+                var lastExtent = stream.Extents
+                    .Where(extent =>
+                        lastDataCluster >= extent.VirtualClusterNumber &&
+                        lastDataCluster <
+                            extent.VirtualClusterNumber + extent.ClusterCount)
+                    .FirstOrDefault();
+
+                if (lastExtent is null || lastExtent.IsSparse)
+                {
+                    continue;
+                }
+
+                var physicalCluster = checked(
+                    lastExtent.LogicalClusterNumber +
+                    (lastDataCluster - lastExtent.VirtualClusterNumber));
+
+                var physicalOffset = checked(
+                    physicalCluster * (long)volumeInfo.BytesPerCluster +
+                    remainder);
+
+                scannedBytes = checked(scannedBytes + slackLength);
+                progress?.Report(scannedBytes);
+
+                var slack = new byte[slackLength];
+                ReadAt(
+                    volumeHandle,
+                    physicalOffset,
+                    slack,
+                    cancellationToken);
+
+                if (!TryFindTextLikePrefix(
+                        slack,
+                        out var textLength))
+                {
+                    continue;
+                }
+
+                data = slack.AsSpan(0, textLength).ToArray();
+                sourceFile = path;
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS allocated-file slack text hit: sourceFile={path}, " +
+                    $"fileSize={stream.FileSizeBytes:N0}, slackBytes={slackLength:N0}, " +
+                    $"recoveredBytes={data.Length:N0}, physicalOffset={physicalOffset:N0}.");
+
+                return true;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS allocated-file slack scan complete: scannedSlackBytes={scannedBytes:N0}.");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS allocated-file slack scan failed: " +
+                $"{ex.GetType().Name}: {ex.Message}");
+        }
+
+        return false;
+    }
+
+    private static bool TryFindTextLikePrefix(
+        byte[] buffer,
+        out int length)
+    {
+        length = 0;
+
+        if (buffer.Length < 4)
+        {
+            return false;
+        }
+
+        const int minimumLength = 4;
+        var candidateLength = 0;
+        var position = 0;
+
+        while (position < buffer.Length &&
+               candidateLength < 64L * 1024L * 1024L)
+        {
+            var value = buffer[position];
+
+            if (value == 0)
+            {
+                break;
+            }
+
+            if (value is >= 0x20 and <= 0x7E ||
+                value is 0x09 or 0x0A or 0x0D)
+            {
+                candidateLength++;
+                position++;
+                continue;
+            }
+
+            if (value is >= 0xC2 and <= 0xF4)
+            {
+                var sequenceLength =
+                    value <= 0xDF ? 2 :
+                    value <= 0xEF ? 3 : 4;
+
+                if (position + sequenceLength > buffer.Length)
+                {
+                    break;
+                }
+
+                for (var i = 1; i < sequenceLength; i++)
+                {
+                    if (buffer[position + i] < 0x80 ||
+                        buffer[position + i] > 0xBF)
+                    {
+                        return candidateLength >= minimumLength
+                            ? SetTextLength(candidateLength, out length)
+                            : false;
+                    }
+                }
+
+                candidateLength += sequenceLength;
+                position += sequenceLength;
+                continue;
+            }
+
+            break;
+        }
+
+        return candidateLength >= minimumLength &&
+               SetTextLength(candidateLength, out length);
+    }
+
+    private static bool SetTextLength(int value, out int length)
+    {
+        length = value;
+        return true;
+    }
+
+    private static ulong TryGetFileReferenceNumber(string path)
+    {
+        using var handle = File.OpenHandle(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+
+        if (handle.IsInvalid)
+        {
+            return 0;
+        }
+
+        if (!GetFileInformationByHandle(
+                handle,
+                out var info))
+        {
+            return 0;
+        }
+
+        return ((ulong)info.FileIndexHigh << 32) |
+               info.FileIndexLow;
+    }
+
     public bool TryReadResidentDataForDeletedReference(
         string rootPath,
         ulong fileReferenceNumber,
