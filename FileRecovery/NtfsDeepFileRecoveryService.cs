@@ -15,14 +15,15 @@ public sealed class NtfsDeepFileRecoveryService
     private const uint FileFlagBackupSemantics = 0x02000000;
 
     private const int IoBufferSize = 4 * 1024 * 1024;
-    private const long DefaultMaxBytesToScan = 4L * 1024L * 1024L * 1024L;
+    public const long DefaultMaxBytesToScan = 4L * 1024L * 1024L * 1024L;
     private const long MaxCarvedFileBytes = 64L * 1024L * 1024L;
 
     public RecoveryResult Recover(
         RecoveryCandidate candidate,
         string destinationDirectory,
         CancellationToken cancellationToken = default,
-        long maxBytesToScan = DefaultMaxBytesToScan)
+        long maxBytesToScan = DefaultMaxBytesToScan,
+        IProgress<long>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(candidate);
 
@@ -77,6 +78,8 @@ public sealed class NtfsDeepFileRecoveryService
             $"Deep NTFS carve started: candidate={candidate.FullPath}, " +
             $"extension={extension}, maxBytes={maxBytesToScan:N0}.");
 
+        progress?.Report(0);
+
         foreach (var freeExtent in bitmapReader.EnumerateFreeExtents(
                      volumeHandle,
                      volumeInfo,
@@ -130,6 +133,7 @@ public sealed class NtfsDeepFileRecoveryService
 
                 scannedBytes = checked(scannedBytes + bytesToRead);
                 extentBytesScanned = checked(extentBytesScanned + bytesToRead);
+                progress?.Report(scannedBytes);
 
                 // Keep the previous 64 MB chunk as overlap. This lets a valid file
                 // whose header starts near the end of one chunk and whose trailer
@@ -275,6 +279,8 @@ public sealed class NtfsDeepFileRecoveryService
             previousChunk = [];
         }
 
+        progress?.Report(scannedBytes);
+
         System.Diagnostics.Debug.WriteLine(
             $"Deep NTFS carve complete: candidate={candidate.FullPath}, " +
             $"scanned={scannedBytes:N0}, extents={extentIndex:N0}, noValidHit=true.");
@@ -283,6 +289,9 @@ public sealed class NtfsDeepFileRecoveryService
             $"No structurally valid {extension} file was found in the first " +
             $"{scannedBytes:N0} free-space byte(s) scanned.");
     }
+
+    public static bool SupportsDeepCarving(string fileName) =>
+        SupportsExtension(Path.GetExtension(fileName));
 
     private static bool SupportsExtension(string extension) =>
         extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
