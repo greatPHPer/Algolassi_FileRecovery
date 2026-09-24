@@ -234,6 +234,12 @@ public sealed class MftCandidateScanner
                 deletedRecordCount++;
                 fileNameEntryCount += fileEntries.Count;
 
+                // Keep the exact MFT record that was just scanned. This is
+                // important for deletions that happened before the application
+                // started: the USN journal can contain an older file-reference
+                // sequence than the currently retained deleted MFT record.
+                var scannedRecord = recordSpan.ToArray();
+
                 foreach (var entry in fileEntries)
                 {
                     if (!targetsByName.TryGetValue(entry.Name, out var sameNameTargets))
@@ -243,31 +249,38 @@ public sealed class MftCandidateScanner
 
                     targetNameMatchCount++;
 
-                    // Most legacy history lookups have a unique filename. In that
-                    // case the historical directory is authoritative enough for the
-                    // fallback match, so do not call OpenFileById for every matching
-                    // MFT record. Parent resolution is reserved for ambiguous names.
+                    // Prefer validating the actual FILE_NAME parent against the
+                    // historical target path. This prevents a same-named deleted
+                    // file in another directory from being promoted accidentally.
+                    var currentDirectoryPath = NtfsParentPathResolver.Resolve(
+                        volumeHandle,
+                        entry.ParentFileReferenceNumber) ?? string.Empty;
+
                     string directoryPath;
                     string? matchingTarget;
 
-                    if (sameNameTargets.Count == 1)
+                    if (!string.IsNullOrWhiteSpace(currentDirectoryPath))
                     {
+                        directoryPath = currentDirectoryPath;
+                        matchingTarget = sameNameTargets.FirstOrDefault(target =>
+                            string.Equals(
+                                NormalizePath(Path.Combine(directoryPath, entry.Name)),
+                                target,
+                                StringComparison.OrdinalIgnoreCase));
+                    }
+                    else if (sameNameTargets.Count == 1)
+                    {
+                        // The parent itself may also have been deleted. For a
+                        // unique target filename, retain the historical directory
+                        // as the conservative fallback when the current parent
+                        // cannot be resolved.
                         matchingTarget = sameNameTargets[0];
                         directoryPath = Path.GetDirectoryName(matchingTarget) ?? string.Empty;
                     }
                     else
                     {
-                        directoryPath = NtfsParentPathResolver.Resolve(
-                            volumeHandle,
-                            entry.ParentFileReferenceNumber) ?? string.Empty;
-
-                        matchingTarget = string.IsNullOrWhiteSpace(directoryPath)
-                            ? null
-                            : sameNameTargets.FirstOrDefault(target =>
-                                string.Equals(
-                                    NormalizePath(Path.Combine(directoryPath, entry.Name)),
-                                    target,
-                                    StringComparison.OrdinalIgnoreCase));
+                        matchingTarget = null;
+                        directoryPath = string.Empty;
                     }
 
                     if (string.IsNullOrWhiteSpace(matchingTarget) ||
@@ -276,18 +289,25 @@ public sealed class MftCandidateScanner
                         continue;
                     }
 
-                    var data = dataReader.ReadDefaultDataStream(
+                    // Use the exact MFT record already found by the bounded raw
+                    // scan. Do not re-read it through the historical USN reference;
+                    // that reference may contain a stale sequence number when the
+                    // file was deleted before AlgoLassi started.
+                    var data = dataReader.ReadDefaultDataStreamFromScannedMftRecord(
                         volumeInfo,
                         volumeHandle,
                         fileReferenceNumber,
-                        entry.Name,
-                        entry.ParentFileReferenceNumber,
-                        matchingTarget);
+                        scannedRecord);
+
+                    if (!data.Found)
+                    {
+                        continue;
+                    }
 
                     // Current cluster allocation is validated immediately before
                     // bytes are recovered. Doing that expensive bitmap scan here
                     // would duplicate the work and keep legacy MFT lookup busy
-                    // long after the 512 MB metadata scan has completed.
+                    // long after the bounded metadata scan has completed.
                     IReadOnlyList<NtfsExtentAllocation> allocations = [];
                     const string allocationEvidence =
                         "Current NTFS cluster allocation will be verified immediately before recovery.";
