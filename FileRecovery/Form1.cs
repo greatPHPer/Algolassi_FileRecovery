@@ -451,9 +451,24 @@ public partial class Form1 : Form
 
             if (recentHistoryRecords.Count > 0)
             {
-                // Give the USN monitor a chance to finish enriching watcher-only
-                // history rows with their exact NTFS file references before scanning.
-                await ResolveMissingNtfsReferencesAsync(recentHistoryRecords);
+                var journalPaths = deletedRecords
+                    .Select(record => NormalizePath(record.FullPath))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                var historyNeedingResolution = recentHistoryRecords
+                    .Where(record =>
+                        (!record.FileReferenceNumber.HasValue ||
+                         !record.ParentFileReferenceNumber.HasValue) &&
+                        !journalPaths.Contains(NormalizePath(record.FullPath)))
+                    .ToList();
+
+                if (historyNeedingResolution.Count > 0)
+                {
+                    // Only resolve recent history rows that the full journal scan
+                    // missed. This keeps the live-evidence repair bounded instead
+                    // of repeatedly rescanning already-resolved history rows.
+                    await ResolveMissingNtfsReferencesAsync(historyNeedingResolution);
+                }
 
                 recentHistoryRecords = _history.GetRecent()
                     .Where(record =>
