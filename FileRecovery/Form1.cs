@@ -837,8 +837,8 @@ public partial class Form1 : Form
                     .Where(record =>
                         record.FileSizeBytes.HasValue &&
                         string.Equals(
-                            NormalizePath(record.FullPath),
-                            NormalizePath(candidate.FullPath),
+                            NormalizeForComparison(record.FullPath),
+                            NormalizeForComparison(candidate.FullPath),
                             StringComparison.OrdinalIgnoreCase))
                     .OrderBy(record =>
                         Math.Abs(
@@ -969,6 +969,23 @@ public partial class Form1 : Form
             SetBusy(false);
             UpdateRecoverButton();
         }
+    }
+
+    private static string NormalizeForComparison(string path)
+    {
+        var normalized = NormalizePath(path);
+
+        while (normalized.StartsWith(@"\\?\", StringComparison.Ordinal))
+        {
+            normalized = normalized[4..];
+        }
+
+        while (normalized.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalized = normalized[4..];
+        }
+
+        return normalized;
     }
 
     private static string BuildCandidateEvidence(RecoveryCandidate candidate)
