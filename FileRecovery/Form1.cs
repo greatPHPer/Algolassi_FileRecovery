@@ -1631,7 +1631,7 @@ public partial class Form1 : Form
                 var maxDeepCarveBytes =
                     NtfsDeepFileRecoveryService.DefaultMaxBytesToScan;
 
-                var carveProgress = new Progress<long>(bytesScanned =>
+                IProgress<long> carveProgress = new Progress<long>(bytesScanned =>
                 {
                     var scannedMb = bytesScanned / (1024d * 1024d);
                     var totalMb = maxDeepCarveBytes / (1024d * 1024d);
