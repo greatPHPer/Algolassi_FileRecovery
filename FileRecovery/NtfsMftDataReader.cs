@@ -190,7 +190,7 @@ public sealed class NtfsMftDataReader
             return -1;
         }
 
-        var offset = firstAttributeOffset;
+        var offset = (int)firstAttributeOffset;
         while (offset + 16 <= record.Length)
         {
             var type = BinaryPrimitives.ReadUInt32LittleEndian(
