@@ -448,15 +448,78 @@ public partial class Form1 : Form
                 .OrderByDescending(record => record.DeletedAtUtc)
                 .ToList();
 
-            var journalPaths = deletedRecords
-                .Select(record => NormalizePath(record.FullPath))
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            // ScanDeletedDirectory() already reconstructs the historical USN journal for
+            // the selected directory. If a history row predates this application session,
+            // copy the exact historical file/parent reference from that journal result
+            // before falling back to the direct journal resolver below. This avoids the
+            // old logic where the matching path was excluded from resolution merely because
+            // ScanDeletedDirectory() had already seen it.
+            var journalMatchesByPath = deletedRecords
+                .GroupBy(
+                    record => NormalizePath(record.FullPath),
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .OrderByDescending(record => record.DeletedAtUtc)
+                        .ToList(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            var journalReferenceMatches = 0;
+
+            foreach (var record in historyRecords)
+            {
+                if (record.FileReferenceNumber.HasValue &&
+                    record.ParentFileReferenceNumber.HasValue)
+                {
+                    continue;
+                }
+
+                if (!journalMatchesByPath.TryGetValue(
+                        NormalizePath(record.FullPath),
+                        out var journalMatches))
+                {
+                    continue;
+                }
+
+                var match = journalMatches
+                    .OrderBy(candidate =>
+                        Math.Abs((candidate.DeletedAtUtc - record.DeletedAtUtc).TotalMinutes))
+                    .FirstOrDefault();
+
+                if (match.FullPath is null)
+                {
+                    continue;
+                }
+
+                var deltaMinutes = Math.Abs(
+                    (match.DeletedAtUtc - record.DeletedAtUtc).TotalMinutes);
+
+                // The journal and persisted history timestamps should describe the same
+                // deletion event. Keep the match deliberately narrow so a later deletion
+                // of the same path cannot be assigned to an older history row.
+                if (deltaMinutes > 5)
+                {
+                    continue;
+                }
+
+                record.FileReferenceNumber = match.FileReferenceNumber;
+                record.ParentFileReferenceNumber = match.ParentFileReferenceNumber;
+                journalReferenceMatches++;
+
+                await Task.Run(() => _history.Upsert(record)).ConfigureAwait(true);
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS historical journal-reference merge: " +
+                $"journalRecords={deletedRecords.Count:N0}, " +
+                $"historyRows={historyRecords.Count:N0}, " +
+                $"resolved={journalReferenceMatches:N0}.");
 
             var historyNeedingResolution = historyRecords
                 .Where(record =>
-                    (!record.FileReferenceNumber.HasValue ||
-                     !record.ParentFileReferenceNumber.HasValue) &&
-                    !journalPaths.Contains(NormalizePath(record.FullPath)))
+                    !record.FileReferenceNumber.HasValue ||
+                    !record.ParentFileReferenceNumber.HasValue)
                 .ToList();
 
             if (historyNeedingResolution.Count > 0)
