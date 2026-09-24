@@ -11,6 +11,9 @@ partial class Form1
     private ListBox lstDirectories = null!;
     private Button btnScanDirectory = null!;
     private Button btnScanNtfs = null!;
+    private TextBox txtScanPath = null!;
+    private Button btnBrowseScanPath = null!;
+    private CheckBox chkScanSubdirectories = null!;
     private Button btnShowHistory = null!;
     private Button btnClearHistory = null!;
     private Label lblFiles = null!;
@@ -43,6 +46,9 @@ partial class Form1
         lstDirectories = new ListBox();
         btnScanDirectory = new Button();
         btnScanNtfs = new Button();
+        txtScanPath = new TextBox();
+        btnBrowseScanPath = new Button();
+        chkScanSubdirectories = new CheckBox();
         btnShowHistory = new Button();
         btnClearHistory = new Button();
         lblFiles = new Label();
@@ -94,12 +100,6 @@ partial class Form1
         btnScanDirectory.UseVisualStyleBackColor = true;
         btnScanDirectory.Click += btnScanDirectory_Click;
 
-        btnScanNtfs.Location = new Point(344, 122);
-        btnScanNtfs.Size = new Size(190, 36);
-        btnScanNtfs.Text = "Scan NTFS Deleted Files";
-        btnScanNtfs.UseVisualStyleBackColor = true;
-        btnScanNtfs.Click += btnScanNtfs_Click;
-
         btnShowHistory.Location = new Point(546, 82);
         btnShowHistory.Size = new Size(170, 36);
         btnShowHistory.Text = "Show Delete History";
@@ -112,9 +112,37 @@ partial class Form1
         btnClearHistory.UseVisualStyleBackColor = true;
         btnClearHistory.Click += btnClearHistory_Click;
 
+        txtScanPath.Location = new Point(344, 122);
+        txtScanPath.Name = "txtScanPath";
+        txtScanPath.PlaceholderText = "Directory to scan for deleted NTFS files...";
+        txtScanPath.Size = new Size(400, 23);
+        txtScanPath.TabIndex = 0;
+
+        btnBrowseScanPath.Location = new Point(750, 120);
+        btnBrowseScanPath.Size = new Size(110, 30);
+        btnBrowseScanPath.Text = "Browse...";
+        btnBrowseScanPath.UseVisualStyleBackColor = true;
+        btnBrowseScanPath.Click += btnBrowseScanPath_Click;
+
+        btnScanNtfs.Location = new Point(344, 158);
+        btnScanNtfs.Size = new Size(190, 36);
+        btnScanNtfs.Text = "Scan NTFS Deleted Files";
+        btnScanNtfs.UseVisualStyleBackColor = true;
+        btnScanNtfs.Click += btnScanNtfs_Click;
+
+        chkScanSubdirectories.AutoSize = true;
+        chkScanSubdirectories.Checked = true;
+        chkScanSubdirectories.CheckState = CheckState.Checked;
+        chkScanSubdirectories.Location = new Point(546, 166);
+        chkScanSubdirectories.Name = "chkScanSubdirectories";
+        chkScanSubdirectories.Size = new Size(143, 19);
+        chkScanSubdirectories.Text = "Include subdirectories";
+        chkScanSubdirectories.UseVisualStyleBackColor = true;
+        chkScanSubdirectories.TabIndex = 1;
+
         lblFiles.AutoSize = true;
         lblFiles.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
-        lblFiles.Location = new Point(344, 171);
+        lblFiles.Location = new Point(344, 207);
         lblFiles.Size = new Size(113, 19);
         lblFiles.Text = "Deleted files";
 
@@ -126,13 +154,13 @@ partial class Form1
         dgvResults.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         dgvResults.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
         dgvResults.Columns.AddRange(new DataGridViewColumn[] { colName, colDeleted, colSize, colStrength, colEvidence });
-        dgvResults.Location = new Point(344, 199);
+        dgvResults.Location = new Point(344, 235);
         dgvResults.MultiSelect = true;
         dgvResults.Name = "dgvResults";
         dgvResults.ReadOnly = true;
         dgvResults.RowHeadersVisible = false;
         dgvResults.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        dgvResults.Size = new Size(662, 408);
+        dgvResults.Size = new Size(662, 372);
         dgvResults.SelectionChanged += dgvResults_SelectionChanged;
 
         colName.DataPropertyName = "Name";
@@ -187,14 +215,18 @@ partial class Form1
         AutoScaleMode = AutoScaleMode.Font;
         ClientSize = new Size(1030, 635);
         Controls.Add(lblStatus);
-        Controls.Add(btnSkipRecycleBin);
         Controls.Add(btnRecover);
+        Controls.Add(btnSkipRecycleBin);
         Controls.Add(dgvResults);
         Controls.Add(lblFiles);
+        Controls.Add(chkScanSubdirectories);
+        Controls.Add(btnScanNtfs);
+        Controls.Add(btnBrowseScanPath);
+        Controls.Add(txtScanPath);
         Controls.Add(btnClearHistory);
         Controls.Add(btnShowHistory);
-        Controls.Add(btnScanNtfs);
         Controls.Add(btnScanDirectory);
+        Controls.Add(btnScanNtfs);
         Controls.Add(lstDirectories);
         Controls.Add(lblDirectories);
         Controls.Add(lblSubtitle);
