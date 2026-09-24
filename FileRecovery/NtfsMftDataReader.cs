@@ -31,9 +31,11 @@ public sealed class NtfsMftDataReader
         ulong fileReferenceNumber,
         ulong expectedParentFileReferenceNumber,
         string expectedFileName,
-        out byte[] data)
+        out byte[] data,
+        out bool usedHeuristicMatch)
     {
         data = [];
+        usedHeuristicMatch = false;
 
         if (string.IsNullOrWhiteSpace(rootPath) ||
             fileReferenceNumber == 0 ||
@@ -110,6 +112,7 @@ public sealed class NtfsMftDataReader
                         out var heuristicDataAttributeOffset))
                 {
                     data = heuristicData;
+                    usedHeuristicMatch = true;
 
                     System.Diagnostics.Debug.WriteLine(
                         $"NTFS heuristic resident $DATA evidence: segment={segmentNumber}, " +
@@ -180,6 +183,7 @@ public sealed class NtfsMftDataReader
                         attributeOffset + valueOffset,
                         checked((int)valueLength))
                     .ToArray();
+                usedHeuristicMatch = false;
 
                 System.Diagnostics.Debug.WriteLine(
                     $"NTFS historical resident $DATA evidence: segment={segmentNumber}, " +
