@@ -155,6 +155,8 @@ public sealed class MftCandidateScanner
         var deletedRecordCount = 0L;
         var fileNameEntryCount = 0L;
         var targetNameMatchCount = 0L;
+        var staleSegmentMatchCount = 0L;
+        var staleTimestampMatchCount = 0L;
 
         if (recordSize <= 0 ||
             volumeInfo.MftValidDataLength <= 0)
@@ -319,6 +321,8 @@ public sealed class MftCandidateScanner
                         var entryParentSegment =
                             entry.ParentFileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
 
+                        staleSegmentMatchCount += segmentTargets.Count;
+
                         var timeMatched = segmentTargets
                             .Where(target =>
                                 target.ParentFileReferenceNumber == 0 ||
@@ -329,7 +333,7 @@ public sealed class MftCandidateScanner
                             .FirstOrDefault(target =>
                                 target.DeletedAtUtc != default &&
                                 entry.TimestampUtc != default &&
-                                Math.Abs((entry.TimestampUtc - target.DeletedAtUtc).TotalSeconds) <= 60 &&
+                                Math.Abs((entry.TimestampUtc - target.DeletedAtUtc).TotalMinutes) <= 5 &&
                                 (string.IsNullOrWhiteSpace(currentDirectoryPath) ||
                                  string.Equals(
                                      NormalizePath(currentDirectoryPath),
@@ -338,6 +342,7 @@ public sealed class MftCandidateScanner
 
                         if (timeMatched.FullPath is not null)
                         {
+                            staleTimestampMatchCount++;
                             matchingTarget = timeMatched.FullPath;
                             directoryPath = Path.GetDirectoryName(matchingTarget) ?? currentDirectoryPath;
                             matchingEvidence =
