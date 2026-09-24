@@ -454,11 +454,68 @@ public sealed class MftCandidateScanner
             $"historicalInUseSegmentsSeen={historicalInUseSegmentSeenCount:N0}, " +
             $"results={results.Count:N0}.");
 
-        // Do not re-run the bounded USN scan here. The caller invokes this
-        // method only for candidates whose original data stream lookup failed,
-        // and it only consumes fallback candidates with DataStreamFound=true.
-        // Returning another USN metadata-only candidate therefore cannot improve
-        // recovery and only repeats the access-sensitive parent/reference lookup.
+        if (results.Count == 0 &&
+            targetReferences is not null &&
+            targetReferences.Count > 0)
+        {
+            // Restore the bounded FSCTL_ENUM_USN_DATA fallback for recent/still-retained
+            // deletions. This can recover fresh delete evidence when the raw logical
+            // $MFT parser did not produce a candidate.
+            //
+            // The fallback is deliberately trusted only when the current MFT file
+            // reference is EXACTLY the same reference captured from the historical
+            // delete record. A reused MFT segment has a different sequence number,
+            // so stale historical references cannot be promoted by this path.
+            try
+            {
+                var fallbackCandidates = ScanForPaths(
+                    root,
+                    normalizedTargets.ToList(),
+                    cancellationToken,
+                    maxPages: 128);
+
+                var historicalReferencesByPath = targetReferences
+                    .Where(target =>
+                        !string.IsNullOrWhiteSpace(target.FullPath) &&
+                        target.FileReferenceNumber != 0)
+                    .GroupBy(
+                        target => NormalizePath(target.FullPath),
+                        StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(
+                        group => group.Key,
+                        group => group
+                            .Select(target => target.FileReferenceNumber)
+                            .ToHashSet(),
+                        StringComparer.OrdinalIgnoreCase);
+
+                var trustedFallbackCandidates = fallbackCandidates
+                    .Where(candidate =>
+                        historicalReferencesByPath.TryGetValue(
+                            NormalizePath(candidate.FullPath),
+                            out var historicalReferences) &&
+                        historicalReferences.Contains(candidate.FileReferenceNumber))
+                    .ToList();
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"Bounded MFT/USN fallback: scannedCandidates={fallbackCandidates.Count:N0}, " +
+                    $"trustedExactReferenceMatches={trustedFallbackCandidates.Count:N0}.");
+
+                if (trustedFallbackCandidates.Count > 0)
+                {
+                    return trustedFallbackCandidates;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"Bounded MFT/USN fallback failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         return results;
     }
 
