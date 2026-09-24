@@ -20,6 +20,7 @@ public partial class Form1 : Form
     private bool _suppressDirectorySelectionChanged;
     private bool _suppressGridSelectionChanged;
     private bool _operationInProgress;
+    private bool _ntfsResultsDisplayed;
 
     public void CloseFromApplication()
     {
@@ -116,7 +117,7 @@ public partial class Form1 : Form
 
     private void QueueHistoryRefresh()
     {
-        if (IsDisposed || _historyRefreshPending)
+        if (IsDisposed || _historyRefreshPending || _ntfsResultsDisplayed)
         {
             return;
         }
@@ -188,6 +189,8 @@ public partial class Form1 : Form
         {
             return;
         }
+
+        _ntfsResultsDisplayed = false;
 
         var selectedDirectory = GetSelectedDirectory();
         var selectedHistoryIds = dgvResults.SelectedRows
@@ -467,6 +470,7 @@ public partial class Form1 : Form
                 _suppressGridSelectionChanged = false;
             }
 
+            _ntfsResultsDisplayed = true;
             lblFiles.Text = $"NTFS candidates ({filtered.Count:N0})";
             lblStatus.Text = filtered.Count == 0
                 ? $"No deleted-file metadata candidates were found under {scanDirectory}."
