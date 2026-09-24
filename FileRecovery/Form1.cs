@@ -1707,6 +1707,66 @@ public partial class Form1 : Form
                     continue;
                 }
 
+                // A fresh deletion can leave the resident $DATA stream in the
+                // normal MFT record even when the regular data-stream lookup did not
+                // promote that record to DataStreamFound. Try that source before
+                // historical slack or free-space carving.
+                if (candidate.FileReferenceNumber != 0 &&
+                    candidate.ParentFileReferenceNumber != 0)
+                {
+                    var freshMftReader = new NtfsMftDataReader();
+
+                    if (freshMftReader.TryReadResidentDataForDeletedReference(
+                        candidate.FullPath,
+                        candidate.FileReferenceNumber,
+                        candidate.ParentFileReferenceNumber,
+                        candidate.Name,
+                        candidate.FullPath,
+                        out var freshResidentData) &&
+                        freshResidentData.Length > 0)
+                    {
+                        var destinationPath =
+                            RecoveryDestinationPolicy.CreateSafeFilePath(
+                                destinationDirectory,
+                                candidate.Name);
+
+                        try
+                        {
+                            File.WriteAllBytes(destinationPath, freshResidentData);
+                        }
+                        catch
+                        {
+                            try
+                            {
+                                File.Delete(destinationPath);
+                            }
+                            catch
+                            {
+                                // Preserve the original recovery failure.
+                            }
+
+                            throw;
+                        }
+
+                        candidate.FileSizeBytes = freshResidentData.Length;
+
+                        successes.Add(new RecoveryResult
+                        {
+                            Success = true,
+                            SourcePath = candidate.FullPath,
+                            DestinationPath = destinationPath,
+                            BytesRecovered = freshResidentData.Length,
+                            Evidence =
+                                $"Recovered {freshResidentData.Length:N0} byte(s) from the " +
+                                "resident $DATA stream retained in the deleted file's MFT " +
+                                "record. The filename and parent reference were validated " +
+                                "against the deleted-file reference."
+                        });
+
+                        continue;
+                    }
+                }
+
                 // A reused MFT segment can still retain the deleted file's resident
                 // $DATA attribute in record slack. Try that forensic source before
                 // scanning free clusters, especially for tiny files whose original
