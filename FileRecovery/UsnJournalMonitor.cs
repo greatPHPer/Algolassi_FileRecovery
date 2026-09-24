@@ -1029,10 +1029,10 @@ public sealed class UsnJournalMonitor : IDisposable
 
                 if (majorVersion == 2)
                 {
-                    var fileReferenceNumber =
+                    var recordFileReferenceNumber =
                         BinaryPrimitives.ReadUInt64LittleEndian(
                             recordSpan.Slice(8, 8));
-                    var parentFileReferenceNumber =
+                    var recordParentFileReferenceNumber =
                         BinaryPrimitives.ReadUInt64LittleEndian(
                             recordSpan.Slice(16, 8));
                     var timestampFileTime =
@@ -1071,8 +1071,8 @@ public sealed class UsnJournalMonitor : IDisposable
                                 volumeHandle,
                                 volumeKey,
                                 new UsnRecord(
-                                    fileReferenceNumber,
-                                    parentFileReferenceNumber,
+                                    recordFileReferenceNumber,
+                                    recordParentFileReferenceNumber,
                                     reason,
                                     fileAttributes,
                                     name,
