@@ -1707,6 +1707,66 @@ public partial class Form1 : Form
                     continue;
                 }
 
+                // A reused MFT segment can still retain the deleted file's resident
+                // $DATA attribute in record slack. Try that forensic source before
+                // scanning free clusters, especially for tiny files whose original
+                // content was probably resident.
+                if (candidate.FileReferenceNumber != 0 &&
+                    candidate.ParentFileReferenceNumber != 0)
+                {
+                    var historicalMftReader = new NtfsMftDataReader();
+
+                    if (historicalMftReader.TryReadHistoricalResidentData(
+                        candidate.FullPath,
+                        candidate.FileReferenceNumber,
+                        candidate.ParentFileReferenceNumber,
+                        candidate.Name,
+                        out var historicalData) &&
+                        historicalData.Length > 0)
+                    {
+                        var destinationPath =
+                            RecoveryDestinationPolicy.CreateSafeFilePath(
+                                destinationDirectory,
+                                candidate.Name);
+
+                        try
+                        {
+                            File.WriteAllBytes(destinationPath, historicalData);
+                        }
+                        catch
+                        {
+                            try
+                            {
+                                File.Delete(destinationPath);
+                            }
+                            catch
+                            {
+                                // Preserve the original recovery failure.
+                            }
+
+                            throw;
+                        }
+
+                        candidate.FileSizeBytes = historicalData.Length;
+
+                        successes.Add(new RecoveryResult
+                        {
+                            Success = true,
+                            SourcePath = candidate.FullPath,
+                            DestinationPath = destinationPath,
+                            BytesRecovered = historicalData.Length,
+                            Evidence =
+                                $"Recovered {historicalData.Length:N0} byte(s) from " +
+                                "historical resident $DATA retained in the reused MFT " +
+                                "record's slack. The source was matched by historical " +
+                                "file name and parent reference; the current MFT sequence " +
+                                "was not treated as the deleted file."
+                        });
+
+                        continue;
+                    }
+                }
+
                 // The retained MFT metadata may be insufficient for this candidate,
                 // but structural carving can still recover many formats without an
                 // original size. Plain text now has a deliberately heuristic fallback
