@@ -73,14 +73,17 @@ internal static class NtfsParentPathResolver
 
     private static string NormalizeFinalPath(string path)
     {
-        if (path.StartsWith(@"\?UNC\", StringComparison.OrdinalIgnoreCase))
+        const string extendedUncPrefix = @"\\?\UNC\";
+        const string extendedPathPrefix = @"\\?\";
+        
+        if (path.StartsWith(extendedUncPrefix, StringComparison.OrdinalIgnoreCase))
         {
-            return @"\" + path[8..];
+            return @"\\" + path[extendedUncPrefix.Length..];
         }
 
-        if (path.StartsWith(@"\?", StringComparison.OrdinalIgnoreCase))
+        if (path.StartsWith(extendedPathPrefix, StringComparison.OrdinalIgnoreCase))
         {
-            return path[4..];
+            return path[extendedPathPrefix.Length..];
         }
 
         return path;
