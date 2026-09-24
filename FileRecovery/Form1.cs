@@ -1721,7 +1721,8 @@ public partial class Form1 : Form
                         candidate.FileReferenceNumber,
                         candidate.ParentFileReferenceNumber,
                         candidate.Name,
-                        out var historicalData) &&
+                        out var historicalData,
+                        out var usedHeuristicHistoricalEvidence) &&
                         historicalData.Length > 0)
                     {
                         var destinationPath =
@@ -1755,12 +1756,18 @@ public partial class Form1 : Form
                             SourcePath = candidate.FullPath,
                             DestinationPath = destinationPath,
                             BytesRecovered = historicalData.Length,
-                            Evidence =
-                                $"Recovered {historicalData.Length:N0} byte(s) from " +
-                                "historical resident $DATA retained in the reused MFT " +
-                                "record's slack. The source was matched by historical " +
-                                "file name and parent reference; the current MFT sequence " +
-                                "was not treated as the deleted file."
+                            Evidence = usedHeuristicHistoricalEvidence
+                                ? $"Recovered {historicalData.Length:N0} byte(s) from " +
+                                  "historical resident $DATA retained in reused MFT record " +
+                                  "slack. The exact historical filename was found near a " +
+                                  "plausible resident $DATA attribute; the parent reference " +
+                                  "could not be structurally validated, so this result is " +
+                                  "heuristic."
+                                : $"Recovered {historicalData.Length:N0} byte(s) from " +
+                                  "historical resident $DATA retained in the reused MFT " +
+                                  "record's slack. The source was matched by historical " +
+                                  "file name and parent reference; the current MFT sequence " +
+                                  "was not treated as the deleted file."
                         });
 
                         continue;
