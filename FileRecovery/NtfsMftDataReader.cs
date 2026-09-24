@@ -230,29 +230,29 @@ public sealed class NtfsMftDataReader
         const int parentOffset = 0;
         const int allocatedSizeOffset = 40;
         const int realSizeOffset = 48;
+        const int fileNameFlagsOffset = 56;
         const int fileNameLengthOffset = 64;
         const int fileNameNamespaceOffset = 65;
         const int fileNameOffset = 66;
 
-        for (var nameOffset = slackStart;
-             nameOffset + expectedNameBytes.Length <= record.Length;
-             nameOffset += 2)
+        if (slackStart < 0 ||
+            slackStart >= record.Length ||
+            expectedNameBytes.Length == 0)
         {
-            if (!record.AsSpan(
-                    nameOffset,
-                    expectedNameBytes.Length)
-                .SequenceEqual(expectedNameBytes))
-            {
-                continue;
-            }
+            return -1;
+        }
 
-            var valueOffset = nameOffset - fileNameOffset;
-            if (valueOffset < slackStart ||
-                valueOffset + fileNameOffset > record.Length)
-            {
-                continue;
-            }
+        var examinedNameByteMatches = 0;
+        var parentMatches = 0;
 
+        // Search by the retained $FILE_NAME value structure rather than only
+        // finding raw UTF-16 bytes and reconstructing the value backwards.
+        // Reused MFT records can leave slack with partial/unaligned remnants,
+        // so scan every byte and validate the complete structure.
+        for (var valueOffset = slackStart;
+             valueOffset + fileNameOffset + expectedNameBytes.Length <= record.Length;
+             valueOffset++)
+        {
             var storedNameLength = record[valueOffset + fileNameLengthOffset];
             var nameNamespace = record[valueOffset + fileNameNamespaceOffset];
 
@@ -261,6 +261,22 @@ public sealed class NtfsMftDataReader
             {
                 continue;
             }
+
+            var nameBytes = checked(storedNameLength * 2);
+            if (valueOffset + fileNameOffset + nameBytes > record.Length)
+            {
+                continue;
+            }
+
+            if (!record.AsSpan(
+                    valueOffset + fileNameOffset,
+                    nameBytes)
+                .SequenceEqual(expectedNameBytes))
+            {
+                continue;
+            }
+
+            examinedNameByteMatches++;
 
             var parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
                 record.AsSpan(
@@ -272,6 +288,8 @@ public sealed class NtfsMftDataReader
                 continue;
             }
 
+            parentMatches++;
+
             var allocatedSize = BinaryPrimitives.ReadInt64LittleEndian(
                 record.AsSpan(
                     valueOffset + allocatedSizeOffset,
@@ -282,6 +300,11 @@ public sealed class NtfsMftDataReader
                     valueOffset + realSizeOffset,
                     sizeof(long)));
 
+            var flags = BinaryPrimitives.ReadUInt32LittleEndian(
+                record.AsSpan(
+                    valueOffset + fileNameFlagsOffset,
+                    sizeof(uint)));
+
             if (realSize < 0 ||
                 allocatedSize < 0 ||
                 realSize > allocatedSize ||
@@ -291,8 +314,22 @@ public sealed class NtfsMftDataReader
             }
 
             historicalFileSize = realSize;
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS historical $FILE_NAME structure match: " +
+                $"offset={valueOffset}, fileNameSize={storedNameLength}, " +
+                $"namespace={nameNamespace}, parentRef={parentReference}, " +
+                $"size={realSize}, allocated={allocatedSize}, flags=0x{flags:X8}.");
+
             return valueOffset;
         }
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS historical $FILE_NAME structure search: " +
+            $"slackStart={slackStart}, recordLength={record.Length}, " +
+            $"rawNameMatches={examinedNameByteMatches}, " +
+            $"parentMatches={parentMatches}, expectedParent={expectedParentFileReferenceNumber}, " +
+            $"expectedName={Encoding.Unicode.GetString(expectedNameBytes)}.");
 
         return -1;
     }
