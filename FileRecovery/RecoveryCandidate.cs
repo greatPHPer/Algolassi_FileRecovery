@@ -12,7 +12,7 @@ public sealed class RecoveryCandidate
 
     public bool DataStreamFound { get; init; }
     public bool DataStreamResident { get; init; }
-    public long FileSizeBytes { get; init; }
+    public long FileSizeBytes { get; set; }
     public long ValidDataLengthBytes { get; init; }
     public byte[]? ResidentData { get; init; }
     public IReadOnlyList<NtfsDataExtent> DataExtents { get; init; } = [];
