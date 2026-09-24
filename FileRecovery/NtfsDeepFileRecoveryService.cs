@@ -679,7 +679,7 @@ public sealed class NtfsDeepFileRecoveryService
                     (uint)chunk,
                     out var bytesRead,
                     IntPtr.Zero) ||
-                bytesRead != chunk)
+                bytesRead != (uint)chunk)
             {
                 throw new Win32Exception(
                     Marshal.GetLastWin32Error(),
