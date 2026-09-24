@@ -172,6 +172,7 @@ public sealed class NtfsDeepFileRecoveryService
                         extension,
                         scanWindow,
                         knownFileSizeBytes,
+                        volumeInfo.BytesPerCluster,
                         out var startOffset,
                         out var carvedLength,
                         out var format))
@@ -328,6 +329,7 @@ public sealed class NtfsDeepFileRecoveryService
         string extension,
         byte[] buffer,
         long knownFileSizeBytes,
+        long bytesPerCluster,
         out int startOffset,
         out int length,
         out string format)
@@ -340,7 +342,12 @@ public sealed class NtfsDeepFileRecoveryService
         {
             if (knownFileSizeBytes <= 0 ||
                 knownFileSizeBytes > MaxCarvedFileBytes ||
-                !TryFindText(buffer, checked((int)knownFileSizeBytes), out startOffset))
+                bytesPerCluster <= 0 ||
+                !TryFindText(
+                    buffer,
+                    checked((int)knownFileSizeBytes),
+                    checked((int)bytesPerCluster),
+                    out startOffset))
             {
                 return false;
             }
@@ -448,6 +455,7 @@ public sealed class NtfsDeepFileRecoveryService
     private static bool TryFindText(
         byte[] buffer,
         int expectedLength,
+        int bytesPerCluster,
         out int start)
     {
         start = -1;
@@ -463,7 +471,8 @@ public sealed class NtfsDeepFileRecoveryService
         // exact known byte length and require every byte to be valid printable
         // UTF-8/ASCII text (plus common whitespace). This deliberately remains
         // heuristic and should never be presented as exact file identity.
-        for (var i = 0; i <= buffer.Length - expectedLength; i++)
+        var lastStart = buffer.Length - expectedLength;
+        for (var i = 0; i <= lastStart; i += bytesPerCluster)
         {
             var span = buffer.AsSpan(i, expectedLength);
 
