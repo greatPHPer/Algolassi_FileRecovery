@@ -78,132 +78,139 @@ public sealed class NtfsDeepFileRecoveryService
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (scannedBytes >= maxBytesToScan)
-            {
-                break;
-            }
+            var extentBytes = checked(
+                freeExtent.ClusterCount * (long)volumeInfo.BytesPerCluster);
 
-            var extentBytes = checked(freeExtent.ClusterCount * (long)volumeInfo.BytesPerCluster);
             if (extentBytes <= 0)
             {
                 continue;
             }
 
-            var bytesRemainingToScan = maxBytesToScan - scannedBytes;
-            var bytesToRead = Math.Min(
-                extentBytes,
-                Math.Min(bytesRemainingToScan, MaxCarvedFileBytes));
-
-            if (bytesToRead <= 0)
-            {
-                break;
-            }
-
-            bytesToRead -= bytesToRead % volumeInfo.BytesPerCluster;
-            if (bytesToRead < volumeInfo.BytesPerCluster)
-            {
-                break;
-            }
-
-            var buffer = new byte[checked((int)bytesToRead)];
-            var physicalOffset = checked(
+            var extentOffset = checked(
                 freeExtent.LogicalClusterNumber * (long)volumeInfo.BytesPerCluster);
+            var extentBytesScanned = 0L;
 
-            ReadAt(
-                volumeHandle,
-                physicalOffset,
-                buffer,
-                cancellationToken);
+            // A single free extent can be much larger than the 64 MB carve buffer.
+            // Walk the entire extent in bounded chunks instead of scanning only its
+            // first chunk and then skipping the remainder.
+            while (extentBytesScanned < extentBytes &&
+                   scannedBytes < maxBytesToScan)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
 
-            scannedBytes = checked(scannedBytes + bytesToRead);
+                var bytesRemainingInExtent = extentBytes - extentBytesScanned;
+                var bytesRemainingOverall = maxBytesToScan - scannedBytes;
+                var bytesToRead = Math.Min(
+                    bytesRemainingInExtent,
+                    Math.Min(bytesRemainingOverall, MaxCarvedFileBytes));
 
-            if (!TryCarve(
-                    extension,
+                bytesToRead -= bytesToRead % volumeInfo.BytesPerCluster;
+
+                if (bytesToRead < volumeInfo.BytesPerCluster)
+                {
+                    break;
+                }
+
+                var buffer = new byte[checked((int)bytesToRead)];
+                var physicalOffset = checked(extentOffset + extentBytesScanned);
+
+                ReadAt(
+                    volumeHandle,
+                    physicalOffset,
                     buffer,
-                    out var startOffset,
-                    out var carvedLength,
-                    out var format))
-            {
-                continue;
+                    cancellationToken);
+
+                scannedBytes = checked(scannedBytes + bytesToRead);
+                extentBytesScanned = checked(extentBytesScanned + bytesToRead);
+
+                if (!TryCarve(
+                        extension,
+                        buffer,
+                        out var startOffset,
+                        out var carvedLength,
+                        out var format))
+                {
+                    continue;
+                }
+
+                if (carvedLength <= 0 ||
+                    carvedLength > MaxCarvedFileBytes ||
+                    startOffset < 0 ||
+                    startOffset > buffer.Length ||
+                    carvedLength > buffer.Length - startOffset)
+                {
+                    continue;
+                }
+
+                var absoluteByteOffset = checked(physicalOffset + startOffset);
+                var firstCluster = absoluteByteOffset / volumeInfo.BytesPerCluster;
+                var lastByteExclusive = checked(
+                    absoluteByteOffset + carvedLength);
+                var lastClusterExclusive = checked(
+                    (lastByteExclusive + volumeInfo.BytesPerCluster - 1) /
+                    volumeInfo.BytesPerCluster);
+                var clusterCount = checked(lastClusterExclusive - firstCluster);
+
+                if (clusterCount <= 0)
+                {
+                    continue;
+                }
+
+                var allocation = bitmapReader.CheckExtents(
+                    volumeHandle,
+                    [
+                        new NtfsDataExtent
+                        {
+                            VirtualClusterNumber = 0,
+                            LogicalClusterNumber = firstCluster,
+                            ClusterCount = clusterCount
+                        }
+                    ],
+                    cancellationToken);
+
+                if (allocation.Count != 1 ||
+                    allocation[0].AllocatedClusterCount != 0 ||
+                    allocation[0].FreeClusterCount != clusterCount)
+                {
+                    // The source changed while scanning. Do not trust or write this hit.
+                    continue;
+                }
+
+                var destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
+                    destinationDirectory,
+                    candidate.Name);
+
+                try
+                {
+                    using var output = new FileStream(
+                        destinationPath,
+                        FileMode.CreateNew,
+                        FileAccess.Write,
+                        FileShare.None,
+                        IoBufferSize,
+                        FileOptions.SequentialScan);
+
+                    output.Write(
+                        buffer,
+                        startOffset,
+                        carvedLength);
+                }
+                catch
+                {
+                    TryDelete(destinationPath);
+                    throw;
+                }
+
+                return new RecoveryResult
+                {
+                    Success = true,
+                    SourcePath = candidate.FullPath,
+                    DestinationPath = destinationPath,
+                    BytesRecovered = carvedLength,
+                    Evidence =
+                        $"Deep NTFS file carving recovered {carvedLength:N0} byte(s) as a structurally valid {format} file from currently free clusters."
+                };
             }
-
-            if (carvedLength <= 0 ||
-                carvedLength > MaxCarvedFileBytes ||
-                startOffset < 0 ||
-                startOffset > buffer.Length ||
-                carvedLength > buffer.Length - startOffset)
-            {
-                continue;
-            }
-
-            var absoluteByteOffset = checked(physicalOffset + startOffset);
-            var firstCluster = absoluteByteOffset / volumeInfo.BytesPerCluster;
-            var lastByteExclusive = checked(
-                absoluteByteOffset + carvedLength);
-            var lastClusterExclusive = checked(
-                (lastByteExclusive + volumeInfo.BytesPerCluster - 1) /
-                volumeInfo.BytesPerCluster);
-            var clusterCount = checked(lastClusterExclusive - firstCluster);
-
-            if (clusterCount <= 0)
-            {
-                continue;
-            }
-
-            var allocation = bitmapReader.CheckExtents(
-                volumeHandle,
-                [
-                    new NtfsDataExtent
-                    {
-                        VirtualClusterNumber = 0,
-                        LogicalClusterNumber = firstCluster,
-                        ClusterCount = clusterCount
-                    }
-                ],
-                cancellationToken);
-
-            if (allocation.Count != 1 ||
-                allocation[0].AllocatedClusterCount != 0 ||
-                allocation[0].FreeClusterCount != clusterCount)
-            {
-                // The source changed while scanning. Do not trust or write this hit.
-                continue;
-            }
-
-            var destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
-                destinationDirectory,
-                candidate.Name);
-
-            try
-            {
-                using var output = new FileStream(
-                    destinationPath,
-                    FileMode.CreateNew,
-                    FileAccess.Write,
-                    FileShare.None,
-                    IoBufferSize,
-                    FileOptions.SequentialScan);
-
-                output.Write(
-                    buffer,
-                    startOffset,
-                    carvedLength);
-            }
-            catch
-            {
-                TryDelete(destinationPath);
-                throw;
-            }
-
-            return new RecoveryResult
-            {
-                Success = true,
-                SourcePath = candidate.FullPath,
-                DestinationPath = destinationPath,
-                BytesRecovered = carvedLength,
-                Evidence =
-                    $"Deep NTFS file carving recovered {carvedLength:N0} byte(s) as a structurally valid {format} file from currently free clusters."
-            };
         }
 
         throw new InvalidOperationException(
