@@ -276,7 +276,9 @@ public sealed class NtfsDeepFileRecoveryService
                     BytesRecovered = carvedLength,
                     Evidence =
                         string.Equals(format, "Plain text", StringComparison.OrdinalIgnoreCase)
-                            ? $"Deep NTFS heuristic text carving recovered exactly {carvedLength:N0} byte(s) from currently free clusters using the known original file length. The content match is heuristic because plain-text files do not carry a self-delimiting file boundary."
+                            ? format.Contains("heuristic", StringComparison.OrdinalIgnoreCase)
+                            ? $"Deep NTFS heuristic text carving recovered a {carvedLength:N0}-byte text-like region from currently free clusters without a known original file length. Plain-text files do not carry a self-delimiting file boundary, so the recovered extent is heuristic."
+                            : $"Deep NTFS heuristic text carving recovered exactly {carvedLength:N0} byte(s) from currently free clusters using the known original file length. The content match is heuristic because plain-text files do not carry a self-delimiting file boundary."
                             : $"Deep NTFS file carving recovered {carvedLength:N0} byte(s) as a structurally valid {format} file from currently free clusters."
                 };
             }
@@ -303,8 +305,10 @@ public sealed class NtfsDeepFileRecoveryService
 
         if (extension.Equals(".txt", StringComparison.OrdinalIgnoreCase))
         {
-            return knownFileSizeBytes > 0 &&
-                   knownFileSizeBytes <= MaxCarvedFileBytes;
+            // Plain text can be carved without the original length only as a
+            // deliberately heuristic prefix search. When the original length is
+            // known, the exact-size path remains preferred.
+            return true;
         }
 
         return SupportsExtension(extension);
@@ -340,20 +344,38 @@ public sealed class NtfsDeepFileRecoveryService
 
         if (extension.Equals(".txt", StringComparison.OrdinalIgnoreCase))
         {
-            if (knownFileSizeBytes <= 0 ||
-                knownFileSizeBytes > MaxCarvedFileBytes ||
-                bytesPerCluster <= 0 ||
-                !TryFindText(
-                    buffer,
-                    checked((int)knownFileSizeBytes),
-                    checked((int)bytesPerCluster),
-                    out startOffset))
+            if (bytesPerCluster <= 0)
             {
                 return false;
             }
 
-            length = checked((int)knownFileSizeBytes);
-            format = "Plain text";
+            if (knownFileSizeBytes > 0)
+            {
+                if (knownFileSizeBytes > MaxCarvedFileBytes ||
+                    !TryFindText(
+                        buffer,
+                        checked((int)knownFileSizeBytes),
+                        checked((int)bytesPerCluster),
+                        out startOffset))
+                {
+                    return false;
+                }
+
+                length = checked((int)knownFileSizeBytes);
+                format = "Plain text";
+                return true;
+            }
+
+            if (!TryFindUnknownSizeText(
+                    buffer,
+                    checked((int)bytesPerCluster),
+                    out startOffset,
+                    out length))
+            {
+                return false;
+            }
+
+            format = "Plain text (heuristic)";
             return true;
         }
 
@@ -484,6 +506,101 @@ public sealed class NtfsDeepFileRecoveryService
 
             start = i;
             return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryFindUnknownSizeText(
+        byte[] buffer,
+        int bytesPerCluster,
+        out int start,
+        out int length)
+    {
+        start = -1;
+        length = 0;
+
+        if (buffer.Length == 0 || bytesPerCluster <= 0)
+        {
+            return false;
+        }
+
+        // Without an original size, plain text has no trustworthy boundary.
+        // Restrict the search to cluster-aligned starts and return only a
+        // contiguous text-like prefix. A minimum length avoids treating isolated
+        // printable bytes as a recovered file.
+        const int minimumLength = 4;
+        var maxStart = buffer.Length - minimumLength;
+
+        for (var i = 0; i <= maxStart; i += bytesPerCluster)
+        {
+            if (buffer[i] == 0)
+            {
+                continue;
+            }
+
+            var candidateLength = 0;
+            var position = i;
+
+            while (position < buffer.Length &&
+                   candidateLength < MaxCarvedFileBytes)
+            {
+                var value = buffer[position];
+
+                if (value == 0)
+                {
+                    break;
+                }
+
+                if (value is >= 0x20 and <= 0x7E || value is 0x09 or 0x0A or 0x0D)
+                {
+                    candidateLength++;
+                    position++;
+                    continue;
+                }
+
+                // Accept a complete UTF-8 sequence when present.
+                if (value is >= 0xC2 and <= 0xF4)
+                {
+                    var sequenceLength =
+                        value <= 0xDF ? 2 :
+                        value <= 0xEF ? 3 : 4;
+
+                    if (position + sequenceLength > buffer.Length)
+                    {
+                        break;
+                    }
+
+                    var valid = true;
+                    for (var j = 1; j < sequenceLength; j++)
+                    {
+                        if (buffer[position + j] < 0x80 ||
+                            buffer[position + j] > 0xBF)
+                        {
+                            valid = false;
+                            break;
+                        }
+                    }
+
+                    if (!valid)
+                    {
+                        break;
+                    }
+
+                    candidateLength += sequenceLength;
+                    position += sequenceLength;
+                    continue;
+                }
+
+                break;
+            }
+
+            if (candidateLength >= minimumLength)
+            {
+                start = i;
+                length = candidateLength;
+                return true;
+            }
         }
 
         return false;
