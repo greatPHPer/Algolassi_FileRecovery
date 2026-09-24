@@ -643,9 +643,15 @@ public sealed class NtfsMftDataReader
 
         if ((flags & 0x0001) != 0)
         {
+            // A freshly deleted file can briefly remain marked IN_USE while the
+            // final close/delete bookkeeping completes. The USN file reference
+            // that reached this reader is already tied to the deletion event, so
+            // keep the record and inspect its $DATA rather than rejecting it
+            // before the attribute parser gets a chance to recover the stream.
             System.Diagnostics.Debug.WriteLine(
-                $"NTFS ReadRecord: record is still marked in-use; flags=0x{flags:X4}, segment={segmentNumber}.");
-            return null;
+                $"NTFS ReadRecord: deleted reference is still marked IN_USE; " +
+                $"continuing because the exact USN file reference was supplied. " +
+                $"flags=0x{flags:X4}, segment={segmentNumber}.");
         }
 
         var baseFileReference = BinaryPrimitives.ReadUInt64LittleEndian(record.AsSpan(32, 8));
