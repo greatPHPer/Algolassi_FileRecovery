@@ -882,6 +882,28 @@ public partial class Form1 : Form
                         $"path={candidate.FullPath}, fileRef={candidate.FileReferenceNumber}, " +
                         $"size={knownSize:N0} bytes.");
                 }
+                else if (candidate.FileSizeBytes <= 0 &&
+                         candidate.FileReferenceNumber != 0 &&
+                         candidate.ParentFileReferenceNumber != 0)
+                {
+                    var historicalMftReader = new NtfsMftDataReader();
+
+                    if (historicalMftReader.TryReadHistoricalFileNameSize(
+                        rootPath,
+                        candidate.FileReferenceNumber,
+                        candidate.ParentFileReferenceNumber,
+                        candidate.Name,
+                        out var historicalSize) &&
+                        historicalSize > 0)
+                    {
+                        candidate.FileSizeBytes = historicalSize;
+
+                        System.Diagnostics.Debug.WriteLine(
+                            $"NTFS candidate size enrichment: match=historical-$FILE_NAME, " +
+                            $"path={candidate.FullPath}, fileRef={candidate.FileReferenceNumber}, " +
+                            $"size={historicalSize:N0} bytes.");
+                    }
+                }
             }
 
             var liveHistoryByPath = recentHistoryRecords
@@ -1685,19 +1707,17 @@ public partial class Form1 : Form
                     continue;
                 }
 
-                // The retained MFT metadata is insufficient for this candidate.
-                // Only file types with a safe, self-delimiting structural format can
-                // be recovered from raw free-space carving. In particular, plain-text
-                // files do not have a reliable end marker, so do not pretend to scan
-                // them indefinitely.
+                // The retained MFT metadata may be insufficient for this candidate,
+                // but structural carving can still recover many formats without an
+                // original size. Plain text now has a deliberately heuristic fallback
+                // when no historical size can be recovered.
                 if (!NtfsDeepFileRecoveryService.SupportsDeepCarving(
                         candidate.Name,
                         candidate.FileSizeBytes))
                 {
                     failures.Add(
                         $"{candidate.Name}: deep NTFS carving is not supported for " +
-                        $"'{Path.GetExtension(candidate.Name)}'. " +
-                        "For plain text, recovery requires a known original byte length.");
+                        $"'{Path.GetExtension(candidate.Name)}'.");
                     continue;
                 }
 
