@@ -1925,7 +1925,7 @@ public partial class Form1 : Form
                         !forensicMarkerDeclined.Contains(markerKey))
                     {
                         var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
-                            $"The original size of '{candidate.Name}' is unknown.\\r\\n\\r\\n" +
+                            $"The original size of '{candidate.Name}' is unknown.\r\n\r\n" +
                             "Enter a unique text string that was definitely contained in this " +
                             "deleted file. AlgoLassi will search every byte of the source volume " +
                             "for that exact UTF-8 marker before attempting broader carving.\\r\\n\\r\\n" +
