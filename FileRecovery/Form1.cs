@@ -809,10 +809,25 @@ public partial class Form1 : Form
                         var expectedFullPath = NormalizePath(record.FullPath);
 
                         var match = availableItems.FirstOrDefault(item =>
+                            !string.IsNullOrWhiteSpace(item.OriginalLocation) &&
+                            !item.OriginalLocation.Equals(
+                                "(Unavailable)",
+                                StringComparison.OrdinalIgnoreCase) &&
                             string.Equals(
                                 NormalizePath(Path.Combine(item.OriginalLocation, item.Name)),
                                 expectedFullPath,
                                 StringComparison.OrdinalIgnoreCase));
+
+                        if (match is null)
+                        {
+                            // Fallback only when Shell does not expose the original
+                            // location. Name + deletion metadata is less precise,
+                            // so use it only after the path-based match fails.
+                            match = availableItems.FirstOrDefault(item =>
+                                string.Equals(item.Name, record.FileName, StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(item.DeletedDate, record.DeletedAtUtc.ToLocalTime().ToString("g"), StringComparison.OrdinalIgnoreCase));
+                        }
+
                         if (match is not null)
                         {
                             matches[record.Id] = match;
@@ -1252,11 +1267,30 @@ public partial class Form1 : Form
                 {
                     try
                     {
+                        // The original path + name is the stable identity we used
+                        // when the history row was matched to the Recycle Bin. Do not
+                        // require Shell-formatted date/size strings to be identical across
+                        // two separate Shell.Application enumerations.
+                        var expectedPath = NormalizePath(
+                            Path.Combine(selected.OriginalLocation, selected.Name));
+
                         var match = availableItems.FirstOrDefault(item =>
-                            string.Equals(item.Name, selected.Name, StringComparison.OrdinalIgnoreCase) &&
-                            string.Equals(item.OriginalLocation, selected.OriginalLocation, StringComparison.OrdinalIgnoreCase) &&
-                            string.Equals(item.DeletedDate, selected.DeletedDate, StringComparison.OrdinalIgnoreCase) &&
-                            string.Equals(item.Size, selected.Size, StringComparison.OrdinalIgnoreCase));
+                            string.Equals(
+                                NormalizePath(Path.Combine(item.OriginalLocation, item.Name)),
+                                expectedPath,
+                                StringComparison.OrdinalIgnoreCase));
+
+                        // Some Windows Shell configurations can temporarily omit the
+                        // Original location column. Retain a conservative metadata
+                        // fallback rather than sending an otherwise recoverable item
+                        // into the NTFS deleted-record path.
+                        if (match is null)
+                        {
+                            match = availableItems.FirstOrDefault(item =>
+                                string.Equals(item.Name, selected.Name, StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(item.DeletedDate, selected.DeletedDate, StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(item.Size, selected.Size, StringComparison.OrdinalIgnoreCase));
+                        }
 
                         if (match is null)
                         {
