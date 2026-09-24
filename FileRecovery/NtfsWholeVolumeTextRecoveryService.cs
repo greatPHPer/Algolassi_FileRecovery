@@ -234,16 +234,16 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     previousTail.Length +
                     markerOffsetInWindow);
 
-                var recovery = RecoverTextRegionAroundMarker(
+                var recovery = RecoverTextRegionFromScannedBuffer(
                     candidate,
                     destinationDirectory,
-                    sourceRoot,
                     volumeInfo,
                     volumeHandle,
                     matchedMarker.Value.Bytes,
                     matchedMarker.Value.Encoding,
-                    absoluteMarkerOffset,
-                    totalVolumeBytes,
+                    window,
+                    checked(physicalOffset - previousTail.Length),
+                    markerOffsetInWindow,
                     cancellationToken);
 
                 System.Diagnostics.Debug.WriteLine(
@@ -441,54 +441,42 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         return (false, -1, null, scannedBytes);
     }
 
-    private static RecoveryResult RecoverTextRegionAroundMarker(
+    private static RecoveryResult RecoverTextRegionFromScannedBuffer(
         RecoveryCandidate candidate,
         string destinationDirectory,
-        string sourceRoot,
         NtfsVolumeInfo volumeInfo,
         SafeFileHandle volumeHandle,
         byte[] markerBytes,
         string markerEncoding,
-        long markerOffset,
-        long totalVolumeBytes,
+        byte[] scanWindow,
+        long scanWindowAbsoluteOffset,
+        int markerOffsetInWindow,
         CancellationToken cancellationToken)
     {
-        var contextBytesBefore = Math.Min(
-            markerOffset,
-            MaxRecoveredTextBytes / 2L);
-        var contextStart = checked(markerOffset - contextBytesBefore);
-        var contextLength = checked(
-            (int)Math.Min(
-                MaxRecoveredTextBytes,
-                totalVolumeBytes - contextStart));
-
-        var context = new byte[contextLength];
-        ReadAt(
-            volumeHandle,
-            contextStart,
-            context,
-            cancellationToken);
-
-        var markerIndex = checked((int)(markerOffset - contextStart));
-        var markerEnd = checked(markerIndex + markerBytes.Length);
-
-        if (markerIndex < 0 ||
-            markerEnd > context.Length ||
-            !context.AsSpan(markerIndex, markerBytes.Length)
-                .SequenceEqual(markerBytes))
+        if (markerOffsetInWindow < 0 ||
+            markerOffsetInWindow + markerBytes.Length > scanWindow.Length)
         {
             throw new InvalidOperationException(
-                "The NTFS volume changed before the matched text marker could be re-read.");
+                "The matched marker fell outside the scanned NTFS buffer.");
         }
 
-        var start = markerIndex;
-        while (start > 0 && IsPlainTextByte(context[start - 1]))
+        if (!scanWindow.AsSpan(
+                markerOffsetInWindow,
+                markerBytes.Length)
+            .SequenceEqual(markerBytes))
+        {
+            throw new InvalidOperationException(
+                "The matched marker could not be validated in the scanned NTFS buffer.");
+        }
+
+        var start = markerOffsetInWindow;
+        while (start > 0 && IsPlainTextByte(scanWindow[start - 1]))
         {
             start--;
         }
 
-        var end = markerEnd;
-        while (end < context.Length && IsPlainTextByte(context[end]))
+        var end = markerOffsetInWindow + markerBytes.Length;
+        while (end < scanWindow.Length && IsPlainTextByte(scanWindow[end]))
         {
             end++;
         }
@@ -496,8 +484,8 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         var recoveredLength = end - start;
         if (recoveredLength < markerBytes.Length)
         {
-            start = markerIndex;
-            end = markerEnd;
+            start = markerOffsetInWindow;
+            end = markerOffsetInWindow + markerBytes.Length;
             recoveredLength = markerBytes.Length;
         }
 
@@ -507,8 +495,8 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 $"The text region containing the marker exceeds the {MaxRecoveredTextBytes:N0}-byte forensic recovery limit.");
         }
 
-        var absoluteStart = checked(contextStart + start);
-        var absoluteEnd = checked(contextStart + end);
+        var absoluteStart = checked(scanWindowAbsoluteOffset + start);
+        var absoluteEnd = checked(scanWindowAbsoluteOffset + end);
 
         var firstCluster = absoluteStart / volumeInfo.BytesPerCluster;
         var lastClusterExclusive = checked(
@@ -519,7 +507,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         if (clusterCount <= 0)
         {
             throw new InvalidOperationException(
-                "The matched text marker did not map to a valid NTFS cluster range.");
+                "The matched NTFS text region did not map to a valid cluster range.");
         }
 
         var allocation = new NtfsVolumeBitmapReader().CheckExtents(
@@ -543,7 +531,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         var allocatedClusters = allocation[0].AllocatedClusterCount;
         var freeClusters = allocation[0].FreeClusterCount;
 
-        var data = context.AsSpan(start, recoveredLength).ToArray();
+        var data = scanWindow.AsSpan(start, recoveredLength).ToArray();
         var destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
             destinationDirectory,
             candidate.Name);
@@ -573,7 +561,9 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             BytesRecovered = data.Length,
             Evidence =
                 $"Whole-volume forensic text scan found the supplied marker at byte " +
-                $"{markerOffset:N0} using {markerEncoding} and recovered {data.Length:N0} contiguous text byte(s). " +
+                $"{scanWindowAbsoluteOffset + markerOffsetInWindow:N0} using {markerEncoding} " +
+                $"and recovered {data.Length:N0} contiguous text byte(s) directly from " +
+                $"the verified raw scan buffer. " +
                 allocationDescription
         };
     }
