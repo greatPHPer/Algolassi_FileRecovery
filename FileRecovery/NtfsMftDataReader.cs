@@ -57,12 +57,10 @@ public sealed class NtfsMftDataReader
             $"recordSize={volumeInfo.BytesPerFileRecordSegment}, " +
             $"mftValidLength={volumeInfo.MftValidDataLength}.");
 
-        using var rawMftVolumeHandle = CreateVolumeHandle(
-            volumeInfo.RootPath,
-            overlapped: true);
+        using var mftHandle = CreateMftHandle(volumeInfo.RootPath);
 
-        var record = ReadMftRecordByExtentMap(
-            rawMftVolumeHandle,
+        var record = ReadMftRecordDirect(
+            mftHandle,
             volumeInfo,
             segmentNumber,
             sequenceNumber,
@@ -76,8 +74,8 @@ public sealed class NtfsMftDataReader
             // The USN record already supplied the exact segment; retry that segment
             // without strict sequence/base checks, but only accept it when the
             // retained $FILE_NAME still identifies the expected parent/name.
-            var relaxedRecord = ReadMftRecordByExtentMap(
-                rawMftVolumeHandle,
+            var relaxedRecord = ReadMftRecordDirect(
+                mftHandle,
                 volumeInfo,
                 segmentNumber,
                 expectedSequenceNumber: 0,
@@ -170,8 +168,8 @@ public sealed class NtfsMftDataReader
             var extensionSegment = entry.SegmentReference & 0x0000FFFFFFFFFFFFUL;
             var extensionSequence = (ushort)(entry.SegmentReference >> 48);
 
-            var extensionRecord = ReadRecord(
-                rawMftVolumeHandle,
+            var extensionRecord = ReadMftRecordDirect(
+                mftHandle,
                 volumeInfo,
                 extensionSegment,
                 extensionSequence,
@@ -978,6 +976,80 @@ public sealed class NtfsMftDataReader
         return false;
     }
 
+    private static byte[]? ReadMftRecordDirect(
+        SafeFileHandle mftHandle,
+        NtfsVolumeInfo volumeInfo,
+        ulong segmentNumber,
+        ushort expectedSequenceNumber,
+        ulong expectedBaseFileReference)
+    {
+        var relativeOffset = checked(
+            checked((long)segmentNumber) * volumeInfo.BytesPerFileRecordSegment);
+
+        if (relativeOffset < 0 ||
+            relativeOffset + volumeInfo.BytesPerFileRecordSegment > volumeInfo.MftValidDataLength)
+        {
+            return null;
+        }
+
+        var record = new byte[checked((int)volumeInfo.BytesPerFileRecordSegment)];
+        ReadAt(
+            mftHandle,
+            relativeOffset,
+            record);
+
+        if (record.Length < 48 ||
+            record[0] != (byte)'F' ||
+            record[1] != (byte)'I' ||
+            record[2] != (byte)'L' ||
+            record[3] != (byte)'E')
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS MFT logical read: invalid FILE signature for segment={segmentNumber}.");
+            return null;
+        }
+
+        try
+        {
+            ApplyUpdateSequenceFixups(
+                record,
+                checked((int)volumeInfo.BytesPerSector));
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS MFT logical read: update-sequence fixup failed for segment={segmentNumber}: {ex.Message}");
+            return null;
+        }
+
+        var sequenceNumber = BinaryPrimitives.ReadUInt16LittleEndian(
+            record.AsSpan(16, 2));
+
+        if (expectedSequenceNumber != 0 &&
+            sequenceNumber != expectedSequenceNumber)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS MFT logical read: sequence mismatch segment={segmentNumber}, " +
+                $"expected={expectedSequenceNumber}, actual={sequenceNumber}.");
+            return null;
+        }
+
+        var baseFileReference = BinaryPrimitives.ReadUInt64LittleEndian(
+            record.AsSpan(32, 8));
+
+        if (expectedBaseFileReference != 0 &&
+            baseFileReference != 0 &&
+            baseFileReference != expectedBaseFileReference)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS MFT logical read: base-reference mismatch segment={segmentNumber}, " +
+                $"expected={expectedBaseFileReference}, actual={baseFileReference}.");
+            return null;
+        }
+
+        return record;
+    }
+
     private static byte[]? ReadRecord(
         SafeFileHandle volumeHandle,
         NtfsVolumeInfo volumeInfo,
@@ -1180,6 +1252,38 @@ public sealed class NtfsMftDataReader
         {
             Marshal.FreeHGlobal(overlappedPtr);
         }
+    }
+
+    private static SafeFileHandle CreateMftHandle(string rootPath)
+    {
+        var normalizedRoot = Path.GetPathRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(normalizedRoot))
+        {
+            throw new InvalidOperationException(
+                "The NTFS source volume root could not be determined.");
+        }
+
+        var mftPath = Path.Combine(normalizedRoot, "$MFT");
+        var handle = CreateFile(
+            mftPath,
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+
+            throw new Win32Exception(
+                error,
+                $"Could not open the NTFS MFT at {mftPath}.");
+        }
+
+        return handle;
     }
 
     private static SafeFileHandle CreateVolumeHandle(
