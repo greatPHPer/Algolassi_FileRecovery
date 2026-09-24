@@ -627,6 +627,18 @@ public sealed class NtfsMftDataReader
         string expectedFileName,
         ulong expectedParentFileReferenceNumber)
     {
+        var flags = BinaryPrimitives.ReadUInt16LittleEndian(
+            record.AsSpan(22, 2));
+
+        // Only accept the sequence-relaxed record when it is still a deleted
+        // file record. A live record with the same parent/name is not valid
+        // evidence for recovering the older deletion.
+        if ((flags & 0x0001) != 0 ||
+            (flags & 0x0002) != 0)
+        {
+            return false;
+        }
+
         var normalizedName = expectedFileName.Trim();
 
         foreach (var attribute in EnumerateAttributes(record))
