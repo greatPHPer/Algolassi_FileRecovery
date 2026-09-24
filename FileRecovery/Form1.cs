@@ -1781,32 +1781,30 @@ public partial class Form1 : Form
                     continue;
                 }
 
-                // Move the deep free-space scan off the UI thread because it can
-                // inspect gigabytes of unallocated NTFS clusters. Report progress
-                // after each bounded read so the status text cannot look frozen.
                 var maxDeepCarveBytes =
                     NtfsDeepFileRecoveryService.DefaultMaxBytesToScan;
 
-                IProgress<long> carveProgress = new Progress<long>(bytesScanned =>
-                {
-                    var scannedMb = bytesScanned / (1024d * 1024d);
-                    var totalMb = maxDeepCarveBytes / (1024d * 1024d);
+                var carveProgress = new SynchronousProgress<long>(
+                    this,
+                    bytesScanned =>
+                    {
+                        var scannedMb = bytesScanned / (1024d * 1024d);
+                        var totalMb = maxDeepCarveBytes / (1024d * 1024d);
 
-                    lblStatus.Text =
-                        $"Deep-scanning NTFS free space for {candidate.Name}... " +
-                        $"{scannedMb:0} / {totalMb:0} MB";
-                });
+                        lblStatus.Text =
+                            $"Deep-scanning NTFS free space for {candidate.Name}... " +
+                            $"{scannedMb:0} / {totalMb:0} MB";
+                    });
 
                 carveProgress.Report(0);
 
-                var carved = await Task.Run(
-                    () => _ntfsDeepFileRecoveryService.Recover(
-                        candidate,
-                        destinationDirectory,
-                        CancellationToken.None,
-                        maxDeepCarveBytes,
-                        carveProgress,
-                        candidate.FileSizeBytes));
+                var carved = _ntfsDeepFileRecoveryService.Recover(
+                    candidate,
+                    destinationDirectory,
+                    CancellationToken.None,
+                    maxDeepCarveBytes,
+                    carveProgress,
+                    candidate.FileSizeBytes);
 
                 successes.Add(carved);
             }
