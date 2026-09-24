@@ -814,12 +814,30 @@ public sealed class NtfsMftDataReader
             volumeHandle,
             volumeInfo);
 
-        return ReadMappedFileBytes(
+        if (bytesToRead == destination.Length)
+        {
+            return ReadMappedFileBytes(
+                volumeHandle,
+                volumeInfo.BytesPerCluster,
+                _mftExtents,
+                fileOffset,
+                destination);
+        }
+
+        var temp = new byte[bytesToRead];
+        var bytesRead = ReadMappedFileBytes(
             volumeHandle,
             volumeInfo.BytesPerCluster,
             _mftExtents,
             fileOffset,
-            destination.AsSpan(0, bytesToRead).ToArray());
+            temp);
+
+        if (bytesRead > 0)
+        {
+            Buffer.BlockCopy(temp, 0, destination, 0, bytesRead);
+        }
+
+        return bytesRead;
     }
 
     private static int ReadMappedFileBytes(
