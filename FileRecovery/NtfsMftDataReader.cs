@@ -24,7 +24,9 @@ public sealed class NtfsMftDataReader
     public NtfsDataStreamInfo ReadDefaultDataStream(
         NtfsVolumeInfo volumeInfo,
         SafeFileHandle volumeHandle,
-        ulong fileReferenceNumber)
+        ulong fileReferenceNumber,
+        string? expectedFileName = null,
+        ulong? expectedParentFileReferenceNumber = null)
     {
         var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
         var sequenceNumber = (ushort)(fileReferenceNumber >> 48);
@@ -57,6 +59,34 @@ public sealed class NtfsMftDataReader
             segmentNumber,
             sequenceNumber,
             expectedBaseFileReference: fileReferenceNumber);
+
+        if (record is null &&
+            !string.IsNullOrWhiteSpace(expectedFileName) &&
+            expectedParentFileReferenceNumber.HasValue)
+        {
+            // A very recent deletion can race the MFT sequence bookkeeping. The
+            // USN record already supplied the exact segment; retry that segment
+            // without requiring the old sequence number, but only accept it when
+            // the retained $FILE_NAME still identifies the expected parent/name.
+            var relaxedRecord = ReadRecord(
+                volumeHandle,
+                volumeInfo,
+                segmentNumber,
+                expectedSequenceNumber: 0,
+                expectedBaseFileReference: 0);
+
+            if (relaxedRecord is not null &&
+                HasMatchingFileNameEntry(
+                    relaxedRecord,
+                    expectedFileName,
+                    expectedParentFileReferenceNumber.Value))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $DATA lookup: accepted sequence-relaxed MFT record " +
+                    $"for fileRef={fileReferenceNumber}, segment={segmentNumber}.");
+                record = relaxedRecord;
+            }
+        }
 
         if (record is null)
         {
@@ -590,6 +620,71 @@ public sealed class NtfsMftDataReader
             targetOffset = checked(targetOffset + chunk);
             remaining -= chunk;
         }
+    }
+
+    private static bool HasMatchingFileNameEntry(
+        byte[] record,
+        string expectedFileName,
+        ulong expectedParentFileReferenceNumber)
+    {
+        var normalizedName = expectedFileName.Trim();
+
+        foreach (var attribute in EnumerateAttributes(record))
+        {
+            if (attribute.Type != 0x30 ||
+                attribute.NameLength != 0 ||
+                attribute.FormCode != 0)
+            {
+                continue;
+            }
+
+            if (attribute.Length < 24)
+            {
+                continue;
+            }
+
+            var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                record.AsSpan(attribute.Offset + 16, 4));
+            var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                record.AsSpan(attribute.Offset + 20, 2));
+
+            if (valueLength < 66 ||
+                valueOffset + valueLength > attribute.Length)
+            {
+                continue;
+            }
+
+            var valueStart = attribute.Offset + valueOffset;
+            var parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                record.AsSpan(valueStart, 8));
+
+            if (parentReference != expectedParentFileReferenceNumber)
+            {
+                continue;
+            }
+
+            var nameLength = record[valueStart + 64];
+            var nameBytes = checked(nameLength * 2);
+
+            if (nameLength == 0 ||
+                valueStart + 66 + nameBytes > record.Length)
+            {
+                continue;
+            }
+
+            var name = System.Text.Encoding.Unicode.GetString(
+                record.AsSpan(valueStart + 66, nameBytes));
+
+            if (string.Equals(
+                    name,
+                    normalizedName,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static byte[]? ReadRecord(
