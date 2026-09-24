@@ -453,7 +453,20 @@ public partial class Form1 : Form
                 })
                 .ToList();
 
-            dgvResults.DataSource = filtered;
+            _suppressGridSelectionChanged = true;
+            try
+            {
+                dgvResults.DataSource = null;
+                dgvResults.Rows.Clear();
+                dgvResults.DataSource = filtered;
+                dgvResults.ClearSelection();
+                dgvResults.Refresh();
+            }
+            finally
+            {
+                _suppressGridSelectionChanged = false;
+            }
+
             lblFiles.Text = $"NTFS candidates ({filtered.Count:N0})";
             lblStatus.Text = filtered.Count == 0
                 ? $"No deleted-file metadata candidates were found under {scanDirectory}."
