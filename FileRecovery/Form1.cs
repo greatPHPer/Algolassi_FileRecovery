@@ -2001,10 +2001,63 @@ public partial class Form1 : Form
                     }
                 }
 
-                // For an unknown-size .txt candidate, offer a marker-driven
-                // whole-volume forensic scan before the broad free-space heuristic.
-                // The marker is deliberately required so allocated live-file bytes are
-                // never accepted merely because they happen to look printable.
+                // Plain-text recovery is fundamentally different from structured file carving:
+                // .txt files do not carry a reliable end marker. Prefer an exact historical
+                // file size whenever one is available, because the deep carver can then test
+                // for a complete contiguous text region of exactly that length.
+                //
+                // If the historical size is still unavailable, allow the user to supply the
+                // exact byte count from the original file's Properties dialog. This keeps the
+                // recovery deterministic instead of treating a small printable fragment as
+                // a successful reconstruction.
+                if (candidate.FileSizeBytes <= 0 &&
+                    Path.GetExtension(candidate.Name).Equals(
+                        ".txt",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    var sizeKey = NormalizePath(candidate.FullPath);
+
+                    if (!forensicMarkerDeclined.Contains(sizeKey))
+                    {
+                        var enteredSize = Microsoft.VisualBasic.Interaction.InputBox(
+                            $"The original size of '{candidate.Name}' is still unknown.\r\n\r\n" +
+                            "Enter the exact original file size in bytes from File Explorer > Properties.\r\n" +
+                            "Example: 1678123\r\n\r\n" +
+                            "Leave this blank if you do not know the original size.",
+                            "Original text file size",
+                            "");
+
+                        if (long.TryParse(
+                                enteredSize?.Trim(),
+                                System.Globalization.NumberStyles.Integer,
+                                System.Globalization.CultureInfo.InvariantCulture,
+                                out var enteredSizeBytes) &&
+                            enteredSizeBytes > 0 &&
+                            enteredSizeBytes <= 64L * 1024L * 1024L)
+                        {
+                            candidate.FileSizeBytes = enteredSizeBytes;
+
+                            System.Diagnostics.Debug.WriteLine(
+                                $"NTFS candidate size enrichment: match=user-input, " +
+                                $"path={candidate.FullPath}, size={enteredSizeBytes:N0} bytes.");
+                        }
+                        else if (!string.IsNullOrWhiteSpace(enteredSize))
+                        {
+                            failures.Add(
+                                $"{candidate.Name}: the supplied original size was not a valid byte count.");
+                            continue;
+                        }
+                    }
+                }
+
+                // If a .txt candidate now has an exact original size, let the normal deep
+                // carving path search free NTFS clusters for a complete block of that length.
+                // This is substantially stronger than accepting the first printable marker
+                // fragment found anywhere in the volume.
+                //
+                // When the size remains unknown, retain the marker-driven whole-volume
+                // forensic path as an explicitly heuristic last resort. Its result must not
+                // be mistaken for an exact reconstruction.
                 if (candidate.FileSizeBytes <= 0 &&
                     Path.GetExtension(candidate.Name).Equals(
                         ".txt",
@@ -2017,12 +2070,12 @@ public partial class Form1 : Form
                         !forensicMarkerDeclined.Contains(markerKey))
                     {
                         var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
-                            $"The original size of '{candidate.Name}' is unknown.\r\n\r\n" +
-                            "Enter a unique text string that was definitely contained in this " +
-                            "deleted file. AlgoLassi will search every byte of the source volume " +
-                            "for that exact UTF-8 marker before attempting broader carving.\r\n\r\n" +
-                            "Leave this blank to skip the whole-volume forensic scan.",
-                            "Full-volume forensic text scan",
+                            $"The exact original size of '{candidate.Name}' is unavailable.\r\n\r\n" +
+                            "Enter a unique text string that was definitely contained in this deleted file. " +
+                            "AlgoLassi will search the entire source volume for that marker.\r\n\r\n" +
+                            "Because plain text has no intrinsic end marker, this mode is heuristic and " +
+                            "may only identify a fragment. Leave this blank to skip it.",
+                            "Heuristic text marker scan",
                             "");
 
                         if (string.IsNullOrWhiteSpace(enteredMarker))
@@ -2068,7 +2121,22 @@ public partial class Form1 : Form
                                 CancellationToken.None,
                                 forensicProgress);
 
-                            successes.Add(forensicRecovery);
+                            // Marker-only recovery is intentionally treated as a heuristic
+                            // observation. Do not report a tiny fragment as an exact recovery.
+                            if (forensicRecovery.BytesRecovered < 4096)
+                            {
+                                failures.Add(
+                                    $"{candidate.Name}: the heuristic text scan found only " +
+                                    $"{forensicRecovery.BytesRecovered:N0} byte(s), which is not enough to claim a complete recovery.");
+                                TryDeleteRecoveredFile(forensicRecovery.DestinationPath);
+                                continue;
+                            }
+
+                            failures.Add(
+                                $"{candidate.Name}: heuristic text scan recovered " +
+                                $"{forensicRecovery.BytesRecovered:N0} byte(s), but the original size is unknown; " +
+                                "the result was not counted as an exact recovery.");
+                            TryDeleteRecoveredFile(forensicRecovery.DestinationPath);
                             continue;
                         }
                         catch (Exception ex)
@@ -2082,8 +2150,8 @@ public partial class Form1 : Form
 
                 // The retained MFT metadata may be insufficient for this candidate,
                 // but structural carving can still recover many formats without an
-                // original size. Plain text now has a deliberately heuristic fallback
-                // when no historical size can be recovered.
+                // original size. Plain text is now handled separately above: exact-size
+                // recovery is preferred, while marker-only recovery is explicitly heuristic.
                 if (!NtfsDeepFileRecoveryService.SupportsDeepCarving(
                         candidate.Name,
                         candidate.FileSizeBytes))
@@ -2454,6 +2522,27 @@ public partial class Form1 : Form
 
         return string.Equals(left, right, StringComparison.OrdinalIgnoreCase)
             || left.StartsWith(right + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void TryDeleteRecoveredFile(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"Could not delete heuristic recovery output '{path}': {ex.Message}");
+        }
     }
 
     private static string? GetSourceVolumeRoot(string path)
