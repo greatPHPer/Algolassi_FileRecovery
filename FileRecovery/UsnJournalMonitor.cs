@@ -169,6 +169,166 @@ public sealed class UsnJournalMonitor : IDisposable
         }
     }
 
+    public IReadOnlyList<UsnDeletedFileRecord> ScanDeletedDirectory(
+        string targetDirectory,
+        bool includeSubdirectories,
+        CancellationToken cancellationToken = default)
+    {
+        WindowsPrivilege.EnableSeBackupPrivilege();
+
+        if (!IsAdministrator())
+        {
+            throw new UnauthorizedAccessException(
+                "Administrator privileges are required for a historical NTFS deleted-file scan.");
+        }
+
+        var fullDirectory = Path.GetFullPath(targetDirectory);
+        var root = Path.GetPathRoot(fullDirectory);
+
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            throw new ArgumentException(
+                "The selected directory must be on a Windows volume.",
+                nameof(targetDirectory));
+        }
+
+        if (!string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Historical deleted-file scanning currently supports NTFS volumes only.");
+        }
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        using var volumeHandle = CreateFile(
+            $@"\\.\{volumeKey[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (volumeHandle.IsInvalid)
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                $"Could not open NTFS volume {root}.");
+        }
+
+        if (!TryQueryJournal(volumeHandle, out var journal, out var queryError))
+        {
+            if (queryError == ErrorJournalNotActive ||
+                queryError == ErrorFileNotFound)
+            {
+                return [];
+            }
+
+            throw new Win32Exception(
+                queryError,
+                $"Could not query the NTFS USN journal for {root}.");
+        }
+
+        var normalizedDirectory = NormalizePath(fullDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar);
+
+        var parentPathCache = new Dictionary<ulong, string?>();
+        var results = new List<UsnDeletedFileRecord>();
+        var seenReferences = new HashSet<ulong>();
+        var nextUsn = journal.FirstUsn;
+
+        while (!cancellationToken.IsCancellationRequested &&
+               nextUsn < journal.NextUsn)
+        {
+            var records = ReadRecords(
+                volumeHandle,
+                journal.JournalId,
+                nextUsn,
+                out var returnedNextUsn);
+
+            if (returnedNextUsn <= nextUsn)
+            {
+                break;
+            }
+
+            foreach (var record in records)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                    (record.FileAttributes & FileAttributeDirectory) != 0 ||
+                    string.IsNullOrWhiteSpace(record.FileName) ||
+                    !seenReferences.Add(record.FileReferenceNumber))
+                {
+                    continue;
+                }
+
+                if (!parentPathCache.TryGetValue(
+                        record.ParentFileReferenceNumber,
+                        out var directoryPath))
+                {
+                    directoryPath = ResolveParentDirectory(
+                        volumeHandle,
+                        record.ParentFileReferenceNumber);
+
+                    parentPathCache[record.ParentFileReferenceNumber] = directoryPath;
+                }
+
+                if (!MatchesDirectory(
+                        directoryPath,
+                        normalizedDirectory,
+                        includeSubdirectories))
+                {
+                    continue;
+                }
+
+                var fullPath = string.IsNullOrWhiteSpace(directoryPath)
+                    ? record.FileName
+                    : Path.Combine(directoryPath, record.FileName);
+
+                results.Add(new UsnDeletedFileRecord(
+                    NormalizePath(fullPath),
+                    record.FileReferenceNumber,
+                    record.ParentFileReferenceNumber,
+                    record.FileName,
+                    directoryPath ?? string.Empty,
+                    record.TimestampUtc));
+            }
+
+            nextUsn = returnedNextUsn;
+        }
+
+        return results;
+    }
+
+    private static bool MatchesDirectory(
+        string? candidate,
+        string targetDirectory,
+        bool includeSubdirectories)
+    {
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return false;
+        }
+
+        var left = NormalizePath(candidate)
+            .TrimEnd(Path.DirectorySeparatorChar);
+        var right = NormalizePath(targetDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar);
+
+        if (string.Equals(left, right, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return includeSubdirectories &&
+               left.StartsWith(
+                   right + Path.DirectorySeparatorChar,
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
     public void Stop()
     {
         lock (_gate)
@@ -1487,6 +1647,14 @@ public sealed class UsnJournalMonitor : IDisposable
         Stop();
         _cts.Dispose();
     }
+
+public sealed record UsnDeletedFileRecord(
+    string FullPath,
+    ulong FileReferenceNumber,
+    ulong ParentFileReferenceNumber,
+    string FileName,
+    string DirectoryPath,
+    DateTime DeletedAtUtc);
 
     private readonly record struct JournalInfo(
         ulong JournalId,
