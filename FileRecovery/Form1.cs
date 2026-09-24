@@ -1612,16 +1612,44 @@ public partial class Form1 : Form
                 }
 
                 // The retained MFT metadata is insufficient for this candidate.
+                // Only file types with a safe, self-delimiting structural format can
+                // be recovered from raw free-space carving. In particular, plain-text
+                // files do not have a reliable end marker, so do not pretend to scan
+                // them indefinitely.
+                if (!NtfsDeepFileRecoveryService.SupportsDeepCarving(candidate.Name))
+                {
+                    failures.Add(
+                        $"{candidate.Name}: deep NTFS carving is not supported for " +
+                        $"'{Path.GetExtension(candidate.Name)}' because the file type " +
+                        "does not provide a safe self-delimiting recovery boundary.");
+                    continue;
+                }
+
                 // Move the deep free-space scan off the UI thread because it can
-                // inspect hundreds of megabytes of unallocated NTFS clusters.
-                lblStatus.Text =
-                    $"Deep-scanning NTFS free space for {candidate.Name}...";
+                // inspect gigabytes of unallocated NTFS clusters. Report progress
+                // after each bounded read so the status text cannot look frozen.
+                var maxDeepCarveBytes =
+                    NtfsDeepFileRecoveryService.DefaultMaxBytesToScan;
+
+                var carveProgress = new Progress<long>(bytesScanned =>
+                {
+                    var scannedMb = bytesScanned / (1024d * 1024d);
+                    var totalMb = maxDeepCarveBytes / (1024d * 1024d);
+
+                    lblStatus.Text =
+                        $"Deep-scanning NTFS free space for {candidate.Name}... " +
+                        $"{scannedMb:0} / {totalMb:0} MB";
+                });
+
+                carveProgress.Report(0);
 
                 var carved = await Task.Run(
                     () => _ntfsDeepFileRecoveryService.Recover(
                         candidate,
                         destinationDirectory,
-                        CancellationToken.None));
+                        CancellationToken.None,
+                        maxDeepCarveBytes,
+                        carveProgress));
 
                 successes.Add(carved);
             }
