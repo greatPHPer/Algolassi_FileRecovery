@@ -63,12 +63,49 @@ public sealed class NtfsMftDataReader
         // MFT index. Deleted MFT records are therefore not recoverable through that
         // FSCTL. Read the physical $MFT data through the mapping stored in MFT record 0
         // and validate the exact sequence number instead.
+        //
+        // ReadRawExact/ReadMappedFileBytes issue overlapped I/O. Keep a dedicated
+        // overlapped handle for all physical $MFT reads; the normal volume handle is
+        // intentionally retained for synchronous metadata/bitmap reads.
+        using var rawMftVolumeHandle = CreateVolumeHandle(
+            volumeInfo.RootPath,
+            overlapped: true);
+
         var record = ReadMftRecordByExtentMap(
-            volumeHandle,
+            rawMftVolumeHandle,
             volumeInfo,
             segmentNumber,
             sequenceNumber,
-            fileReferenceNumber);
+            expectedBaseFileReference: fileReferenceNumber);
+
+        if (record is null &&
+            !string.IsNullOrWhiteSpace(expectedFileName) &&
+            expectedParentFileReferenceNumber.HasValue)
+        {
+            // A very recent deletion can race the MFT sequence bookkeeping.
+            // The USN record already supplied the exact segment; retry that segment
+            // without strict sequence/base checks, but only accept it when the
+            // retained $FILE_NAME still identifies the expected parent/name.
+            var relaxedRecord = ReadMftRecordByExtentMap(
+                rawMftVolumeHandle,
+                volumeInfo,
+                segmentNumber,
+                expectedSequenceNumber: 0,
+                expectedBaseFileReference: 0);
+
+            if (relaxedRecord is not null &&
+                HasMatchingFileNameEntry(
+                    relaxedRecord,
+                    expectedFileName,
+                    expectedParentFileReferenceNumber.Value,
+                    expectedSequenceNumber: sequenceNumber))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $DATA lookup: accepted raw MFT record for " +
+                    $"fileRef={fileReferenceNumber}, segment={segmentNumber}.");
+                record = relaxedRecord;
+            }
+        }
 
         if (record is null)
         {
@@ -144,11 +181,11 @@ public sealed class NtfsMftDataReader
             var extensionSequence = (ushort)(entry.SegmentReference >> 48);
 
             var extensionRecord = ReadMftRecordByExtentMap(
-                volumeHandle,
+                rawMftVolumeHandle,
                 volumeInfo,
                 extensionSegment,
                 extensionSequence,
-                fileReferenceNumber);
+                expectedBaseFileReference: fileReferenceNumber);
 
             if (extensionRecord is null)
             {
