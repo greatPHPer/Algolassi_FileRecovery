@@ -22,24 +22,6 @@ public sealed class MftCandidateScanner
     private const uint FileAttributeDirectory = 0x00000010;
     private const int UsnRecordV2MinimumLength = 60;
 
-    public IReadOnlyList<RecoveryCandidate> ScanDeletedDirectory(
-        string scanDirectory,
-        bool includeSubdirectories,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(scanDirectory);
-
-        WindowsPrivilege.EnableSeBackupPrivilege();
-
-        return ScanInternal(
-            scanDirectory,
-            targetPaths: null,
-            targetDirectory: scanDirectory,
-            includeSubdirectories: includeSubdirectories,
-            cancellationToken: cancellationToken,
-            maxPages: int.MaxValue);
-    }
-
     public IReadOnlyList<RecoveryCandidate> Scan(
         string rootPath,
         CancellationToken cancellationToken = default)
