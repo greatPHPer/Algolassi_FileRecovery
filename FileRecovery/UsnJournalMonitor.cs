@@ -235,8 +235,7 @@ public sealed class UsnJournalMonitor : IDisposable
             .TrimEnd(Path.DirectorySeparatorChar);
 
         var parentPathCache = new Dictionary<ulong, string?>();
-        var results = new List<UsnDeletedFileRecord>();
-        var seenReferences = new HashSet<ulong>();
+        var latestDeletes = new Dictionary<ulong, UsnRecord>();
         var nextUsn = journal.FirstUsn;
 
         while (!cancellationToken.IsCancellationRequested &&
@@ -259,48 +258,60 @@ public sealed class UsnJournalMonitor : IDisposable
 
                 if ((record.Reason & UsnReasonFileDelete) == 0 ||
                     (record.FileAttributes & FileAttributeDirectory) != 0 ||
-                    string.IsNullOrWhiteSpace(record.FileName) ||
-                    !seenReferences.Add(record.FileReferenceNumber))
+                    string.IsNullOrWhiteSpace(record.FileName))
                 {
                     continue;
                 }
 
-                if (!parentPathCache.TryGetValue(
-                        record.ParentFileReferenceNumber,
-                        out var directoryPath))
-                {
-                    directoryPath = ResolveParentDirectory(
-                        volumeHandle,
-                        record.ParentFileReferenceNumber);
-
-                    parentPathCache[record.ParentFileReferenceNumber] = directoryPath;
-                }
-
-                if (!MatchesDirectory(
-                        directoryPath,
-                        normalizedDirectory,
-                        includeSubdirectories))
-                {
-                    continue;
-                }
-
-                var fullPath = string.IsNullOrWhiteSpace(directoryPath)
-                    ? record.FileName
-                    : Path.Combine(directoryPath, record.FileName);
-
-                results.Add(new UsnDeletedFileRecord(
-                    NormalizePath(fullPath),
-                    record.FileReferenceNumber,
-                    record.ParentFileReferenceNumber,
-                    record.FileName,
-                    directoryPath ?? string.Empty,
-                    record.TimestampUtc));
+                // NTFS can reuse an MFT file-reference number after a record is
+                // deleted. The journal is read in chronological order, so the
+                // latest delete event for a given file reference is the one that
+                // can still match the record's current MFT sequence number.
+                latestDeletes[record.FileReferenceNumber] = record;
             }
 
             nextUsn = returnedNextUsn;
         }
 
-        return results;
+        foreach (var record in latestDeletes.Values)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!parentPathCache.TryGetValue(
+                    record.ParentFileReferenceNumber,
+                    out var directoryPath))
+            {
+                directoryPath = ResolveParentDirectory(
+                    volumeHandle,
+                    record.ParentFileReferenceNumber);
+
+                parentPathCache[record.ParentFileReferenceNumber] = directoryPath;
+            }
+
+            if (!MatchesDirectory(
+                    directoryPath,
+                    normalizedDirectory,
+                    includeSubdirectories))
+            {
+                continue;
+            }
+
+            var fullPath = string.IsNullOrWhiteSpace(directoryPath)
+                ? record.FileName
+                : Path.Combine(directoryPath, record.FileName);
+
+            results.Add(new UsnDeletedFileRecord(
+                NormalizePath(fullPath),
+                record.FileReferenceNumber,
+                record.ParentFileReferenceNumber,
+                record.FileName,
+                directoryPath ?? string.Empty,
+                record.TimestampUtc));
+        }
+
+        return results
+            .OrderByDescending(record => record.DeletedAtUtc)
+            .ToList();
     }
 
     private static bool MatchesDirectory(
