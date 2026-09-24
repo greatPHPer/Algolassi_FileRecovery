@@ -11,6 +11,7 @@ partial class Form1
     private ListBox lstDirectories = null!;
     private Button btnScanDirectory = null!;
     private Button btnScanNtfs = null!;
+    private Button btnRawVolumeMarker = null!;
     private TextBox txtScanPath = null!;
     private Button btnBrowseScanPath = null!;
     private CheckBox chkScanSubdirectories = null!;
@@ -46,6 +47,7 @@ partial class Form1
         lstDirectories = new ListBox();
         btnScanDirectory = new Button();
         btnScanNtfs = new Button();
+        btnRawVolumeMarker = new Button();
         txtScanPath = new TextBox();
         btnBrowseScanPath = new Button();
         chkScanSubdirectories = new CheckBox();
@@ -129,6 +131,12 @@ partial class Form1
         btnScanNtfs.Text = "Scan NTFS Deleted Files";
         btnScanNtfs.UseVisualStyleBackColor = true;
         btnScanNtfs.Click += btnScanNtfs_Click;
+
+        btnRawVolumeMarker.Location = new Point(704, 158);
+        btnRawVolumeMarker.Size = new Size(156, 36);
+        btnRawVolumeMarker.Text = "Raw Volume Marker Test";
+        btnRawVolumeMarker.UseVisualStyleBackColor = true;
+        btnRawVolumeMarker.Click += btnRawVolumeMarker_Click;
 
         chkScanSubdirectories.AutoSize = true;
         chkScanSubdirectories.Checked = true;
@@ -221,6 +229,7 @@ partial class Form1
         Controls.Add(lblFiles);
         Controls.Add(chkScanSubdirectories);
         Controls.Add(btnScanNtfs);
+        Controls.Add(btnRawVolumeMarker);
         Controls.Add(btnBrowseScanPath);
         Controls.Add(txtScanPath);
         Controls.Add(btnClearHistory);
