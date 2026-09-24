@@ -157,6 +157,9 @@ public sealed class MftCandidateScanner
         var targetNameMatchCount = 0L;
         var staleSegmentMatchCount = 0L;
         var staleTimestampMatchCount = 0L;
+        var historicalSegmentSeenCount = 0L;
+        var historicalDeletedSegmentSeenCount = 0L;
+        var historicalInUseSegmentSeenCount = 0L;
 
         if (recordSize <= 0 ||
             volumeInfo.MftValidDataLength <= 0)
@@ -230,6 +233,35 @@ public sealed class MftCandidateScanner
                 // Parse the FILE record directly from the read buffer. Avoid
                 // copying every MFT record into a second array.
                 var recordSpan = buffer.AsSpan(offset, recordSize);
+                var segmentNumber = checked(
+                    (ulong)((scanStartRelative + scanned + offset) / recordSize));
+
+                if (historicalTargetsBySegment.ContainsKey(segmentNumber))
+                {
+                    historicalSegmentSeenCount++;
+
+                    if (recordSpan.Length >= 23)
+                    {
+                        var currentSequence = BinaryPrimitives.ReadUInt16LittleEndian(
+                            recordSpan.Slice(16, 2));
+                        var currentFlags = BinaryPrimitives.ReadUInt16LittleEndian(
+                            recordSpan.Slice(22, 2));
+
+                        if ((currentFlags & 0x0001) == 0)
+                        {
+                            historicalDeletedSegmentSeenCount++;
+                        }
+                        else
+                        {
+                            historicalInUseSegmentSeenCount++;
+                        }
+
+                        System.Diagnostics.Debug.WriteLine(
+                            $"Historical target MFT segment observed: segment={segmentNumber}, " +
+                            $"currentSequence={currentSequence}, flags=0x{currentFlags:X4}.");
+                    }
+                }
+
                 if (recordSpan.Length >= 4 &&
                     recordSpan[0] == (byte)'F' &&
                     recordSpan[1] == (byte)'I' &&
@@ -242,7 +274,7 @@ public sealed class MftCandidateScanner
                 if (!TryParseDeletedFileNameEntries(
                         recordSpan,
                         volumeInfo.BytesPerSector,
-                        checked((ulong)((scanStartRelative + scanned + offset) / recordSize)),
+                        segmentNumber,
                         out var fileReferenceNumber,
                         out var fileEntries))
                 {
@@ -416,7 +448,11 @@ public sealed class MftCandidateScanner
             $"recordSize={recordSize:N0}, FILE signatures={fileSignatureCount:N0}, " +
             $"deletedRecords={deletedRecordCount:N0}, FILE_NAME entries={fileNameEntryCount:N0}, " +
             $"targetNameMatches={targetNameMatchCount:N0}, staleSegmentMatches={staleSegmentMatchCount:N0}, " +
-            $"staleTimestampMatches={staleTimestampMatchCount:N0}, results={results.Count:N0}.");
+            $"staleTimestampMatches={staleTimestampMatchCount:N0}, " +
+            $"historicalSegmentsSeen={historicalSegmentSeenCount:N0}, " +
+            $"historicalDeletedSegmentsSeen={historicalDeletedSegmentSeenCount:N0}, " +
+            $"historicalInUseSegmentsSeen={historicalInUseSegmentSeenCount:N0}, " +
+            $"results={results.Count:N0}.");
 
         if (results.Count == 0)
         {
