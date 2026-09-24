@@ -25,6 +25,7 @@ public sealed class UsnJournalMonitor : IDisposable
     private const int ErrorJournalNotActive = 1179;
     private const int ErrorJournalEntryDeleted = 1181;
     private const int ErrorFileNotFound = 2;
+    private const int ErrorHandleEof = 38;
 
     private const uint UsnReasonFileDelete = 0x00000200;
     private const uint FileAttributeDirectory = 0x00000010;
@@ -1043,6 +1044,8 @@ public sealed class UsnJournalMonitor : IDisposable
 
         ulong startFileReferenceNumber = 0;
         const int maxPages = 32;
+        var recordsSeen = 0L;
+        var targetNameMatches = 0L;
 
         for (var page = 0; page < maxPages; page++)
         {
@@ -1068,6 +1071,15 @@ public sealed class UsnJournalMonitor : IDisposable
             {
                 var error = Marshal.GetLastWin32Error();
 
+                if (error == ErrorHandleEof)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"Bounded USN enum reached EOF normally: page={page + 1}, " +
+                        $"recordsSeen={recordsSeen:N0}, targetNameMatches={targetNameMatches:N0}, " +
+                        $"lowUsn={lowUsn}, highUsn={highUsn}.");
+                    return false;
+                }
+
                 if (error == ErrorJournalDeleteInProgress ||
                     error == ErrorJournalNotActive ||
                     error == ErrorJournalEntryDeleted)
@@ -1076,7 +1088,9 @@ public sealed class UsnJournalMonitor : IDisposable
                 }
 
                 System.Diagnostics.Debug.WriteLine(
-                    $"Bounded USN enum fallback failed: error={error}, lowUsn={lowUsn}, highUsn={highUsn}.");
+                    $"Bounded USN enum fallback failed: error={error}, page={page + 1}, " +
+                    $"recordsSeen={recordsSeen:N0}, targetNameMatches={targetNameMatches:N0}, " +
+                    $"lowUsn={lowUsn}, highUsn={highUsn}.");
                 return false;
             }
 
@@ -1139,6 +1153,16 @@ public sealed class UsnJournalMonitor : IDisposable
                         var name = System.Text.Encoding.Unicode.GetString(
                             recordSpan.Slice(nameOffset, nameLength));
 
+                        recordsSeen++;
+
+                        if (string.Equals(
+                                name,
+                                Path.GetFileName(normalizedTarget),
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            targetNameMatches++;
+                        }
+
                         if (TryMatchEnumeratedRecord(
                                 volumeHandle,
                                 volumeKey,
@@ -1171,6 +1195,11 @@ public sealed class UsnJournalMonitor : IDisposable
                 break;
             }
         }
+
+        System.Diagnostics.Debug.WriteLine(
+            $"Bounded USN enum exhausted page limit: pages={maxPages}, " +
+            $"recordsSeen={recordsSeen:N0}, targetNameMatches={targetNameMatches:N0}, " +
+            $"lowUsn={lowUsn}, highUsn={highUsn}.");
 
         return false;
     }
