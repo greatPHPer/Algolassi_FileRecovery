@@ -281,7 +281,8 @@ public sealed class MftCandidateScanner
                         volumeHandle,
                         fileReferenceNumber,
                         entry.Name,
-                        entry.ParentFileReferenceNumber);
+                        entry.ParentFileReferenceNumber,
+                        matchingTarget);
 
                     // Current cluster allocation is validated immediately before
                     // bytes are recovered. Doing that expensive bitmap scan here
@@ -435,7 +436,8 @@ public sealed class MftCandidateScanner
                 volumeHandle,
                 target.FileReferenceNumber,
                 name,
-                target.ParentFileReferenceNumber);
+                target.ParentFileReferenceNumber,
+                target.FullPath);
 
             IReadOnlyList<NtfsExtentAllocation> allocations = [];
             string allocationEvidence = string.Empty;
@@ -626,7 +628,8 @@ public sealed class MftCandidateScanner
                             volumeHandle,
                             fileReference,
                             name,
-                            parentReference);
+                            parentReference,
+                            fullPath);
 
                         IReadOnlyList<NtfsExtentAllocation> allocations = [];
                         string allocationEvidence = string.Empty;
