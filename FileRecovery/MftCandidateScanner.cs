@@ -30,6 +30,8 @@ public sealed class MftCandidateScanner
         return ScanInternal(
             rootPath,
             targetPaths: null,
+            targetDirectory: null,
+            includeSubdirectories: false,
             cancellationToken: cancellationToken,
             maxPages: int.MaxValue);
     }
@@ -54,7 +56,58 @@ public sealed class MftCandidateScanner
             .Select(NormalizePath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        return ScanInternal(rootPath, normalizedTargets, cancellationToken, maxPages);
+        return ScanInternal(
+            rootPath,
+            normalizedTargets,
+            targetDirectory: null,
+            includeSubdirectories: false,
+            cancellationToken,
+            maxPages);
+    }
+
+    public IReadOnlyList<RecoveryCandidate> ScanDeletedDirectory(
+        string targetDirectory,
+        bool includeSubdirectories,
+        CancellationToken cancellationToken = default,
+        int maxPages = int.MaxValue)
+    {
+        WindowsPrivilege.EnableSeBackupPrivilege();
+
+        if (string.IsNullOrWhiteSpace(targetDirectory))
+        {
+            throw new ArgumentException(
+                "A directory must be selected for the deleted-file scan.",
+                nameof(targetDirectory));
+        }
+
+        if (!Directory.Exists(targetDirectory))
+        {
+            throw new DirectoryNotFoundException(
+                $"The selected scan directory no longer exists: {targetDirectory}");
+        }
+
+        if (maxPages <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxPages));
+        }
+
+        var fullDirectory = Path.GetFullPath(targetDirectory);
+        var root = Path.GetPathRoot(fullDirectory);
+
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            throw new ArgumentException(
+                "The selected directory must be on a Windows volume.",
+                nameof(targetDirectory));
+        }
+
+        return ScanInternal(
+            root,
+            targetPaths: null,
+            targetDirectory: fullDirectory,
+            includeSubdirectories,
+            cancellationToken,
+            maxPages);
     }
 
     public async Task<IReadOnlyList<RecoveryCandidate>> ScanRawMftForPathsAsync(
@@ -474,6 +527,8 @@ public sealed class MftCandidateScanner
     private IReadOnlyList<RecoveryCandidate> ScanInternal(
         string rootPath,
         IReadOnlySet<string>? targetPaths,
+        string? targetDirectory,
+        bool includeSubdirectories,
         CancellationToken cancellationToken,
         int maxPages)
     {
@@ -495,6 +550,10 @@ public sealed class MftCandidateScanner
         var bitmapReader = new NtfsVolumeBitmapReader();
 
         var results = new List<RecoveryCandidate>();
+        var normalizedTargetDirectory = string.IsNullOrWhiteSpace(targetDirectory)
+            ? null
+            : NormalizePath(targetDirectory);
+
         var targetFileNames = targetPaths is null
             ? null
             : targetPaths
@@ -593,6 +652,16 @@ public sealed class MftCandidateScanner
                         var directoryPath = NtfsParentPathResolver.Resolve(
                             volumeHandle,
                             parentReference) ?? string.Empty;
+
+                        if (normalizedTargetDirectory is not null &&
+                            !IsDirectoryMatch(
+                                directoryPath,
+                                normalizedTargetDirectory,
+                                includeSubdirectories))
+                        {
+                            offset += checked((int)recordLength);
+                            continue;
+                        }
 
                         var fullPath = string.IsNullOrWhiteSpace(directoryPath)
                             ? name
@@ -802,6 +871,25 @@ public sealed class MftCandidateScanner
 
     private static string NormalizePath(string path) =>
         path.Trim().Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+
+    private static bool IsDirectoryMatch(
+        string candidate,
+        string directory,
+        bool includeSubdirectories)
+    {
+        var left = NormalizePath(candidate).TrimEnd(Path.DirectorySeparatorChar);
+        var right = NormalizePath(directory).TrimEnd(Path.DirectorySeparatorChar);
+
+        if (string.Equals(left, right, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return includeSubdirectories &&
+               left.StartsWith(
+                   right + Path.DirectorySeparatorChar,
+                   StringComparison.OrdinalIgnoreCase);
+    }
 
     private static RecoveryCandidate BuildCandidate(
         ulong fileReferenceNumber,
