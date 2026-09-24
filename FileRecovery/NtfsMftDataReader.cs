@@ -42,7 +42,7 @@ public sealed class NtfsMftDataReader
             return false;
         }
 
-        var root = Path.GetPathRoot(rootPath);
+        var root = GetNtfsVolumeRoot(rootPath);
         if (string.IsNullOrWhiteSpace(root))
         {
             return false;
@@ -99,21 +99,22 @@ public sealed class NtfsMftDataReader
             }
 
             // Resident $DATA is small and fully contained in the MFT record.
-            // Only accept an old $DATA attribute that is itself in record slack,
-            // has the expected historical byte length, and is located close to the
-            // matching historical $FILE_NAME attribute. This prevents the current
-            // record's live $DATA attribute from being mistaken for deleted data.
+            // After record reuse, the old slack is not guaranteed to preserve the
+            // original attribute sequence. Search the slack byte-for-byte for a
+            // plausible resident unnamed $DATA attribute whose length matches the
+            // historical $FILE_NAME size and is physically close to that filename.
             const int maxRelatedSlackDistance = 1024;
 
             for (var attributeOffset = slackStart;
-                 attributeOffset + 24 <= record.Length;)
+                 attributeOffset + 24 <= record.Length;
+                 attributeOffset++)
             {
                 var type = BinaryPrimitives.ReadUInt32LittleEndian(
                     record.AsSpan(attributeOffset, 4));
 
-                if (type == NtfsAttributeEnd)
+                if (type != NtfsAttributeData)
                 {
-                    break;
+                    continue;
                 }
 
                 var attributeLength = BinaryPrimitives.ReadUInt32LittleEndian(
@@ -122,47 +123,48 @@ public sealed class NtfsMftDataReader
                 if (attributeLength < 24 ||
                     attributeOffset + attributeLength > record.Length)
                 {
-                    attributeOffset += 8;
                     continue;
                 }
 
                 var formCode = record[attributeOffset + 8];
                 var nameLength = record[attributeOffset + 9];
 
-                if (type == NtfsAttributeData &&
-                    formCode == 0 &&
-                    nameLength == 0 &&
-                    attributeLength >= 24)
+                if (formCode != 0 || nameLength != 0)
                 {
-                    var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
-                        record.AsSpan(attributeOffset + 16, 4));
-
-                    var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
-                        record.AsSpan(attributeOffset + 20, 2));
-
-                    if (valueLength == (ulong)historicalFileSize &&
-                        valueLength <= (uint)MaxAttributeListBytes &&
-                        valueOffset < attributeLength &&
-                        valueLength <= attributeLength - valueOffset &&
-                        Math.Abs(attributeOffset - historicalFileNameOffset) <= maxRelatedSlackDistance)
-                    {
-                        data = record.AsSpan(
-                                attributeOffset + valueOffset,
-                                checked((int)valueLength))
-                            .ToArray();
-
-                        System.Diagnostics.Debug.WriteLine(
-                            $"NTFS historical resident $DATA evidence: segment={segmentNumber}, " +
-                            $"fileName={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
-                            $"size={data.Length:N0}, dataAttributeOffset={attributeOffset}, " +
-                            $"fileNameOffset={historicalFileNameOffset}.");
-
-                        return true;
-                    }
+                    continue;
                 }
 
-                attributeOffset += checked((int)attributeLength);
+                var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(attributeOffset + 16, 4));
+
+                var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(attributeOffset + 20, 2));
+
+                if (valueLength == 0 ||
+                    valueLength != (ulong)historicalFileSize ||
+                    valueLength > (uint)MaxAttributeListBytes ||
+                    valueOffset < 24 ||
+                    valueOffset >= attributeLength ||
+                    valueLength > attributeLength - valueOffset ||
+                    Math.Abs(attributeOffset - historicalFileNameOffset) > maxRelatedSlackDistance)
+                {
+                    continue;
+                }
+
+                data = record.AsSpan(
+                        attributeOffset + valueOffset,
+                        checked((int)valueLength))
+                    .ToArray();
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS historical resident $DATA evidence: segment={segmentNumber}, " +
+                    $"fileName={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
+                    $"size={data.Length:N0}, dataAttributeOffset={attributeOffset}, " +
+                    $"fileNameOffset={historicalFileNameOffset}.");
+
+                return true;
             }
+
         }
         catch (Exception ex)
         {
@@ -1552,6 +1554,25 @@ public sealed class NtfsMftDataReader
         }
 
         return false;
+    }
+
+    private static string? GetNtfsVolumeRoot(string path)
+    {
+        var normalized = path.Trim();
+
+        while (normalized.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+               normalized.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalized = normalized[4..];
+        }
+
+        var root = Path.GetPathRoot(normalized);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return null;
+        }
+
+        return root;
     }
 
     private static string NormalizePath(string path) =>
