@@ -21,6 +21,7 @@ public partial class Form1 : Form
     private bool _suppressGridSelectionChanged;
     private bool _operationInProgress;
     private bool _ntfsResultsDisplayed;
+    private bool _ntfsScanInProgress;
 
     public void CloseFromApplication()
     {
@@ -117,7 +118,7 @@ public partial class Form1 : Form
 
     private void QueueHistoryRefresh()
     {
-        if (IsDisposed || _historyRefreshPending || _ntfsResultsDisplayed)
+        if (IsDisposed || _historyRefreshPending || _ntfsResultsDisplayed || _ntfsScanInProgress)
         {
             return;
         }
@@ -128,7 +129,9 @@ public partial class Form1 : Form
         {
             _historyRefreshPending = false;
 
-            if (!IsDisposed)
+            if (!IsDisposed &&
+                !_ntfsResultsDisplayed &&
+                !_ntfsScanInProgress)
             {
                 RefreshFromHistory();
             }
@@ -424,6 +427,8 @@ public partial class Form1 : Form
             true,
             $"Scanning deleted NTFS metadata under {scanDirectory}...");
 
+        _ntfsScanInProgress = true;
+
         try
         {
             var deletedRecords = _usnMonitor.ScanDeletedDirectory(
@@ -498,6 +503,7 @@ public partial class Form1 : Form
         }
         finally
         {
+            _ntfsScanInProgress = false;
             SetBusy(false);
             UpdateRecoverButton();
         }
