@@ -1023,6 +1023,8 @@ public partial class Form1 : Form
         IReadOnlyList<DeletionRecord> records)
     {
         var resolved = new List<DeletionRecord>();
+        var unresolved = new List<DeletionRecord>();
+        var recentCutoffUtc = DateTime.UtcNow.AddMinutes(-15);
 
         foreach (var record in records)
         {
@@ -1032,29 +1034,86 @@ public partial class Form1 : Form
                 continue;
             }
 
-            // Do not perform an unbounded recovery-time journal enumeration here.
-            // The background USN monitor owns the journal cursor and caches recent
-            // deletion records. Give it a short window to observe a fresh deletion,
-            // while keeping the Recovery Center UI responsive.
-            for (var attempt = 0; attempt < 10; attempt++)
-            {
-                if (_usnMonitor.TryResolveRecentDeletedFileBounded(
-                        record.FullPath,
-                        record.DeletedAtUtc,
-                        out var fileReferenceNumber,
-                        out var parentFileReferenceNumber))
-                {
-                    record.FileReferenceNumber = fileReferenceNumber;
-                    record.ParentFileReferenceNumber = parentFileReferenceNumber;
-                    resolved.Add(record);
-                    break;
-                }
+            var resolvedFromLiveMonitor = false;
 
-                if (attempt < 9)
+            // Fresh deletions are first given a short opportunity to resolve from
+            // the monitor/cache path. Historical journal scanning is only used when
+            // that live path cannot resolve the record.
+            if (record.DeletedAtUtc == default ||
+                record.DeletedAtUtc >= recentCutoffUtc)
+            {
+                for (var attempt = 0; attempt < 5; attempt++)
                 {
-                    await Task.Delay(300).ConfigureAwait(true);
+                    if (_usnMonitor.TryResolveRecentDeletedFileBounded(
+                            record.FullPath,
+                            record.DeletedAtUtc,
+                            out var fileReferenceNumber,
+                            out var parentFileReferenceNumber))
+                    {
+                        record.FileReferenceNumber = fileReferenceNumber;
+                        record.ParentFileReferenceNumber = parentFileReferenceNumber;
+                        resolved.Add(record);
+                        resolvedFromLiveMonitor = true;
+                        break;
+                    }
+
+                    if (attempt < 4)
+                    {
+                        await Task.Delay(200).ConfigureAwait(true);
+                    }
                 }
             }
+
+            if (!resolvedFromLiveMonitor)
+            {
+                unresolved.Add(record);
+            }
+        }
+
+        // A deletion that happened before this application session cannot be in the
+        // in-memory USN cache. Resolve all remaining history rows in one journal pass
+        // instead of rescanning the entire journal separately for every file.
+        if (unresolved.Count > 0)
+        {
+            var targets = unresolved
+                .Select(record => (record.FullPath, record.DeletedAtUtc))
+                .ToList();
+
+            var historicalMatches = await Task.Run(
+                    () => _usnMonitor.ResolveHistoricalDeletionsFromJournal(
+                        targets,
+                        CancellationToken.None))
+                .ConfigureAwait(true);
+
+            var matchesByPath = historicalMatches
+                .GroupBy(
+                    match => NormalizePath(match.FullPath),
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .OrderByDescending(match => match.DeletedAtUtc)
+                        .First(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            foreach (var record in unresolved)
+            {
+                if (!matchesByPath.TryGetValue(
+                        NormalizePath(record.FullPath),
+                        out var match))
+                {
+                    continue;
+                }
+
+                record.FileReferenceNumber = match.FileReferenceNumber;
+                record.ParentFileReferenceNumber = match.ParentFileReferenceNumber;
+                resolved.Add(record);
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS historical reference resolution: requested={unresolved.Count:N0}, " +
+                $"resolved={historicalMatches.Count:N0}, " +
+                $"stillMissing={unresolved.Count - resolved.Count:N0}.");
         }
 
         foreach (var record in resolved)
