@@ -26,6 +26,275 @@ public sealed class NtfsMftDataReader
 
     private IReadOnlyList<NtfsDataExtent>? _mftExtents;
 
+    public bool TryReadHistoricalResidentData(
+        string rootPath,
+        ulong fileReferenceNumber,
+        ulong expectedParentFileReferenceNumber,
+        string expectedFileName,
+        out byte[] data)
+    {
+        data = [];
+
+        if (string.IsNullOrWhiteSpace(rootPath) ||
+            fileReferenceNumber == 0 ||
+            string.IsNullOrWhiteSpace(expectedFileName))
+        {
+            return false;
+        }
+
+        var root = Path.GetPathRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return false;
+        }
+
+        try
+        {
+            WindowsPrivilege.EnableSeBackupPrivilege();
+
+            var volumeInfo = new NtfsVolumeInspector().Inspect(root);
+            using var rawMftVolumeHandle = CreateVolumeHandle(
+                volumeInfo.RootPath,
+                overlapped: true);
+
+            var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
+
+            // This is deliberately a forensic slack read. We do not accept the
+            // current MFT sequence as the historical record because the USN sequence
+            // is already known to be stale for these reused segments.
+            var record = ReadMftRecordByExtentMap(
+                rawMftVolumeHandle,
+                volumeInfo,
+                segmentNumber,
+                expectedSequenceNumber: 0,
+                expectedBaseFileReference: 0);
+
+            if (record is null)
+            {
+                return false;
+            }
+
+            var slackStart = FindAttributeSlackStart(record);
+            if (slackStart < 0 || slackStart >= record.Length)
+            {
+                return false;
+            }
+
+            var expectedNameBytes = Encoding.Unicode.GetBytes(expectedFileName);
+            if (expectedNameBytes.Length == 0)
+            {
+                return false;
+            }
+
+            var historicalFileNameOffset = FindHistoricalFileNameValue(
+                record,
+                slackStart,
+                expectedNameBytes,
+                expectedParentFileReferenceNumber,
+                out var historicalFileSize);
+
+            if (historicalFileNameOffset < 0 || historicalFileSize < 0)
+            {
+                return false;
+            }
+
+            // Resident $DATA is small and fully contained in the MFT record.
+            // Only accept an old $DATA attribute that is itself in record slack,
+            // has the expected historical byte length, and is located close to the
+            // matching historical $FILE_NAME attribute. This prevents the current
+            // record's live $DATA attribute from being mistaken for deleted data.
+            const int maxRelatedSlackDistance = 1024;
+
+            for (var attributeOffset = slackStart;
+                 attributeOffset + 24 <= record.Length;)
+            {
+                var type = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(attributeOffset, 4));
+
+                if (type == NtfsAttributeEnd)
+                {
+                    break;
+                }
+
+                var attributeLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(attributeOffset + 4, 4));
+
+                if (attributeLength < 24 ||
+                    attributeOffset + attributeLength > record.Length)
+                {
+                    attributeOffset += 8;
+                    continue;
+                }
+
+                var formCode = record[attributeOffset + 8];
+                var nameLength = record[attributeOffset + 9];
+
+                if (type == NtfsAttributeData &&
+                    formCode == 0 &&
+                    nameLength == 0 &&
+                    attributeLength >= 24)
+                {
+                    var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                        record.AsSpan(attributeOffset + 16, 4));
+
+                    var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                        record.AsSpan(attributeOffset + 20, 2));
+
+                    if (valueLength == (ulong)historicalFileSize &&
+                        valueLength <= (uint)MaxAttributeListBytes &&
+                        valueOffset < attributeLength &&
+                        valueLength <= attributeLength - valueOffset &&
+                        Math.Abs(attributeOffset - historicalFileNameOffset) <= maxRelatedSlackDistance)
+                    {
+                        data = record.AsSpan(
+                                attributeOffset + valueOffset,
+                                checked((int)valueLength))
+                            .ToArray();
+
+                        System.Diagnostics.Debug.WriteLine(
+                            $"NTFS historical resident $DATA evidence: segment={segmentNumber}, " +
+                            $"fileName={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
+                            $"size={data.Length:N0}, dataAttributeOffset={attributeOffset}, " +
+                            $"fileNameOffset={historicalFileNameOffset}.");
+
+                        return true;
+                    }
+                }
+
+                attributeOffset += checked((int)attributeLength);
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS historical resident $DATA lookup failed: " +
+                $"{ex.GetType().Name}: {ex.Message}");
+        }
+
+        return false;
+    }
+
+    private static int FindAttributeSlackStart(byte[] record)
+    {
+        if (record.Length < 24)
+        {
+            return -1;
+        }
+
+        var firstAttributeOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+            record.AsSpan(20, 2));
+
+        if (firstAttributeOffset < 24 ||
+            firstAttributeOffset >= record.Length)
+        {
+            return -1;
+        }
+
+        var offset = firstAttributeOffset;
+        while (offset + 16 <= record.Length)
+        {
+            var type = BinaryPrimitives.ReadUInt32LittleEndian(
+                record.AsSpan(offset, 4));
+
+            if (type == NtfsAttributeEnd)
+            {
+                return offset + 4;
+            }
+
+            var attributeLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                record.AsSpan(offset + 4, 4));
+
+            if (attributeLength < 24 ||
+                offset + attributeLength > record.Length)
+            {
+                return -1;
+            }
+
+            offset += checked((int)attributeLength);
+        }
+
+        return -1;
+    }
+
+    private static int FindHistoricalFileNameValue(
+        byte[] record,
+        int slackStart,
+        byte[] expectedNameBytes,
+        ulong expectedParentFileReferenceNumber,
+        out long historicalFileSize)
+    {
+        historicalFileSize = -1;
+
+        const int parentOffset = 0;
+        const int allocatedSizeOffset = 40;
+        const int realSizeOffset = 48;
+        const int fileNameLengthOffset = 64;
+        const int fileNameNamespaceOffset = 65;
+        const int fileNameOffset = 66;
+
+        for (var nameOffset = slackStart;
+             nameOffset + expectedNameBytes.Length <= record.Length;
+             nameOffset += 2)
+        {
+            if (!record.AsSpan(
+                    nameOffset,
+                    expectedNameBytes.Length)
+                .SequenceEqual(expectedNameBytes))
+            {
+                continue;
+            }
+
+            var valueOffset = nameOffset - fileNameOffset;
+            if (valueOffset < slackStart ||
+                valueOffset + fileNameOffset > record.Length)
+            {
+                continue;
+            }
+
+            var storedNameLength = record[valueOffset + fileNameLengthOffset];
+            var nameNamespace = record[valueOffset + fileNameNamespaceOffset];
+
+            if (storedNameLength != expectedNameBytes.Length / 2 ||
+                nameNamespace > 3)
+            {
+                continue;
+            }
+
+            var parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                record.AsSpan(
+                    valueOffset + parentOffset,
+                    sizeof(ulong)));
+
+            if (parentReference != expectedParentFileReferenceNumber)
+            {
+                continue;
+            }
+
+            var allocatedSize = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(
+                    valueOffset + allocatedSizeOffset,
+                    sizeof(long)));
+
+            var realSize = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(
+                    valueOffset + realSizeOffset,
+                    sizeof(long)));
+
+            if (realSize < 0 ||
+                allocatedSize < 0 ||
+                realSize > allocatedSize ||
+                realSize > MaxAttributeListBytes)
+            {
+                continue;
+            }
+
+            historicalFileSize = realSize;
+            return valueOffset;
+        }
+
+        return -1;
+    }
+
     public bool TryReadHistoricalFileNameSize(
         string rootPath,
         ulong fileReferenceNumber,
