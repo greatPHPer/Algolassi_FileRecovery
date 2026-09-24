@@ -822,6 +822,16 @@ public sealed class UsnJournalMonitor : IDisposable
 
                 foreach (var record in records)
                 {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"Bounded USN record: file={record.FileName}, " +
+                        $"fileRef={record.FileReferenceNumber}, " +
+                        $"parentRef={record.ParentFileReferenceNumber}, " +
+                        $"reason=0x{record.Reason:X8}, " +
+                        $"attributes=0x{record.FileAttributes:X8}, " +
+                        $"usnTime={record.TimestampUtc:O}, " +
+                        $"historyTime={deletedAtUtc:O}, " +
+                        $"target={normalizedTarget}.");
+
                     if (TryMatchDeletedRecord(
                             volumeHandle,
                             volumeKey,
