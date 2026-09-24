@@ -15,7 +15,7 @@ public sealed class NtfsDeepFileRecoveryService
     private const uint FileFlagBackupSemantics = 0x02000000;
 
     private const int IoBufferSize = 4 * 1024 * 1024;
-    private const long DefaultMaxBytesToScan = 512L * 1024L * 1024L;
+    private const long DefaultMaxBytesToScan = 4L * 1024L * 1024L * 1024L;
     private const long MaxCarvedFileBytes = 64L * 1024L * 1024L;
 
     public RecoveryResult Recover(
