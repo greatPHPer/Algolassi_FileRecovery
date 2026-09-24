@@ -611,11 +611,12 @@ public sealed class NtfsMftDataReader
                 progress?.Report(scannedBytes);
 
                 var slack = new byte[slackLength];
+                cancellationToken.ThrowIfCancellationRequested();
+
                 ReadAt(
                     volumeHandle,
                     physicalOffset,
-                    slack,
-                    cancellationToken);
+                    slack);
 
                 if (!TryFindTextLikePrefix(
                         slack,
