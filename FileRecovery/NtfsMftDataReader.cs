@@ -525,6 +525,12 @@ public sealed class NtfsMftDataReader
 
             if (record is null)
             {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS fresh resident $DATA: exact MFT reference did not validate. " +
+                    $"fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
+                    $"expectedSequence={sequenceNumber}, expectedParent={expectedParentFileReferenceNumber}, " +
+                    $"fileName={expectedFileName}.");
+
                 record = ReadMftRecordByExtentMap(
                     volumeHandle,
                     volumeInfo,
@@ -532,14 +538,35 @@ public sealed class NtfsMftDataReader
                     expectedSequenceNumber: 0,
                     expectedBaseFileReference: 0);
 
-                if (record is null ||
-                    !HasMatchingFileNameEntry(
-                        volumeHandle,
-                        record,
-                        expectedFileName,
-                        expectedParentFileReferenceNumber,
-                        expectedFullPath,
-                        expectedSequenceNumber: sequenceNumber))
+                if (record is null)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS fresh resident $DATA: could not read current MFT segment={segmentNumber}.");
+                    return false;
+                }
+
+                var currentSequence = BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(16, 2));
+                var currentFlags = BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(22, 2));
+                var currentBaseReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    record.AsSpan(32, 8));
+
+                var fileNameMatches = HasMatchingFileNameEntry(
+                    volumeHandle,
+                    record,
+                    expectedFileName,
+                    expectedParentFileReferenceNumber,
+                    expectedFullPath,
+                    expectedSequenceNumber: sequenceNumber);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS fresh resident $DATA: relaxed record inspected. " +
+                    $"segment={segmentNumber}, currentSequence={currentSequence}, " +
+                    $"expectedSequence={sequenceNumber}, flags=0x{currentFlags:X4}, " +
+                    $"baseRef={currentBaseReference}, fileNameParentMatch={fileNameMatches}.");
+
+                if (!fileNameMatches)
                 {
                     return false;
                 }
