@@ -11,6 +11,7 @@ public sealed class UsnJournalMonitor : IDisposable
 {
     private const uint FsctlQueryUsnJournal = 0x000900F4;
     private const uint FsctlReadUsnJournal = 0x000900BB;
+    private const uint FsctlEnumUsnData = 0x000900B3;
     private const uint FsctlCreateUsnJournal = 0x000900E7;
 
     private const uint GenericRead = 0x80000000;
@@ -26,6 +27,7 @@ public sealed class UsnJournalMonitor : IDisposable
     private const int ErrorFileNotFound = 2;
 
     private const uint UsnReasonFileDelete = 0x00000200;
+    private const uint FileAttributeDirectory = 0x00000010;
     private const int UsnRecordV2MinimumLength = 60;
 
     private readonly RecoverySettings _settings;
@@ -776,128 +778,340 @@ public sealed class UsnJournalMonitor : IDisposable
 
         var normalizedTarget = NormalizePath(fullPath);
 
-        // Recovery must still be able to find a deletion when the background
-        // monitor has already advanced its cursor past that USN. Start from a
-        // recent USN window instead of depending exclusively on the shared
-        // monitor cursor. A recent Shift+Delete should be near the journal tail.
+        // READ_USN_JOURNAL requires StartUsn to identify a journal position;
+        // it is not safe to manufacture a recent USN by subtracting from
+        // NextUsn. Use the monitor's actual cursor when it is a valid journal
+        // position, then fall back to bounded FSCTL_ENUM_USN_DATA over the
+        // recent USN range if the monitor cursor has already reached the tail.
+        var searchStart = journal.FirstUsn;
+
+        if (_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) &&
+            cursor.JournalId == journal.JournalId &&
+            cursor.NextUsn >= journal.FirstUsn &&
+            cursor.NextUsn <= journal.NextUsn)
+        {
+            searchStart = cursor.NextUsn;
+        }
+
+        if (searchStart < journal.NextUsn)
+        {
+            var nextUsn = searchStart;
+            const int maxBatches = 8;
+
+            for (var batch = 0;
+                 batch < maxBatches &&
+                 nextUsn < journal.NextUsn;
+                 batch++)
+            {
+                var records = ReadRecords(
+                    volumeHandle,
+                    journal.JournalId,
+                    nextUsn,
+                    out var returnedNextUsn);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"Bounded USN lookup: target={normalizedTarget}, batch={batch + 1}, " +
+                    $"start={nextUsn}, journalNext={journal.NextUsn}, " +
+                    $"records={records.Count}, returnedNext={returnedNextUsn}.");
+
+                if (returnedNextUsn <= nextUsn)
+                {
+                    break;
+                }
+
+                foreach (var record in records)
+                {
+                    if (TryMatchDeletedRecord(
+                            volumeHandle,
+                            volumeKey,
+                            record,
+                            normalizedTarget,
+                            deletedAtUtc,
+                            out fileReferenceNumber,
+                            out parentFileReferenceNumber))
+                    {
+                        return true;
+                    }
+                }
+
+                nextUsn = returnedNextUsn;
+            }
+        }
+
+        // The recovery-time bounded lookup is read-only with respect to the
+        // monitor cursor. If the background worker already consumed the journal
+        // tail, enumerate only the recent USN range without inventing a StartUsn.
         const long recentUsnWindow = 10_000_000;
-        var searchStart = Math.Max(
+        var lowUsn = Math.Max(
             journal.FirstUsn,
             journal.NextUsn - recentUsnWindow);
 
-        if (searchStart >= journal.NextUsn)
+        return TryResolveRecentUsnEnumData(
+            volumeHandle,
+            volumeKey,
+            lowUsn,
+            journal.NextUsn,
+            normalizedTarget,
+            deletedAtUtc,
+            out fileReferenceNumber,
+            out parentFileReferenceNumber);
+    }
+
+    private bool TryMatchDeletedRecord(
+        SafeFileHandle volumeHandle,
+        string volumeKey,
+        UsnRecord record,
+        string normalizedTarget,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        if ((record.Reason & UsnReasonFileDelete) == 0 ||
+            (record.FileAttributes & FileAttributeDirectory) != 0 ||
+            string.IsNullOrWhiteSpace(record.FileName))
         {
             return false;
         }
 
-        var nextUsn = searchStart;
-        const int maxBatches = 8;
-
-        for (var batch = 0;
-             batch < maxBatches &&
-             nextUsn < journal.NextUsn;
-             batch++)
+        if (deletedAtUtc != default &&
+            Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes) > 5)
         {
-            var records = ReadRecords(
+            return false;
+        }
+
+        var cache = _parentPathCaches.GetOrAdd(
+            volumeKey,
+            _ => new ConcurrentDictionary<ulong, string>());
+
+        var directory = cache.TryGetValue(
+            record.ParentFileReferenceNumber,
+            out var knownPath)
+            ? knownPath
+            : ResolveParentDirectory(
                 volumeHandle,
-                journal.JournalId,
-                nextUsn,
-                out var returnedNextUsn);
+                record.ParentFileReferenceNumber);
 
-            System.Diagnostics.Debug.WriteLine(
-                $"Bounded USN lookup: target={normalizedTarget}, batch={batch + 1}, " +
-                $"start={nextUsn}, journalNext={journal.NextUsn}, " +
-                $"records={records.Count}, returnedNext={returnedNextUsn}.");
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            cache[record.ParentFileReferenceNumber] = directory;
+        }
 
-            if (returnedNextUsn <= nextUsn)
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            if (!string.Equals(
+                    record.FileName,
+                    Path.GetFileName(normalizedTarget),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            var candidatePath = NormalizePath(
+                Path.Combine(directory, record.FileName));
+
+            if (!string.Equals(
+                    candidatePath,
+                    normalizedTarget,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        fileReferenceNumber = record.FileReferenceNumber;
+        parentFileReferenceNumber = record.ParentFileReferenceNumber;
+
+        _recentDeletedRecords.Enqueue(
+            new RecentDeletedRecord(
+                fileReferenceNumber,
+                parentFileReferenceNumber,
+                record.FileName,
+                directory,
+                record.TimestampUtc));
+
+        while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+               _recentDeletedRecords.TryDequeue(out _))
+        {
+        }
+
+        return true;
+    }
+
+    private bool TryResolveRecentUsnEnumData(
+        SafeFileHandle volumeHandle,
+        string volumeKey,
+        long lowUsn,
+        long highUsn,
+        string normalizedTarget,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        if (lowUsn >= highUsn)
+        {
+            return false;
+        }
+
+        ulong startFileReferenceNumber = 0;
+        const int maxPages = 32;
+
+        for (var page = 0; page < maxPages; page++)
+        {
+            var request = new MftEnumDataV0
+            {
+                StartFileReferenceNumber = startFileReferenceNumber,
+                LowUsn = lowUsn,
+                HighUsn = highUsn
+            };
+
+            var input = StructureToBytes(request);
+            var output = new byte[1024 * 1024];
+
+            if (!DeviceIoControl(
+                    volumeHandle,
+                    FsctlEnumUsnData,
+                    input,
+                    (uint)input.Length,
+                    output,
+                    (uint)output.Length,
+                    out var bytesReturned,
+                    IntPtr.Zero))
+            {
+                var error = Marshal.GetLastWin32Error();
+
+                if (error == ErrorJournalDeleteInProgress ||
+                    error == ErrorJournalNotActive ||
+                    error == ErrorJournalEntryDeleted)
+                {
+                    return false;
+                }
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"Bounded USN enum fallback failed: error={error}, lowUsn={lowUsn}, highUsn={highUsn}.");
+                return false;
+            }
+
+            if (bytesReturned < sizeof(ulong))
+            {
+                return false;
+            }
+
+            var nextStart = BinaryPrimitives.ReadUInt64LittleEndian(
+                output.AsSpan(0, 8));
+
+            var offset = 8;
+
+            while (offset + 4 <= bytesReturned)
+            {
+                var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                    output.AsSpan(offset, 4));
+
+                if (recordLength < UsnRecordV2MinimumLength ||
+                    recordLength > bytesReturned - offset)
+                {
+                    break;
+                }
+
+                var recordSpan = output.AsSpan(
+                    offset,
+                    checked((int)recordLength));
+
+                var majorVersion = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(4, 2));
+
+                if (majorVersion == 2)
+                {
+                    var fileReferenceNumber =
+                        BinaryPrimitives.ReadUInt64LittleEndian(
+                            recordSpan.Slice(8, 8));
+                    var parentFileReferenceNumber =
+                        BinaryPrimitives.ReadUInt64LittleEndian(
+                            recordSpan.Slice(16, 8));
+                    var timestampFileTime =
+                        BinaryPrimitives.ReadInt64LittleEndian(
+                            recordSpan.Slice(32, 8));
+                    var reason =
+                        BinaryPrimitives.ReadUInt32LittleEndian(
+                            recordSpan.Slice(40, 4));
+                    var fileAttributes =
+                        BinaryPrimitives.ReadUInt32LittleEndian(
+                            recordSpan.Slice(52, 4));
+                    var nameLength =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            recordSpan.Slice(56, 2));
+                    var nameOffset =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            recordSpan.Slice(58, 2));
+
+                    if (nameOffset + nameLength <= recordSpan.Length)
+                    {
+                        DateTime timestampUtc;
+
+                        try
+                        {
+                            timestampUtc = DateTime.FromFileTimeUtc(timestampFileTime);
+                        }
+                        catch
+                        {
+                            timestampUtc = DateTime.UtcNow;
+                        }
+
+                        var name = System.Text.Encoding.Unicode.GetString(
+                            recordSpan.Slice(nameOffset, nameLength));
+
+                        if (TryMatchDeletedRecord(
+                                volumeHandle,
+                                volumeKey,
+                                new UsnRecord(
+                                    fileReferenceNumber,
+                                    parentFileReferenceNumber,
+                                    reason,
+                                    fileAttributes,
+                                    name,
+                                    timestampUtc),
+                                normalizedTarget,
+                                deletedAtUtc,
+                                out fileReferenceNumber,
+                                out parentFileReferenceNumber))
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                offset += checked((int)recordLength);
+            }
+
+            if (nextStart <= startFileReferenceNumber)
             {
                 break;
             }
 
-            foreach (var record in records)
+            startFileReferenceNumber = nextStart;
+
+            if (bytesReturned <= sizeof(ulong))
             {
-                if ((record.Reason & UsnReasonFileDelete) == 0 ||
-                    (record.FileAttributes & 0x10) != 0 ||
-                    string.IsNullOrWhiteSpace(record.FileName))
-                {
-                    continue;
-                }
-
-                if (deletedAtUtc != default &&
-                    Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes) > 5)
-                {
-                    continue;
-                }
-
-                var cache = _parentPathCaches.GetOrAdd(
-                    volumeKey,
-                    _ => new ConcurrentDictionary<ulong, string>());
-
-                var directory = cache.TryGetValue(
-                    record.ParentFileReferenceNumber,
-                    out var knownPath)
-                    ? knownPath
-                    : ResolveParentDirectory(
-                        volumeHandle,
-                        record.ParentFileReferenceNumber);
-
-                if (!string.IsNullOrWhiteSpace(directory))
-                {
-                    cache[record.ParentFileReferenceNumber] = directory;
-                }
-
-                if (string.IsNullOrWhiteSpace(directory))
-                {
-                    if (!string.Equals(
-                            record.FileName,
-                            Path.GetFileName(normalizedTarget),
-                            StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-                }
-                else
-                {
-                    var candidatePath = NormalizePath(
-                        Path.Combine(directory, record.FileName));
-
-                    if (!string.Equals(
-                            candidatePath,
-                            normalizedTarget,
-                            StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-                }
-
-                fileReferenceNumber = record.FileReferenceNumber;
-                parentFileReferenceNumber = record.ParentFileReferenceNumber;
-
-                _recentDeletedRecords.Enqueue(
-                    new RecentDeletedRecord(
-                        fileReferenceNumber,
-                        parentFileReferenceNumber,
-                        record.FileName,
-                        directory,
-                        record.TimestampUtc));
-
-                while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
-                       _recentDeletedRecords.TryDequeue(out _))
-                {
-                }
-
-                return true;
+                break;
             }
-
-            nextUsn = returnedNextUsn;
         }
 
-        // The recovery-time bounded lookup is read-only with respect to the
-        // monitor cursor. The background USN monitor owns cursor advancement;
-        // otherwise a failed lookup could skip journal records before the monitor
-        // has had a chance to cache them.
-
         return false;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MftEnumDataV0
+    {
+        public ulong StartFileReferenceNumber;
+        public long LowUsn;
+        public long HighUsn;
     }
 
     private static string NormalizePath(string path) =>
