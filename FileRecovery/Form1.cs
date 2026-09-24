@@ -2499,7 +2499,11 @@ public sealed class SynchronousProgress<T>(Control control, Action<T> handler) :
     {
         if (control.IsHandleCreated && !control.IsDisposed)
         {
-            control.Invoke(() => handler(value));
+            control.Invoke(() =>
+            {
+                handler(value);
+                Application.DoEvents();
+            });
         }
     }
 }
