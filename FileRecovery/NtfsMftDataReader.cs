@@ -14,6 +14,7 @@ public sealed class NtfsMftDataReader
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOverlapped = 0x40000000;
+    private const uint FsctlGetNtfsFileRecord = 0x00090068;
     private const int ErrorIoPending = 997;
 
     private const uint NtfsAttributeList = 0x20;
@@ -57,49 +58,19 @@ public sealed class NtfsMftDataReader
             $"recordSize={volumeInfo.BytesPerFileRecordSegment}, " +
             $"mftValidLength={volumeInfo.MftValidDataLength}.");
 
-        using var mftHandle = CreateMftHandle(volumeInfo.RootPath);
-
-        var record = ReadMftRecordDirect(
-            mftHandle,
-            volumeInfo,
-            segmentNumber,
-            sequenceNumber,
-            expectedBaseFileReference: fileReferenceNumber);
-
-        if (record is null &&
-            !string.IsNullOrWhiteSpace(expectedFileName) &&
-            expectedParentFileReferenceNumber.HasValue)
-        {
-            // A very recent deletion can race the MFT sequence bookkeeping.
-            // The USN record already supplied the exact segment; retry that segment
-            // without strict sequence/base checks, but only accept it when the
-            // retained $FILE_NAME still identifies the expected parent/name.
-            var relaxedRecord = ReadMftRecordDirect(
-                mftHandle,
-                volumeInfo,
-                segmentNumber,
-                expectedSequenceNumber: 0,
-                expectedBaseFileReference: 0);
-
-            if (relaxedRecord is not null &&
-                HasMatchingFileNameEntry(
-                    relaxedRecord,
-                    expectedFileName,
-                    expectedParentFileReferenceNumber.Value,
-                    expectedSequenceNumber: sequenceNumber))
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $DATA lookup: accepted raw MFT record for " +
-                    $"fileRef={fileReferenceNumber}, segment={segmentNumber}.");
-                record = relaxedRecord;
-            }
-        }
+        // Ask NTFS itself for the exact MFT record represented by the USN file reference.
+        // This avoids opening the protected $MFT namespace and avoids reconstructing
+        // the physical MFT extent map ourselves.
+        var record = ReadMftRecordByFileReference(
+            volumeHandle,
+            fileReferenceNumber);
 
         if (record is null)
         {
             System.Diagnostics.Debug.WriteLine(
-                $"NTFS $DATA lookup: ReadRecord returned null for fileRef={fileReferenceNumber}.");
-            return NotFound("The referenced MFT segment no longer contains a valid deleted-file record.");
+                $"NTFS $DATA lookup: FSCTL_GET_NTFS_FILE_RECORD could not return exact " +
+                $"fileRef={fileReferenceNumber}.");
+            return NotFound("NTFS could not return the exact MFT record for this file reference.");
         }
 
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
@@ -168,12 +139,9 @@ public sealed class NtfsMftDataReader
             var extensionSegment = entry.SegmentReference & 0x0000FFFFFFFFFFFFUL;
             var extensionSequence = (ushort)(entry.SegmentReference >> 48);
 
-            var extensionRecord = ReadMftRecordDirect(
-                mftHandle,
-                volumeInfo,
-                extensionSegment,
-                extensionSequence,
-                expectedBaseFileReference: fileReferenceNumber);
+            var extensionRecord = ReadMftRecordByFileReference(
+                volumeHandle,
+                entry.SegmentReference);
 
             if (extensionRecord is null)
             {
@@ -1254,36 +1222,69 @@ public sealed class NtfsMftDataReader
         }
     }
 
-    private static SafeFileHandle CreateMftHandle(string rootPath)
+    private static byte[]? ReadMftRecordByFileReference(
+        SafeFileHandle volumeHandle,
+        ulong fileReferenceNumber)
     {
-        var normalizedRoot = Path.GetPathRoot(rootPath);
-        if (string.IsNullOrWhiteSpace(normalizedRoot))
-        {
-            throw new InvalidOperationException(
-                "The NTFS source volume root could not be determined.");
-        }
+        Span<byte> input = stackalloc byte[8];
+        BinaryPrimitives.WriteUInt64LittleEndian(input, fileReferenceNumber);
 
-        var mftPath = Path.Combine(normalizedRoot, "$MFT");
-        var handle = CreateFile(
-            mftPath,
-            GenericRead,
-            FileShareRead | FileShareWrite | FileShareDelete,
-            IntPtr.Zero,
-            OpenExisting,
-            FileFlagBackupSemantics,
-            IntPtr.Zero);
+        // NTFS_FILE_RECORD_OUTPUT_BUFFER contains:
+        //   FileReferenceNumber (8 bytes)
+        //   FileRecordLength   (4 bytes)
+        //   FileRecord          (variable)
+        var output = new byte[4 * 1024];
 
-        if (handle.IsInvalid)
+        if (!DeviceIoControl(
+                volumeHandle,
+                FsctlGetNtfsFileRecord,
+                input.ToArray(),
+                (uint)input.Length,
+                output,
+                (uint)output.Length,
+                out var bytesReturned,
+                IntPtr.Zero))
         {
             var error = Marshal.GetLastWin32Error();
-            handle.Dispose();
-
-            throw new Win32Exception(
-                error,
-                $"Could not open the NTFS MFT at {mftPath}.");
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS FSCTL_GET_NTFS_FILE_RECORD failed for fileRef={fileReferenceNumber}, error={error}.");
+            return null;
         }
 
-        return handle;
+        if (bytesReturned < 12)
+        {
+            return null;
+        }
+
+        var returnedReference = BinaryPrimitives.ReadUInt64LittleEndian(output.AsSpan(0, 8));
+        var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(output.AsSpan(8, 4));
+
+        // The FSCTL can return the first record at or below the requested reference.
+        // Recovery must have the exact reference; never accept a neighbouring/reused record.
+        if (returnedReference != fileReferenceNumber ||
+            recordLength < 24 ||
+            recordLength > output.Length - 12 ||
+            12 + recordLength > bytesReturned)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS FSCTL_GET_NTFS_FILE_RECORD returned ref={returnedReference}, " +
+                $"length={recordLength} for requested ref={fileReferenceNumber}.");
+            return null;
+        }
+
+        var record = new byte[recordLength];
+        Buffer.BlockCopy(output, 12, record, 0, (int)recordLength);
+
+        if (record.Length < 8 ||
+            record[0] != (byte)'F' ||
+            record[1] != (byte)'I' ||
+            record[2] != (byte)'L' ||
+            record[3] != (byte)'E')
+        {
+            return null;
+        }
+
+        return record;
     }
 
     private static SafeFileHandle CreateVolumeHandle(
@@ -1349,7 +1350,18 @@ public sealed class NtfsMftDataReader
         }
     }
 
-    [DllImport("kernel32.dll", SetLastError = true)]
+        [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle hDevice,
+        uint dwIoControlCode,
+        byte[]? lpInBuffer,
+        uint nInBufferSize,
+        byte[]? lpOutBuffer,
+        uint nOutBufferSize,
+        out uint lpBytesReturned,
+        IntPtr lpOverlapped);
+
+[DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool ReadFile(
         SafeFileHandle hFile,
         IntPtr lpBuffer,
