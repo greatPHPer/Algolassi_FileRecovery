@@ -877,9 +877,18 @@ public sealed class UsnJournalMonitor : IDisposable
             return false;
         }
 
+        var timestampDeltaMinutes = deletedAtUtc == default
+            ? 0
+            : Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes);
+
         if (deletedAtUtc != default &&
-            Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes) > 5)
+            timestampDeltaMinutes > 5)
         {
+            System.Diagnostics.Debug.WriteLine(
+                $"USN delete rejected by timestamp: name={record.FileName}, " +
+                $"usnTime={record.TimestampUtc:O}, historyTime={deletedAtUtc:O}, " +
+                $"deltaMinutes={timestampDeltaMinutes:0.###}, " +
+                $"target={normalizedTarget}.");
             return false;
         }
 
@@ -900,13 +909,21 @@ public sealed class UsnJournalMonitor : IDisposable
             cache[record.ParentFileReferenceNumber] = directory;
         }
 
+        var targetFileName = Path.GetFileName(normalizedTarget);
+
         if (string.IsNullOrWhiteSpace(directory))
         {
+            System.Diagnostics.Debug.WriteLine(
+                $"USN delete parent path unavailable: name={record.FileName}, " +
+                $"parentRef={record.ParentFileReferenceNumber}, target={normalizedTarget}.");
+
             if (!string.Equals(
                     record.FileName,
-                    Path.GetFileName(normalizedTarget),
+                    targetFileName,
                     StringComparison.OrdinalIgnoreCase))
             {
+                System.Diagnostics.Debug.WriteLine(
+                    $"USN delete rejected by filename: record={record.FileName}, targetName={targetFileName}.");
                 return false;
             }
         }
@@ -915,10 +932,17 @@ public sealed class UsnJournalMonitor : IDisposable
             var candidatePath = NormalizePath(
                 Path.Combine(directory, record.FileName));
 
-            if (!string.Equals(
-                    candidatePath,
-                    normalizedTarget,
-                    StringComparison.OrdinalIgnoreCase))
+            var pathMatches = string.Equals(
+                candidatePath,
+                normalizedTarget,
+                StringComparison.OrdinalIgnoreCase);
+
+            System.Diagnostics.Debug.WriteLine(
+                $"USN delete candidate: name={record.FileName}, parentRef={record.ParentFileReferenceNumber}, " +
+                $"directory={directory}, candidate={candidatePath}, target={normalizedTarget}, " +
+                $"timestampDeltaMinutes={timestampDeltaMinutes:0.###}, pathMatches={pathMatches}.");
+
+            if (!pathMatches)
             {
                 return false;
             }
