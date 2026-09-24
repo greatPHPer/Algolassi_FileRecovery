@@ -742,7 +742,7 @@ public sealed class NtfsDeepFileRecoveryService
 
     [System.Runtime.InteropServices.DllImport(
         "kernel32.dll",
-        CharSet = CharSet.Unicode,
+        CharSet = System.Runtime.InteropServices.CharSet.Unicode,
         SetLastError = true)]
     private static extern SafeFileHandle CreateFile(
         string lpFileName,
