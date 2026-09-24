@@ -479,6 +479,11 @@ public partial class Form1 : Form
                     .ToList();
             }
 
+            var recentLiveUsnDeletes = _usnMonitor.GetRecentDeletedFiles(
+                scanDirectory,
+                includeSubdirectories,
+                TimeSpan.FromMinutes(15));
+
             var rootPath = Path.GetPathRoot(scanDirectory)!;
 
             var targetRecords = deletedRecords
@@ -494,6 +499,24 @@ public partial class Form1 : Form
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             var mergedLiveHistoryCount = 0;
+            var mergedLiveUsnCount = 0;
+
+            foreach (var record in recentLiveUsnDeletes)
+            {
+                var normalizedPath = NormalizePath(record.FullPath);
+                if (!targetPaths.Add(normalizedPath))
+                {
+                    continue;
+                }
+
+                targetRecords.Add((
+                    record.FullPath,
+                    record.FileReferenceNumber,
+                    record.ParentFileReferenceNumber,
+                    record.DeletedAtUtc));
+
+                mergedLiveUsnCount++;
+            }
 
             foreach (var record in recentHistoryRecords)
             {
@@ -518,10 +541,17 @@ public partial class Form1 : Form
                 mergedLiveHistoryCount++;
             }
 
-            if (mergedLiveHistoryCount > 0)
+            if (mergedLiveHistoryCount > 0 || mergedLiveUsnCount > 0)
             {
                 System.Diagnostics.Debug.WriteLine(
-                    $"NTFS scan merged {mergedLiveHistoryCount:N0} recent monitored deletion(s) from history.");
+                    $"NTFS scan merged live deletions: usnCache={mergedLiveUsnCount:N0}, " +
+                    $"history={mergedLiveHistoryCount:N0}.");
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS scan live-delete merge: usnCache={recentLiveUsnDeletes.Count:N0}, " +
+                    $"recentHistoryCandidates={recentHistoryRecords.Count:N0}, none merged.");
             }
 
             var candidates = _mftCandidateScanner.ScanForFileReferences(
@@ -644,9 +674,9 @@ public partial class Form1 : Form
             lblFiles.Text = $"NTFS candidates ({filtered.Count:N0})";
             lblStatus.Text = filtered.Count == 0
                 ? $"No deleted-file metadata candidates were found under {scanDirectory}."
-                : mergedLiveHistoryCount > 0
+                : mergedLiveHistoryCount > 0 || mergedLiveUsnCount > 0
                     ? $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}; " +
-                      $"{mergedLiveHistoryCount:N0} recent live deletion(s) were included from monitored history."
+                      $"{mergedLiveUsnCount + mergedLiveHistoryCount:N0} recent live deletion(s) were included."
                     : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}.";
         }
         catch (UnauthorizedAccessException)
