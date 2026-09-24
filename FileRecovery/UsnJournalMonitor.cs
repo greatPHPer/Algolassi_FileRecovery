@@ -900,6 +900,246 @@ public sealed class UsnJournalMonitor : IDisposable
         return false;
     }
 
+    public bool TryResolveHistoricalDeletionFromJournal(
+        string fullPath,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        var matches = ResolveHistoricalDeletionsFromJournal(
+            [(fullPath, deletedAtUtc)],
+            CancellationToken.None);
+
+        var match = matches.FirstOrDefault();
+        if (match is null)
+        {
+            return false;
+        }
+
+        fileReferenceNumber = match.FileReferenceNumber;
+        parentFileReferenceNumber = match.ParentFileReferenceNumber;
+        return true;
+    }
+
+    public IReadOnlyList<HistoricalUsnResolution> ResolveHistoricalDeletionsFromJournal(
+        IReadOnlyCollection<(string FullPath, DateTime DeletedAtUtc)> targets,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+
+        if (targets.Count == 0 || !IsAdministrator())
+        {
+            return [];
+        }
+
+        WindowsPrivilege.EnableSeBackupPrivilege();
+
+        var normalizedTargets = targets
+            .Where(target => !string.IsNullOrWhiteSpace(target.FullPath))
+            .Select(target => (
+                FullPath: NormalizePath(Path.GetFullPath(target.FullPath)),
+                FileName: Path.GetFileName(NormalizePath(target.FullPath)),
+                DeletedAtUtc: target.DeletedAtUtc))
+            .Where(target => !string.IsNullOrWhiteSpace(target.FileName))
+            .GroupBy(target => target.FullPath, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group
+                .OrderByDescending(target => target.DeletedAtUtc)
+                .First())
+            .ToList();
+
+        if (normalizedTargets.Count == 0)
+        {
+            return [];
+        }
+
+        var results = new List<HistoricalUsnResolution>();
+
+        foreach (var volumeGroup in normalizedTargets.GroupBy(
+                     target => Path.GetPathRoot(target.FullPath),
+                     StringComparer.OrdinalIgnoreCase))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var root = volumeGroup.Key;
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                continue;
+            }
+
+            try
+            {
+                if (!string.Equals(
+                        new DriveInfo(root).DriveFormat,
+                        "NTFS",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+            }
+            catch
+            {
+                continue;
+            }
+
+            var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+
+            using var volumeHandle = CreateFile(
+                $@"\\.\{volumeKey[..2]}",
+                GenericRead,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics,
+                IntPtr.Zero);
+
+            if (volumeHandle.IsInvalid ||
+                !TryQueryJournal(volumeHandle, out var journal, out var queryError))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"Historical USN lookup unavailable: volume={volumeKey}, error={queryError}.");
+                continue;
+            }
+
+            var pendingByName = volumeGroup
+                .GroupBy(
+                    target => target.FileName,
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.ToList(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            var remainingTargets = pendingByName.Values.Sum(list => list.Count);
+            var nextUsn = journal.FirstUsn;
+            var batchesRead = 0;
+
+            System.Diagnostics.Debug.WriteLine(
+                $"Historical USN lookup: volume={volumeKey}, targets={remainingTargets:N0}, " +
+                $"firstUsn={journal.FirstUsn}, nextUsn={journal.NextUsn}.");
+
+            while (remainingTargets > 0 &&
+                   nextUsn < journal.NextUsn)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var records = ReadRecords(
+                    volumeHandle,
+                    journal.JournalId,
+                    nextUsn,
+                    out var returnedNextUsn);
+
+                batchesRead++;
+
+                if (returnedNextUsn <= nextUsn)
+                {
+                    break;
+                }
+
+                foreach (var record in records)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                        (record.FileAttributes & FileAttributeDirectory) != 0 ||
+                        string.IsNullOrWhiteSpace(record.FileName) ||
+                        !pendingByName.TryGetValue(record.FileName, out var nameTargets))
+                    {
+                        continue;
+                    }
+
+                    var targetMatches = nameTargets
+                        .Where(target =>
+                            target.DeletedAtUtc == default ||
+                            Math.Abs((record.TimestampUtc - target.DeletedAtUtc).TotalMinutes) <= 5)
+                        .ToList();
+
+                    if (targetMatches.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var directory = ResolveParentDirectory(
+                        volumeHandle,
+                        record.ParentFileReferenceNumber);
+
+                    if (string.IsNullOrWhiteSpace(directory))
+                    {
+                        continue;
+                    }
+
+                    var candidatePath = NormalizePath(
+                        Path.Combine(directory, record.FileName));
+
+                    var matchedTarget = targetMatches
+                        .Select(target => new
+                        {
+                            Target = target,
+                            DeltaMinutes = target.DeletedAtUtc == default
+                                ? 0
+                                : Math.Abs((record.TimestampUtc - target.DeletedAtUtc).TotalMinutes)
+                        })
+                        .Where(item =>
+                            string.Equals(
+                                item.Target.FullPath,
+                                candidatePath,
+                                StringComparison.OrdinalIgnoreCase))
+                        .OrderBy(item => item.DeltaMinutes)
+                        .Select(item => item.Target)
+                        .FirstOrDefault();
+
+                    if (matchedTarget is null)
+                    {
+                        continue;
+                    }
+
+                    results.Add(
+                        new HistoricalUsnResolution(
+                            matchedTarget.FullPath,
+                            record.FileReferenceNumber,
+                            record.ParentFileReferenceNumber,
+                            record.TimestampUtc));
+
+                    nameTargets.Remove(matchedTarget);
+
+                    if (nameTargets.Count == 0)
+                    {
+                        pendingByName.Remove(record.FileName);
+                    }
+
+                    remainingTargets--;
+
+                    _parentPathCaches.GetOrAdd(
+                        volumeKey,
+                        _ => new ConcurrentDictionary<ulong, string>())
+                        [record.ParentFileReferenceNumber] = directory;
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"Historical USN match: target={matchedTarget.FullPath}, " +
+                        $"fileRef={record.FileReferenceNumber}, " +
+                        $"parentRef={record.ParentFileReferenceNumber}, " +
+                        $"deleteTime={record.TimestampUtc:O}.");
+
+                    if (remainingTargets == 0)
+                    {
+                        break;
+                    }
+                }
+
+                nextUsn = returnedNextUsn;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"Historical USN lookup complete: volume={volumeKey}, " +
+                $"resolved={volumeGroup.Count() - remainingTargets:N0}, " +
+                $"unresolved={remainingTargets:N0}, batches={batchesRead:N0}.");
+        }
+
+        return results;
+    }
+
     public IReadOnlyList<UsnDeletedFileRecord> GetRecentDeletedFiles(
         string targetDirectory,
         bool includeSubdirectories,
@@ -1702,6 +1942,12 @@ public sealed record UsnDeletedFileRecord(
     ulong ParentFileReferenceNumber,
     string FileName,
     string DirectoryPath,
+    DateTime DeletedAtUtc);
+
+public sealed record HistoricalUsnResolution(
+    string FullPath,
+    ulong FileReferenceNumber,
+    ulong ParentFileReferenceNumber,
     DateTime DeletedAtUtc);
 
     private readonly record struct JournalInfo(
