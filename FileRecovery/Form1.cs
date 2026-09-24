@@ -833,7 +833,25 @@ public partial class Form1 : Form
             // carving can be attempted for formats such as plain text.
             foreach (var candidate in candidates.Where(candidate => candidate.FileSizeBytes <= 0))
             {
-                var sizeMatch = historyRecords
+                // Prefer the exact historical MFT file reference because the current
+                // candidate path can differ in formatting (for example, \\?\\ prefixes)
+                // or can point at a reused MFT record whose current name/path is no
+                // longer the deleted file's original path. Fall back to the canonical
+                // path match only when no exact historical reference match is available.
+                var referenceMatch = candidate.FileReferenceNumber != 0
+                    ? historyRecords
+                        .Where(record =>
+                            record.FileReferenceNumber.HasValue &&
+                            record.FileReferenceNumber.Value == candidate.FileReferenceNumber &&
+                            record.FileSizeBytes.HasValue)
+                        .OrderBy(record =>
+                            Math.Abs(
+                                (record.DeletedAtUtc - candidate.LastUsnTimestampUtc)
+                                    .TotalMinutes))
+                        .FirstOrDefault()
+                    : null;
+
+                var sizeMatch = referenceMatch ?? historyRecords
                     .Where(record =>
                         record.FileSizeBytes.HasValue &&
                         string.Equals(
@@ -855,8 +873,13 @@ public partial class Form1 : Form
                 {
                     candidate.FileSizeBytes = knownSize;
 
+                    var matchKind = referenceMatch is not null
+                        ? "file-reference"
+                        : "path";
+
                     System.Diagnostics.Debug.WriteLine(
-                        $"NTFS candidate size enrichment: path={candidate.FullPath}, " +
+                        $"NTFS candidate size enrichment: match={matchKind}, " +
+                        $"path={candidate.FullPath}, fileRef={candidate.FileReferenceNumber}, " +
                         $"size={knownSize:N0} bytes.");
                 }
             }
