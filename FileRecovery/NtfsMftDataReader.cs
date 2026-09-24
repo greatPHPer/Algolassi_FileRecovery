@@ -513,7 +513,15 @@ public sealed class NtfsMftDataReader
                 volumeInfo.RootPath,
                 overlapped: false);
 
-            var normalizedDirectory = Path.GetFullPath(scanDirectory)
+            var normalizedDirectory = scanDirectory.Trim();
+
+            while (normalizedDirectory.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+                   normalizedDirectory.StartsWith(@"\\.\", StringComparison.Ordinal))
+            {
+                normalizedDirectory = normalizedDirectory[4..];
+            }
+
+            normalizedDirectory = Path.GetFullPath(normalizedDirectory)
                 .TrimEnd(Path.DirectorySeparatorChar);
             var extension = expectedExtension ?? string.Empty;
 
