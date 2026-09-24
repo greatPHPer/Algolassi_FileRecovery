@@ -995,8 +995,9 @@ public sealed class UsnJournalMonitor : IDisposable
                 FileFlagBackupSemantics,
                 IntPtr.Zero);
 
+            var queryError = 0;
             if (volumeHandle.IsInvalid ||
-                !TryQueryJournal(volumeHandle, out var journal, out var queryError))
+                !TryQueryJournal(volumeHandle, out var journal, out queryError))
             {
                 System.Diagnostics.Debug.WriteLine(
                     $"Historical USN lookup unavailable: volume={volumeKey}, error={queryError}.");
@@ -1090,7 +1091,7 @@ public sealed class UsnJournalMonitor : IDisposable
                         .Select(item => item.Target)
                         .FirstOrDefault();
 
-                    if (matchedTarget is null)
+                    if (string.IsNullOrWhiteSpace(matchedTarget.FullPath))
                     {
                         continue;
                     }
