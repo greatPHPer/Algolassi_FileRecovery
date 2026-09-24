@@ -34,18 +34,30 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 nameof(marker));
         }
 
-        var markerBytes = System.Text.Encoding.UTF8.GetBytes(marker);
-        if (markerBytes.Length < 4)
+        var markerVariants = new[]
+        {
+            (
+                Encoding: "UTF-8",
+                Bytes: System.Text.Encoding.UTF8.GetBytes(marker)),
+            (
+                Encoding: "UTF-16LE",
+                Bytes: System.Text.Encoding.Unicode.GetBytes(marker)),
+            (
+                Encoding: "UTF-16BE",
+                Bytes: System.Text.Encoding.BigEndianUnicode.GetBytes(marker))
+        };
+
+        if (markerVariants.Any(item => item.Bytes.Length < 4))
         {
             throw new ArgumentException(
-                "The text marker must contain at least 4 UTF-8 bytes.",
+                "The text marker must contain at least 4 bytes in the supported encodings.",
                 nameof(marker));
         }
 
-        if (markerBytes.Length > MaxMarkerBytes)
+        if (markerVariants.Any(item => item.Bytes.Length > MaxMarkerBytes))
         {
             throw new ArgumentException(
-                $"The text marker cannot exceed {MaxMarkerBytes:N0} UTF-8 bytes.",
+                $"The text marker cannot exceed {MaxMarkerBytes:N0} bytes in the supported encodings.",
                 nameof(marker));
         }
 
@@ -85,7 +97,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
 
         using var volumeHandle = CreateVolumeHandle(sourceRoot);
 
-        var overlapLength = markerBytes.Length - 1;
+        var overlapLength = markerVariants.Max(item => item.Bytes.Length) - 1;
         var previousTail = Array.Empty<byte>();
         long scannedBytes = 0;
         long lastReportedBytes = 0;
@@ -94,7 +106,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
 
         System.Diagnostics.Debug.WriteLine(
             $"NTFS whole-volume target scan started: candidate={candidate.FullPath}, " +
-            $"markerBytes={markerBytes.Length:N0}, volumeBytes={totalVolumeBytes:N0}.");
+            $"markerEncodings=UTF-8/UTF-16LE/UTF-16BE, volumeBytes={totalVolumeBytes:N0}.");
 
         while (scannedBytes < totalVolumeBytes)
         {
@@ -188,7 +200,24 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 previousTail.Length,
                 bytesRead);
 
-            var markerOffsetInWindow = window.AsSpan().IndexOf(markerBytes);
+            (string Encoding, byte[] Bytes)? matchedMarker = null;
+            var markerOffsetInWindow = -1;
+
+            foreach (var markerVariant in markerVariants)
+            {
+                var candidateOffset = window.AsSpan().IndexOf(markerVariant.Bytes);
+                if (candidateOffset < 0)
+                {
+                    continue;
+                }
+
+                if (markerOffsetInWindow < 0 || candidateOffset < markerOffsetInWindow)
+                {
+                    markerOffsetInWindow = candidateOffset;
+                    matchedMarker = markerVariant;
+                }
+            }
+
             scannedBytes = checked(scannedBytes + bytesRead);
 
             if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
@@ -198,7 +227,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 progress?.Report(scannedBytes);
             }
 
-            if (markerOffsetInWindow >= 0)
+            if (matchedMarker.HasValue && markerOffsetInWindow >= 0)
             {
                 var absoluteMarkerOffset = checked(
                     physicalOffset -
@@ -211,7 +240,8 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     sourceRoot,
                     volumeInfo,
                     volumeHandle,
-                    markerBytes,
+                    matchedMarker.Value.Bytes,
+                    matchedMarker.Value.Encoding,
                     absoluteMarkerOffset,
                     totalVolumeBytes,
                     cancellationToken);
@@ -219,6 +249,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 System.Diagnostics.Debug.WriteLine(
                     $"NTFS whole-volume target scan hit: " +
                     $"candidate={candidate.FullPath}, " +
+                    $"encoding={matchedMarker.Value.Encoding}, " +
                     $"markerOffset={absoluteMarkerOffset:N0}, " +
                     $"scanned={scannedBytes:N0}.");
 
@@ -249,6 +280,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         NtfsVolumeInfo volumeInfo,
         SafeFileHandle volumeHandle,
         byte[] markerBytes,
+        string markerEncoding,
         long markerOffset,
         long totalVolumeBytes,
         CancellationToken cancellationToken)
@@ -373,7 +405,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             BytesRecovered = data.Length,
             Evidence =
                 $"Whole-volume forensic text scan found the supplied marker at byte " +
-                $"{markerOffset:N0} and recovered {data.Length:N0} contiguous text byte(s). " +
+                $"{markerOffset:N0} using {markerEncoding} and recovered {data.Length:N0} contiguous text byte(s). " +
                 allocationDescription
         };
     }
