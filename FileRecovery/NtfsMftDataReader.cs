@@ -863,11 +863,6 @@ public sealed class NtfsMftDataReader
 
         foreach (var extent in extents.OrderBy(x => x.VirtualClusterNumber))
         {
-            if (extent.IsSparse)
-            {
-                continue;
-            }
-
             var extentStart = checked(
                 extent.VirtualClusterNumber * (long)bytesPerCluster);
             var extentLength = checked(
@@ -881,28 +876,46 @@ public sealed class NtfsMftDataReader
             }
 
             var withinExtent = logicalOffset - extentStart;
-            var physicalOffset = checked(
-                extent.LogicalClusterNumber * (long)bytesPerCluster +
-                withinExtent);
-
             var bytesAvailable = checked(extentEnd - logicalOffset);
             var bytesToRead = (int)Math.Min(
                 (long)remaining,
                 bytesAvailable);
 
-            var temp = new byte[bytesToRead];
+            if (bytesToRead <= 0)
+            {
+                continue;
+            }
 
-            ReadRawExact(
-                volumeHandle,
-                physicalOffset,
-                temp);
+            if (extent.IsSparse)
+            {
+                // A sparse MFT run represents zero-filled logical bytes. We still
+                // need to advance the logical offset so a later physical extent can
+                // be reached instead of terminating the sequential MFT scan.
+                Array.Clear(
+                    destination,
+                    destinationOffset,
+                    bytesToRead);
+            }
+            else
+            {
+                var physicalOffset = checked(
+                    extent.LogicalClusterNumber * (long)bytesPerCluster +
+                    withinExtent);
 
-            Buffer.BlockCopy(
-                temp,
-                0,
-                destination,
-                destinationOffset,
-                bytesToRead);
+                var temp = new byte[bytesToRead];
+
+                ReadRawExact(
+                    volumeHandle,
+                    physicalOffset,
+                    temp);
+
+                Buffer.BlockCopy(
+                    temp,
+                    0,
+                    destination,
+                    destinationOffset,
+                    bytesToRead);
+            }
 
             destinationOffset += bytesToRead;
             remaining -= bytesToRead;
