@@ -343,7 +343,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         var volumeName = root.TrimEnd(Path.DirectorySeparatorChar);
 
         var handle = CreateFile(
-            $@"\\.{volumeName[..2]}",
+            $@"\\.\{volumeName[..2]}",
             GenericRead,
             FileShareRead | FileShareWrite | FileShareDelete,
             IntPtr.Zero,
