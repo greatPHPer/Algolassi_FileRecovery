@@ -394,12 +394,12 @@ public partial class Form1 : Form
                         $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
                 });
 
-            var result = await Task.Run(
-                () => _ntfsWholeVolumeTextRecoveryService.FindMarkerOnVolume(
+            var result =
+                _ntfsWholeVolumeTextRecoveryService.FindMarkerOnVolume(
                     dialog.FileName,
                     marker,
                     CancellationToken.None,
-                    progress));
+                    progress);
 
             if (result.Found)
             {
