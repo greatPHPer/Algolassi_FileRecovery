@@ -289,7 +289,9 @@ public sealed class MftCandidateScanner
                     var data = dataReader.ReadDefaultDataStream(
                         volumeInfo,
                         volumeHandle,
-                        fileReferenceNumber);
+                        fileReferenceNumber,
+                        entry.Name,
+                        entry.ParentFileReferenceNumber);
 
                     // Current cluster allocation is validated immediately before
                     // bytes are recovered. Doing that expensive bitmap scan here
@@ -632,7 +634,9 @@ public sealed class MftCandidateScanner
                         var data = dataReader.ReadDefaultDataStream(
                             volumeInfo,
                             volumeHandle,
-                            fileReference);
+                            fileReference,
+                            name,
+                            parentReference);
 
                         IReadOnlyList<NtfsExtentAllocation> allocations = [];
                         string allocationEvidence = string.Empty;
