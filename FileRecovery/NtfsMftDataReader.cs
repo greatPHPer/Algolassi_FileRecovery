@@ -64,26 +64,25 @@ public sealed class NtfsMftDataReader
             !string.IsNullOrWhiteSpace(expectedFileName) &&
             expectedParentFileReferenceNumber.HasValue)
         {
-            // A very recent deletion can race the MFT sequence bookkeeping. The
-            // USN record already supplied the exact segment; retry that segment
-            // without requiring the old sequence number, but only accept it when
-            // the retained $FILE_NAME still identifies the expected parent/name.
-            var relaxedRecord = ReadRecord(
+            // A very recent deletion can race the MFT sequence bookkeeping.
+            // The USN record already supplied the exact segment; retry that segment
+            // without strict sequence/base checks, but only accept it when the
+            // retained $FILE_NAME still identifies the expected parent/name.
+            var relaxedRecord = ReadRawRecord(
                 volumeHandle,
                 volumeInfo,
-                segmentNumber,
-                expectedSequenceNumber: 0,
-                expectedBaseFileReference: 0);
+                segmentNumber);
 
             if (relaxedRecord is not null &&
                 HasMatchingFileNameEntry(
                     relaxedRecord,
                     expectedFileName,
-                    expectedParentFileReferenceNumber.Value))
+                    expectedParentFileReferenceNumber.Value,
+                    expectedSequenceNumber: sequenceNumber))
             {
                 System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $DATA lookup: accepted sequence-relaxed MFT record " +
-                    $"for fileRef={fileReferenceNumber}, segment={segmentNumber}.");
+                    $"NTFS $DATA lookup: accepted raw MFT record for " +
+                    $"fileRef={fileReferenceNumber}, segment={segmentNumber}.");
                 record = relaxedRecord;
             }
         }
@@ -487,6 +486,8 @@ public sealed class NtfsMftDataReader
     {
         if (descriptors.Count == 0)
         {
+            System.Diagnostics.Debug.WriteLine(
+                "NTFS $DATA lookup: BuildDataStream received zero unnamed $DATA descriptors.");
             return NotFound("No unnamed $DATA attribute was retained in the base or extension MFT records.");
         }
 
@@ -622,19 +623,67 @@ public sealed class NtfsMftDataReader
         }
     }
 
+    private static byte[]? ReadRawRecord(
+        SafeFileHandle volumeHandle,
+        NtfsVolumeInfo volumeInfo,
+        ulong segmentNumber)
+    {
+        var relativeOffset = checked(
+            checked((long)segmentNumber) * volumeInfo.BytesPerFileRecordSegment);
+
+        if (relativeOffset < 0 ||
+            relativeOffset + volumeInfo.BytesPerFileRecordSegment > volumeInfo.MftValidDataLength)
+        {
+            return null;
+        }
+
+        var mftStartOffset = checked(
+            volumeInfo.MftStartLcn * (long)volumeInfo.BytesPerCluster);
+
+        var record = new byte[checked((int)volumeInfo.BytesPerFileRecordSegment)];
+        ReadAt(
+            volumeHandle,
+            checked(mftStartOffset + relativeOffset),
+            record);
+
+        if (record.Length < 48 ||
+            record[0] != (byte)'F' ||
+            record[1] != (byte)'I' ||
+            record[2] != (byte)'L' ||
+            record[3] != (byte)'E')
+        {
+            return null;
+        }
+
+        ApplyUpdateSequenceFixups(
+            record,
+            checked((int)volumeInfo.BytesPerSector));
+
+        return record;
+    }
+
     private static bool HasMatchingFileNameEntry(
         byte[] record,
         string expectedFileName,
-        ulong expectedParentFileReferenceNumber)
+        ulong expectedParentFileReferenceNumber,
+        ushort expectedSequenceNumber = 0)
     {
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(
             record.AsSpan(22, 2));
+        var actualSequenceNumber = BinaryPrimitives.ReadUInt16LittleEndian(
+            record.AsSpan(16, 2));
 
-        // Only accept the sequence-relaxed record when it is still a deleted
-        // file record. A live record with the same parent/name is not valid
-        // evidence for recovering the older deletion.
-        if ((flags & 0x0001) != 0 ||
-            (flags & 0x0002) != 0)
+        // If the current MFT sequence still equals the USN sequence, an IN_USE
+        // flag can reflect a just-finished delete transaction. If the sequence
+        // has changed, only a deleted record is safe to consider.
+        if (expectedSequenceNumber != 0 &&
+            actualSequenceNumber != expectedSequenceNumber &&
+            (flags & 0x0001) != 0)
+        {
+            return false;
+        }
+
+        if ((flags & 0x0002) != 0)
         {
             return false;
         }
