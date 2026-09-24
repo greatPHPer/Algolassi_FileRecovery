@@ -1080,6 +1080,9 @@ public sealed class NtfsMftDataReader
         return false;
     }
 
+    private static string NormalizePath(string path) =>
+        path.Trim().Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+
     private static byte[]? ReadMftRecordDirect(
         SafeFileHandle mftHandle,
         NtfsVolumeInfo volumeInfo,
