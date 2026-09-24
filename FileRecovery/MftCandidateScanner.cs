@@ -58,11 +58,11 @@ public sealed class MftCandidateScanner
 
         return ScanInternal(
             rootPath,
-            normalizedTargets,
+            targetPaths: normalizedTargets,
             targetDirectory: null,
             includeSubdirectories: false,
-            cancellationToken,
-            maxPages);
+            cancellationToken: cancellationToken,
+            maxPages: maxPages);
     }
 
     public IReadOnlyList<RecoveryCandidate> ScanDeletedDirectory(
