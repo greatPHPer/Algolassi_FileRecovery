@@ -273,6 +273,174 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             $"{scannedBytes:N0} byte(s) of the NTFS volume.");
     }
 
+    public (bool Found, long Offset, string? Encoding, long ScannedBytes) FindMarkerOnVolume(
+        string sourcePath,
+        string marker,
+        CancellationToken cancellationToken = default,
+        IProgress<long>? progress = null)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath))
+        {
+            throw new ArgumentException("A source path is required.", nameof(sourcePath));
+        }
+
+        if (string.IsNullOrWhiteSpace(marker))
+        {
+            throw new ArgumentException("A marker is required.", nameof(marker));
+        }
+
+        var markerVariants = new[]
+        {
+            (
+                Encoding: "UTF-8",
+                Bytes: System.Text.Encoding.UTF8.GetBytes(marker)),
+            (
+                Encoding: "UTF-16LE",
+                Bytes: System.Text.Encoding.Unicode.GetBytes(marker)),
+            (
+                Encoding: "UTF-16BE",
+                Bytes: System.Text.Encoding.BigEndianUnicode.GetBytes(marker))
+        };
+
+        var sourceRoot = GetNtfsVolumeRoot(sourcePath);
+        if (string.IsNullOrWhiteSpace(sourceRoot))
+        {
+            throw new InvalidOperationException(
+                "The source path is not on a valid Windows volume.");
+        }
+
+        WindowsPrivilege.EnableSeBackupPrivilege();
+
+        var volumeInfo = new NtfsVolumeInspector().Inspect(sourceRoot);
+        var totalVolumeBytes = checked(
+            volumeInfo.TotalClusters * (long)volumeInfo.BytesPerCluster);
+
+        using var volumeHandle = CreateVolumeHandle(sourceRoot);
+
+        var overlapLength = markerVariants.Max(item => item.Bytes.Length) - 1;
+        var previousTail = Array.Empty<byte>();
+        long scannedBytes = 0;
+        long lastReportedBytes = 0;
+
+        progress?.Report(0);
+
+        while (scannedBytes < totalVolumeBytes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var remaining = totalVolumeBytes - scannedBytes;
+            var bytesToRead = (int)Math.Min(IoBufferSize, remaining);
+            bytesToRead -= bytesToRead % checked((int)volumeInfo.BytesPerCluster);
+
+            if (bytesToRead < volumeInfo.BytesPerCluster)
+            {
+                break;
+            }
+
+            var physicalOffset = scannedBytes;
+            byte[]? buffer = null;
+            var attemptedBytes = bytesToRead;
+
+            while (attemptedBytes >= volumeInfo.BytesPerCluster)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                try
+                {
+                    buffer = new byte[attemptedBytes];
+                    ReadAt(
+                        volumeHandle,
+                        physicalOffset,
+                        buffer,
+                        cancellationToken);
+                    break;
+                }
+                catch (Win32Exception)
+                {
+                    attemptedBytes /= 2;
+                    attemptedBytes -=
+                        attemptedBytes % checked((int)volumeInfo.BytesPerCluster);
+                }
+            }
+
+            if (buffer is null)
+            {
+                scannedBytes = checked(
+                    scannedBytes + volumeInfo.BytesPerCluster);
+                previousTail = [];
+                continue;
+            }
+
+            var window = new byte[checked(previousTail.Length + buffer.Length)];
+
+            if (previousTail.Length > 0)
+            {
+                Buffer.BlockCopy(
+                    previousTail,
+                    0,
+                    window,
+                    0,
+                    previousTail.Length);
+            }
+
+            Buffer.BlockCopy(
+                buffer,
+                0,
+                window,
+                previousTail.Length,
+                buffer.Length);
+
+            foreach (var markerVariant in markerVariants)
+            {
+                var markerOffset = window.AsSpan().IndexOf(markerVariant.Bytes);
+                if (markerOffset < 0)
+                {
+                    continue;
+                }
+
+                var absoluteOffset = checked(
+                    physicalOffset -
+                    previousTail.Length +
+                    markerOffset);
+
+                scannedBytes = checked(scannedBytes + buffer.Length);
+                progress?.Report(scannedBytes);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS raw live marker diagnostic: " +
+                    $"source={sourcePath}, encoding={markerVariant.Encoding}, " +
+                    $"offset={absoluteOffset:N0}.");
+
+                return (
+                    true,
+                    absoluteOffset,
+                    markerVariant.Encoding,
+                    scannedBytes);
+            }
+
+            scannedBytes = checked(scannedBytes + buffer.Length);
+
+            if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
+                scannedBytes == totalVolumeBytes)
+            {
+                lastReportedBytes = scannedBytes;
+                progress?.Report(scannedBytes);
+            }
+
+            previousTail = buffer.Length <= overlapLength
+                ? buffer
+                : buffer.AsSpan(buffer.Length - overlapLength).ToArray();
+        }
+
+        progress?.Report(scannedBytes);
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS raw live marker diagnostic complete: " +
+            $"source={sourcePath}, scanned={scannedBytes:N0}, found=false.");
+
+        return (false, -1, null, scannedBytes);
+    }
+
     private static RecoveryResult RecoverTextRegionAroundMarker(
         RecoveryCandidate candidate,
         string destinationDirectory,
