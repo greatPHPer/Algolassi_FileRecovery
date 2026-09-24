@@ -942,6 +942,87 @@ public sealed class UsnJournalMonitor : IDisposable
         return true;
     }
 
+    private bool TryMatchEnumeratedRecord(
+        SafeFileHandle volumeHandle,
+        string volumeKey,
+        ulong recordFileReferenceNumber,
+        ulong recordParentFileReferenceNumber,
+        uint reason,
+        uint fileAttributes,
+        string fileName,
+        string normalizedTarget,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        // FSCTL_ENUM_USN_DATA is an MFT enumeration. Its returned USN record
+        // does not carry the change-journal Reason/TimeStamp fields, so this
+        // matcher must use identity/path data only.
+        if ((fileAttributes & FileAttributeDirectory) != 0 ||
+            string.IsNullOrWhiteSpace(fileName))
+        {
+            return false;
+        }
+
+        var cache = _parentPathCaches.GetOrAdd(
+            volumeKey,
+            _ => new ConcurrentDictionary<ulong, string>());
+
+        var directory = cache.TryGetValue(
+            recordParentFileReferenceNumber,
+            out var knownPath)
+            ? knownPath
+            : ResolveParentDirectory(
+                volumeHandle,
+                recordParentFileReferenceNumber);
+
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            cache[recordParentFileReferenceNumber] = directory;
+        }
+
+        var pathMatches = !string.IsNullOrWhiteSpace(directory) &&
+            string.Equals(
+                NormalizePath(Path.Combine(directory, fileName)),
+                normalizedTarget,
+                StringComparison.OrdinalIgnoreCase);
+
+        var fileNameMatches = string.Equals(
+            fileName,
+            Path.GetFileName(normalizedTarget),
+            StringComparison.OrdinalIgnoreCase);
+
+        if (!pathMatches && !fileNameMatches)
+        {
+            return false;
+        }
+
+        fileReferenceNumber = recordFileReferenceNumber;
+        parentFileReferenceNumber = recordParentFileReferenceNumber;
+
+        System.Diagnostics.Debug.WriteLine(
+            $"USN enum recovery match: name={fileName}, fileRef={recordFileReferenceNumber}, " +
+            $"parentRef={recordParentFileReferenceNumber}, reason=0x{reason:X8}, " +
+            $"pathMatched={pathMatches}.");
+
+        _recentDeletedRecords.Enqueue(
+            new RecentDeletedRecord(
+                fileReferenceNumber,
+                parentFileReferenceNumber,
+                fileName,
+                directory,
+                DateTime.UtcNow));
+
+        while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+               _recentDeletedRecords.TryDequeue(out _))
+        {
+        }
+
+        return true;
+    }
+
     private bool TryResolveRecentUsnEnumData(
         SafeFileHandle volumeHandle,
         string volumeKey,
@@ -1053,32 +1134,20 @@ public sealed class UsnJournalMonitor : IDisposable
 
                     if (nameOffset + nameLength <= recordSpan.Length)
                     {
-                        DateTime timestampUtc;
-
-                        try
-                        {
-                            timestampUtc = DateTime.FromFileTimeUtc(timestampFileTime);
-                        }
-                        catch
-                        {
-                            timestampUtc = DateTime.UtcNow;
-                        }
+                        _ = timestampFileTime;
 
                         var name = System.Text.Encoding.Unicode.GetString(
                             recordSpan.Slice(nameOffset, nameLength));
 
-                        if (TryMatchDeletedRecord(
+                        if (TryMatchEnumeratedRecord(
                                 volumeHandle,
                                 volumeKey,
-                                new UsnRecord(
-                                    recordFileReferenceNumber,
-                                    recordParentFileReferenceNumber,
-                                    reason,
-                                    fileAttributes,
-                                    name,
-                                    timestampUtc),
+                                recordFileReferenceNumber,
+                                recordParentFileReferenceNumber,
+                                reason,
+                                fileAttributes,
+                                name,
                                 normalizedTarget,
-                                deletedAtUtc,
                                 out fileReferenceNumber,
                                 out parentFileReferenceNumber))
                         {
