@@ -250,7 +250,7 @@ public sealed class NtfsMftDataReader
         return BuildDataStream(dataAttributes, Math.Max(1, dataAttributes.Count));
     }
 
-    private static List<DataAttributeDescriptor> FindUnnamedDataAttributes(private static List<DataAttributeDescriptor> FindUnnamedDataAttributes(
+    private static List<DataAttributeDescriptor> FindUnnamedDataAttributes(
         byte[] record,
         NtfsVolumeInfo volumeInfo)
     {
