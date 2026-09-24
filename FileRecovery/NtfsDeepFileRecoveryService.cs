@@ -51,7 +51,7 @@ public sealed class NtfsDeepFileRecoveryService
 
         WindowsPrivilege.EnableSeBackupPrivilege();
 
-        var sourceRoot = Path.GetPathRoot(candidate.FullPath);
+        var sourceRoot = GetNtfsVolumeRoot(candidate.FullPath);
         if (string.IsNullOrWhiteSpace(sourceRoot))
         {
             throw new InvalidOperationException(
@@ -1031,6 +1031,19 @@ public sealed class NtfsDeepFileRecoveryService
             bufferOffset += chunk;
             remaining -= chunk;
         }
+    }
+
+    private static string? GetNtfsVolumeRoot(string path)
+    {
+        var normalized = path.Trim();
+
+        while (normalized.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+               normalized.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalized = normalized[4..];
+        }
+
+        return Path.GetPathRoot(normalized);
     }
 
     private static SafeFileHandle CreateVolumeHandle(string root)
