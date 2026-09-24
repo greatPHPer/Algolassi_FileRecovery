@@ -567,14 +567,34 @@ public partial class Form1 : Form
             // while keeping the Recovery Center UI responsive.
             for (var attempt = 0; attempt < 10; attempt++)
             {
-                if (_usnMonitor.TryResolveRecentDeletedFileBounded(
-                        record.FullPath,
-                        record.DeletedAtUtc,
-                        out var fileReferenceNumber,
-                        out var parentFileReferenceNumber))
+                // TryResolveRecentDeletedFileBounded performs synchronous native
+                // NTFS journal/MFT enumeration. Keep that work off the WinForms
+                // UI thread; otherwise a slow OpenFileById/DeviceIoControl call
+                // can make the application appear deadlocked.
+                var resolution = await Task.Run(() =>
                 {
-                    record.FileReferenceNumber = fileReferenceNumber;
-                    record.ParentFileReferenceNumber = parentFileReferenceNumber;
+                    if (_usnMonitor.TryResolveRecentDeletedFileBounded(
+                            record.FullPath,
+                            record.DeletedAtUtc,
+                            out var fileReferenceNumber,
+                            out var parentFileReferenceNumber))
+                    {
+                        return (
+                            Success: true,
+                            FileReferenceNumber: fileReferenceNumber,
+                            ParentFileReferenceNumber: parentFileReferenceNumber);
+                    }
+
+                    return (
+                        Success: false,
+                        FileReferenceNumber: 0UL,
+                        ParentFileReferenceNumber: 0UL);
+                }).ConfigureAwait(true);
+
+                if (resolution.Success)
+                {
+                    record.FileReferenceNumber = resolution.FileReferenceNumber;
+                    record.ParentFileReferenceNumber = resolution.ParentFileReferenceNumber;
                     resolved.Add(record);
                     break;
                 }
