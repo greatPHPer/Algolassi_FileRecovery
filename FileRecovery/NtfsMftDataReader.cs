@@ -1,3 +1,4 @@
+using System.Text;
 using System.Buffers.Binary;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
@@ -24,6 +25,151 @@ public sealed class NtfsMftDataReader
     private const int RawReadBufferSize = 1024 * 1024;
 
     private IReadOnlyList<NtfsDataExtent>? _mftExtents;
+
+    public bool TryReadHistoricalFileNameSize(
+        string rootPath,
+        ulong fileReferenceNumber,
+        ulong expectedParentFileReferenceNumber,
+        string expectedFileName,
+        out long fileSizeBytes)
+    {
+        fileSizeBytes = 0;
+
+        if (string.IsNullOrWhiteSpace(rootPath) ||
+            fileReferenceNumber == 0 ||
+            string.IsNullOrWhiteSpace(expectedFileName))
+        {
+            return false;
+        }
+
+        var root = Path.GetPathRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return false;
+        }
+
+        try
+        {
+            WindowsPrivilege.EnableSeBackupPrivilege();
+
+            var volumeInfo = new NtfsVolumeInspector().Inspect(root);
+            using var rawMftVolumeHandle = CreateVolumeHandle(
+                volumeInfo.RootPath,
+                overlapped: true);
+
+            var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
+
+            // Do not use the historical sequence here. The purpose of this helper is
+            // to inspect remnants of the historical $FILE_NAME attribute after the
+            // segment has been reused. Acceptance still requires the historical
+            // filename and parent reference to match.
+            var record = ReadMftRecordByExtentMap(
+                rawMftVolumeHandle,
+                volumeInfo,
+                segmentNumber,
+                expectedSequenceNumber: 0,
+                expectedBaseFileReference: 0);
+
+            if (record is null)
+            {
+                return false;
+            }
+
+            var expectedNameBytes = Encoding.Unicode.GetBytes(expectedFileName);
+            if (expectedNameBytes.Length == 0)
+            {
+                return false;
+            }
+
+            const int fileNameValueParentOffset = 0;
+            const int fileNameValueAllocatedSizeOffset = 40;
+            const int fileNameValueRealSizeOffset = 48;
+            const int fileNameValueFlagsOffset = 56;
+            const int fileNameValueLengthOffset = 64;
+            const int fileNameValueNamespaceOffset = 65;
+            const int fileNameValueNameOffset = 66;
+
+            for (var nameOffset = 0;
+                 nameOffset + expectedNameBytes.Length <= record.Length;
+                 nameOffset += 2)
+            {
+                if (!record.AsSpan(
+                        nameOffset,
+                        expectedNameBytes.Length)
+                    .SequenceEqual(expectedNameBytes))
+                {
+                    continue;
+                }
+
+                var valueOffset = nameOffset - fileNameValueNameOffset;
+                if (valueOffset < 0 ||
+                    valueOffset + fileNameValueNameOffset > record.Length)
+                {
+                    continue;
+                }
+
+                var storedNameLength = record[valueOffset + fileNameValueLengthOffset];
+                var nameNamespace = record[valueOffset + fileNameValueNamespaceOffset];
+
+                if (storedNameLength != expectedFileName.Length ||
+                    nameNamespace > 3)
+                {
+                    continue;
+                }
+
+                var parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    record.AsSpan(
+                        valueOffset + fileNameValueParentOffset,
+                        sizeof(ulong)));
+
+                if (parentReference != expectedParentFileReferenceNumber)
+                {
+                    continue;
+                }
+
+                var allocatedSize = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(
+                        valueOffset + fileNameValueAllocatedSizeOffset,
+                        sizeof(long)));
+
+                var realSize = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(
+                        valueOffset + fileNameValueRealSizeOffset,
+                        sizeof(long)));
+
+                if (realSize < 0 ||
+                    allocatedSize < 0 ||
+                    realSize > allocatedSize ||
+                    realSize > MaxAttributeListBytes)
+                {
+                    continue;
+                }
+
+                var flags = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(
+                        valueOffset + fileNameValueFlagsOffset,
+                        sizeof(uint)));
+
+                fileSizeBytes = realSize;
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS historical $FILE_NAME size evidence: segment={segmentNumber}, " +
+                    $"fileName={expectedFileName}, parentRef={parentReference}, " +
+                    $"size={realSize:N0}, allocated={allocatedSize:N0}, " +
+                    $"namespace={nameNamespace}, flags=0x{flags:X8}.");
+
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS historical $FILE_NAME size lookup failed: " +
+                $"{ex.GetType().Name}: {ex.Message}");
+        }
+
+        return false;
+    }
 
     public NtfsDataStreamInfo ReadDefaultDataStream(
         NtfsVolumeInfo volumeInfo,
