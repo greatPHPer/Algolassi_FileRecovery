@@ -438,46 +438,49 @@ public partial class Form1 : Form
 
             // The background monitor can observe a deletion immediately while this
             // on-demand historical journal reconstruction can still miss that same
-            // event because parent-path resolution is timing-sensitive. Merge recent
-            // history records back into the NTFS target set so a deletion observed
-            // while AlgoLassi is running is also visible in the Scan NTFS results.
+            // event because parent-path resolution is timing-sensitive. First repair
+            // any history rows under the selected directory that still lack the exact
+            // NTFS references, then use the recent subset for live-evidence annotation.
             var recentHistoryCutoffUtc = DateTime.UtcNow.AddMinutes(-15);
-            var recentHistoryRecords = _history.GetRecent()
+            var historyRecords = _history.GetRecent()
                 .Where(record =>
-                    record.DeletedAtUtc >= recentHistoryCutoffUtc &&
                     IsDirectoryMatch(record.DirectoryPath, scanDirectory))
                 .OrderByDescending(record => record.DeletedAtUtc)
                 .ToList();
 
-            if (recentHistoryRecords.Count > 0)
+            var journalPaths = deletedRecords
+                .Select(record => NormalizePath(record.FullPath))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var historyNeedingResolution = historyRecords
+                .Where(record =>
+                    (!record.FileReferenceNumber.HasValue ||
+                     !record.ParentFileReferenceNumber.HasValue) &&
+                    !journalPaths.Contains(NormalizePath(record.FullPath)))
+                .ToList();
+
+            if (historyNeedingResolution.Count > 0)
             {
-                var journalPaths = deletedRecords
-                    .Select(record => NormalizePath(record.FullPath))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-                var historyNeedingResolution = recentHistoryRecords
-                    .Where(record =>
-                        (!record.FileReferenceNumber.HasValue ||
-                         !record.ParentFileReferenceNumber.HasValue) &&
-                        !journalPaths.Contains(NormalizePath(record.FullPath)))
-                    .ToList();
-
-                if (historyNeedingResolution.Count > 0)
-                {
-                    // Only resolve recent history rows that the full journal scan
-                    // missed. This keeps the live-evidence repair bounded instead
-                    // of repeatedly rescanning already-resolved history rows.
-                    await ResolveMissingNtfsReferencesAsync(historyNeedingResolution);
-                }
-
-                recentHistoryRecords = _history.GetRecent()
-                    .Where(record =>
-                        record.DeletedAtUtc >= recentHistoryCutoffUtc &&
-                        IsDirectoryMatch(record.DirectoryPath, scanDirectory) &&
-                        record.FileReferenceNumber.HasValue)
-                    .OrderByDescending(record => record.DeletedAtUtc)
-                    .ToList();
+                await ResolveMissingNtfsReferencesAsync(historyNeedingResolution);
             }
+
+            historyRecords = _history.GetRecent()
+                .Where(record =>
+                    IsDirectoryMatch(record.DirectoryPath, scanDirectory))
+                .OrderByDescending(record => record.DeletedAtUtc)
+                .ToList();
+
+            var recentHistoryRecords = historyRecords
+                .Where(record =>
+                    record.DeletedAtUtc >= recentHistoryCutoffUtc &&
+                    record.FileReferenceNumber.HasValue)
+                .ToList();
+
+            var historyRecordsWithReferences = historyRecords
+                .Where(record =>
+                    record.FileReferenceNumber.HasValue &&
+                    record.ParentFileReferenceNumber.HasValue)
+                .ToList();
 
             var recentLiveUsnDeletes = _usnMonitor.GetRecentDeletedFiles(
                 scanDirectory,
@@ -518,14 +521,8 @@ public partial class Form1 : Form
                 mergedLiveUsnCount++;
             }
 
-            foreach (var record in recentHistoryRecords)
+            foreach (var record in historyRecordsWithReferences)
             {
-                if (!record.FileReferenceNumber.HasValue ||
-                    !record.ParentFileReferenceNumber.HasValue)
-                {
-                    continue;
-                }
-
                 var normalizedPath = NormalizePath(record.FullPath);
                 if (!targetPaths.Add(normalizedPath))
                 {
@@ -534,8 +531,8 @@ public partial class Form1 : Form
 
                 targetRecords.Add((
                     record.FullPath,
-                    record.FileReferenceNumber.Value,
-                    record.ParentFileReferenceNumber.Value,
+                    record.FileReferenceNumber!.Value,
+                    record.ParentFileReferenceNumber!.Value,
                     record.DeletedAtUtc));
 
                 mergedLiveHistoryCount++;
@@ -544,14 +541,14 @@ public partial class Form1 : Form
             if (mergedLiveHistoryCount > 0 || mergedLiveUsnCount > 0)
             {
                 System.Diagnostics.Debug.WriteLine(
-                    $"NTFS scan merged live deletions: usnCache={mergedLiveUsnCount:N0}, " +
+                    $"NTFS scan merged deletion references: usnCache={mergedLiveUsnCount:N0}, " +
                     $"history={mergedLiveHistoryCount:N0}.");
             }
             else
             {
                 System.Diagnostics.Debug.WriteLine(
-                    $"NTFS scan live-delete merge: usnCache={recentLiveUsnDeletes.Count:N0}, " +
-                    $"recentHistoryCandidates={recentHistoryRecords.Count:N0}, none merged.");
+                    $"NTFS scan deletion-reference merge: usnCache={recentLiveUsnDeletes.Count:N0}, " +
+                    $"historyReferences={historyRecordsWithReferences.Count:N0}, none merged.");
             }
 
             var recentTargetRecordsByPath = recentHistoryRecords
