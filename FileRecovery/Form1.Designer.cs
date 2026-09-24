@@ -226,7 +226,6 @@ partial class Form1
         Controls.Add(btnClearHistory);
         Controls.Add(btnShowHistory);
         Controls.Add(btnScanDirectory);
-        Controls.Add(btnScanNtfs);
         Controls.Add(lstDirectories);
         Controls.Add(lblDirectories);
         Controls.Add(lblSubtitle);
