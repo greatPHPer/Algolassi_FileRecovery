@@ -436,6 +436,34 @@ public partial class Form1 : Form
                 includeSubdirectories,
                 CancellationToken.None);
 
+            // The background monitor can observe a deletion immediately while this
+            // on-demand historical journal reconstruction can still miss that same
+            // event because parent-path resolution is timing-sensitive. Merge recent
+            // history records back into the NTFS target set so a deletion observed
+            // while AlgoLassi is running is also visible in the Scan NTFS results.
+            var recentHistoryCutoffUtc = DateTime.UtcNow.AddMinutes(-15);
+            var recentHistoryRecords = _history.GetRecent()
+                .Where(record =>
+                    record.DeletedAtUtc >= recentHistoryCutoffUtc &&
+                    IsDirectoryMatch(record.DirectoryPath, scanDirectory))
+                .OrderByDescending(record => record.DeletedAtUtc)
+                .ToList();
+
+            if (recentHistoryRecords.Count > 0)
+            {
+                // Give the USN monitor a chance to finish enriching watcher-only
+                // history rows with their exact NTFS file references before scanning.
+                await ResolveMissingNtfsReferencesAsync(recentHistoryRecords);
+
+                recentHistoryRecords = _history.GetRecent()
+                    .Where(record =>
+                        record.DeletedAtUtc >= recentHistoryCutoffUtc &&
+                        IsDirectoryMatch(record.DirectoryPath, scanDirectory) &&
+                        record.FileReferenceNumber.HasValue)
+                    .OrderByDescending(record => record.DeletedAtUtc)
+                    .ToList();
+            }
+
             var rootPath = Path.GetPathRoot(scanDirectory)!;
 
             var targetRecords = deletedRecords
@@ -445,6 +473,41 @@ public partial class Form1 : Form
                     record.ParentFileReferenceNumber,
                     record.DeletedAtUtc))
                 .ToList();
+
+            var targetPaths = targetRecords
+                .Select(target => NormalizePath(target.FullPath))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var mergedLiveHistoryCount = 0;
+
+            foreach (var record in recentHistoryRecords)
+            {
+                if (!record.FileReferenceNumber.HasValue ||
+                    !record.ParentFileReferenceNumber.HasValue)
+                {
+                    continue;
+                }
+
+                var normalizedPath = NormalizePath(record.FullPath);
+                if (!targetPaths.Add(normalizedPath))
+                {
+                    continue;
+                }
+
+                targetRecords.Add((
+                    record.FullPath,
+                    record.FileReferenceNumber.Value,
+                    record.ParentFileReferenceNumber.Value,
+                    record.DeletedAtUtc));
+
+                mergedLiveHistoryCount++;
+            }
+
+            if (mergedLiveHistoryCount > 0)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS scan merged {mergedLiveHistoryCount:N0} recent monitored deletion(s) from history.");
+            }
 
             var candidates = _mftCandidateScanner.ScanForFileReferences(
                 rootPath,
@@ -502,17 +565,49 @@ public partial class Form1 : Form
                 }
             }
 
+            var liveHistoryByPath = recentHistoryRecords
+                .Where(record => record.FileReferenceNumber.HasValue)
+                .GroupBy(
+                    record => NormalizePath(record.FullPath),
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.First(),
+                    StringComparer.OrdinalIgnoreCase);
+
             var filtered = candidates
-                .Select(candidate => new RecoveryDisplayRow
+                .Select(candidate =>
                 {
-                    Name = candidate.Name,
-                    DeletedOn = candidate.LastUsnTimestampUtc.ToLocalTime().ToString("g"),
-                    FileSize = candidate.DataStreamFound
-                        ? FormatSize(candidate.FileSizeBytes)
-                        : "Unknown",
-                    RecoveryStrength = candidate.Strength.ToString(),
-                    Evidence = BuildCandidateEvidence(candidate),
-                    RecoveryCandidate = candidate
+                    liveHistoryByPath.TryGetValue(
+                        NormalizePath(candidate.FullPath),
+                        out var liveHistory);
+
+                    var evidence = BuildCandidateEvidence(candidate);
+
+                    if (liveHistory is not null)
+                    {
+                        evidence = string.Join(
+                            " ",
+                            new[]
+                            {
+                                evidence,
+                                "Live deletion history: AlgoLassi observed this deletion while the application was running."
+                            }.Where(text => !string.IsNullOrWhiteSpace(text)));
+                    }
+
+                    return new RecoveryDisplayRow
+                    {
+                        Name = candidate.Name,
+                        DeletedOn = candidate.LastUsnTimestampUtc.ToLocalTime().ToString("g"),
+                        FileSize = candidate.DataStreamFound
+                            ? FormatSize(candidate.FileSizeBytes)
+                            : liveHistory?.FileSizeBytes is long historySize
+                                ? FormatSize(historySize)
+                                : "Unknown",
+                        RecoveryStrength = candidate.Strength.ToString(),
+                        Evidence = evidence,
+                        RecoveryCandidate = candidate
+                    };
                 })
                 .ToList();
 
@@ -534,7 +629,10 @@ public partial class Form1 : Form
             lblFiles.Text = $"NTFS candidates ({filtered.Count:N0})";
             lblStatus.Text = filtered.Count == 0
                 ? $"No deleted-file metadata candidates were found under {scanDirectory}."
-                : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}.";
+                : mergedLiveHistoryCount > 0
+                    ? $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}; " +
+                      $"{mergedLiveHistoryCount:N0} recent live deletion(s) were included from monitored history."
+                    : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}.";
         }
         catch (UnauthorizedAccessException)
         {
