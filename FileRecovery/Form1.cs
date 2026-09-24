@@ -1856,11 +1856,14 @@ public partial class Form1 : Form
                     bytesScanned =>
                     {
                         var scannedMb = bytesScanned / (1024d * 1024d);
-                        var totalMb = maxDeepCarveBytes / (1024d * 1024d);
 
                         lblStatus.Text =
-                            $"Deep-scanning NTFS free space for {candidate.Name}... " +
-                            $"{scannedMb:0} / {totalMb:0} MB";
+                            maxDeepCarveBytes == long.MaxValue
+                                ? $"Deep-scanning all NTFS free space for {candidate.Name}... " +
+                                  $"{scannedMb:0} MB scanned"
+                                : $"Deep-scanning NTFS free space for {candidate.Name}... " +
+                                  $"{scannedMb:0} / " +
+                                  $"{maxDeepCarveBytes / (1024d * 1024d):0} MB";
                     });
 
                 carveProgress.Report(0);
