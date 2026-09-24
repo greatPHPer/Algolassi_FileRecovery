@@ -346,7 +346,7 @@ public sealed class MftCandidateScanner
                             matchingTarget = timeMatched.FullPath;
                             directoryPath = Path.GetDirectoryName(matchingTarget) ?? currentDirectoryPath;
                             matchingEvidence =
-                                "Retained deleted MFT record matched the historical USN MFT segment, parent context, and deletion-time window despite a stale file-reference sequence.";
+                                "Retained deleted MFT record matched the historical USN MFT segment, parent context, and a 5-minute FILE_NAME modification-time window around the USN deletion despite a stale file-reference sequence.";
                         }
                     }
 
@@ -411,7 +411,8 @@ public sealed class MftCandidateScanner
             $"Raw MFT fallback: scanned={scanned:N0} bytes, " +
             $"recordSize={recordSize:N0}, FILE signatures={fileSignatureCount:N0}, " +
             $"deletedRecords={deletedRecordCount:N0}, FILE_NAME entries={fileNameEntryCount:N0}, " +
-            $"targetNameMatches={targetNameMatchCount:N0}, results={results.Count:N0}.");
+            $"targetNameMatches={targetNameMatchCount:N0}, staleSegmentMatches={staleSegmentMatchCount:N0}, " +
+            $"staleTimestampMatches={staleTimestampMatchCount:N0}, results={results.Count:N0}.");
 
         if (results.Count == 0)
         {
