@@ -1928,7 +1928,7 @@ public partial class Form1 : Form
                             $"The original size of '{candidate.Name}' is unknown.\r\n\r\n" +
                             "Enter a unique text string that was definitely contained in this " +
                             "deleted file. AlgoLassi will search every byte of the source volume " +
-                            "for that exact UTF-8 marker before attempting broader carving.\\r\\n\\r\\n" +
+                            "for that exact UTF-8 marker before attempting broader carving.\r\n\r\n" +
                             "Leave this blank to skip the whole-volume forensic scan.",
                             "Full-volume forensic text scan",
                             "");
