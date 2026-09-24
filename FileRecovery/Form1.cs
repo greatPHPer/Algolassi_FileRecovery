@@ -436,16 +436,59 @@ public partial class Form1 : Form
                 includeSubdirectories,
                 CancellationToken.None);
 
+            var rootPath = Path.GetPathRoot(scanDirectory)!;
+
+            var targetRecords = deletedRecords
+                .Select(record => (
+                    record.FullPath,
+                    record.FileReferenceNumber,
+                    record.ParentFileReferenceNumber,
+                    record.DeletedAtUtc))
+                .ToList();
+
             var candidates = _mftCandidateScanner.ScanForFileReferences(
-                Path.GetPathRoot(scanDirectory)!,
-                deletedRecords
-                    .Select(record => (
-                        record.FullPath,
-                        record.FileReferenceNumber,
-                        record.ParentFileReferenceNumber,
-                        record.DeletedAtUtc))
-                    .ToList(),
-                CancellationToken.None);
+                rootPath,
+                targetRecords,
+                CancellationToken.None)
+                .ToList();
+
+            var missingDataPaths = candidates
+                .Where(candidate => !candidate.DataStreamFound)
+                .Select(candidate => candidate.FullPath)
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (missingDataPaths.Count > 0)
+            {
+                lblStatus.Text =
+                    $"Found {candidates.Count:N0} candidate(s); resolving NTFS $DATA evidence for {missingDataPaths.Count:N0} item(s)...";
+
+                var fallbackCandidates =
+                    await _mftCandidateScanner.ScanRawMftForPathsAsync(
+                        rootPath,
+                        missingDataPaths,
+                        CancellationToken.None);
+
+                if (fallbackCandidates.Count > 0)
+                {
+                    var fallbackByPath = fallbackCandidates
+                        .Where(candidate => candidate.DataStreamFound)
+                        .GroupBy(candidate => candidate.FullPath, StringComparer.OrdinalIgnoreCase)
+                        .ToDictionary(
+                            group => group.Key,
+                            group => group.First(),
+                            StringComparer.OrdinalIgnoreCase);
+
+                    candidates = candidates
+                        .Select(candidate =>
+                            candidate.DataStreamFound ||
+                            !fallbackByPath.TryGetValue(candidate.FullPath, out var fallback)
+                                ? candidate
+                                : fallback)
+                        .ToList();
+                }
+            }
 
             var filtered = candidates
                 .Select(candidate => new RecoveryDisplayRow
