@@ -275,10 +275,10 @@ public sealed class NtfsDeepFileRecoveryService
                     DestinationPath = destinationPath,
                     BytesRecovered = carvedLength,
                     Evidence =
-                        string.Equals(format, "Plain text", StringComparison.OrdinalIgnoreCase)
+                        format.StartsWith("Plain text", StringComparison.OrdinalIgnoreCase)
                             ? format.Contains("heuristic", StringComparison.OrdinalIgnoreCase)
-                            ? $"Deep NTFS heuristic text carving recovered a {carvedLength:N0}-byte text-like region from currently free clusters without a known original file length. Plain-text files do not carry a self-delimiting file boundary, so the recovered extent is heuristic."
-                            : $"Deep NTFS heuristic text carving recovered exactly {carvedLength:N0} byte(s) from currently free clusters using the known original file length. The content match is heuristic because plain-text files do not carry a self-delimiting file boundary."
+                                ? $"Deep NTFS heuristic text carving recovered a {carvedLength:N0}-byte text-like region from currently free clusters without a known original file length. Plain-text files do not carry a self-delimiting file boundary, so the recovered extent is heuristic."
+                                : $"Deep NTFS heuristic text carving recovered exactly {carvedLength:N0} byte(s) from currently free clusters using the known original file length. The content match is heuristic because plain-text files do not carry a self-delimiting file boundary."
                             : $"Deep NTFS file carving recovered {carvedLength:N0} byte(s) as a structurally valid {format} file from currently free clusters."
                 };
             }
