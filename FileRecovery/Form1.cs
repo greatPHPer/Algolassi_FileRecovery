@@ -554,11 +554,86 @@ public partial class Form1 : Form
                     $"recentHistoryCandidates={recentHistoryRecords.Count:N0}, none merged.");
             }
 
+            var recentTargetRecordsByPath = recentHistoryRecords
+                .Select(record => (
+                    FullPath: NormalizePath(record.FullPath),
+                    DeletedAtUtc: record.DeletedAtUtc))
+                .Concat(
+                    recentLiveUsnDeletes.Select(record => (
+                        FullPath: NormalizePath(record.FullPath),
+                        DeletedAtUtc: record.DeletedAtUtc)))
+                .GroupBy(
+                    target => target.FullPath,
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .OrderByDescending(target => target.DeletedAtUtc)
+                        .First(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            var directLiveCandidates = new List<RecoveryCandidate>();
+
+            if (recentTargetRecordsByPath.Count > 0)
+            {
+                try
+                {
+                    // A recent deletion can be present in history before its exact
+                    // file reference is enriched. Query the current MFT/USN view by
+                    // exact path for only those recent targets. The timestamp guard
+                    // prevents an unrelated older deletion of the same path from
+                    // being promoted.
+                    var pathCandidates = _mftCandidateScanner.ScanForPaths(
+                        rootPath,
+                        recentTargetRecordsByPath.Keys.ToList(),
+                        CancellationToken.None,
+                        maxPages: 128);
+
+                    directLiveCandidates = pathCandidates
+                        .Where(candidate =>
+                            recentTargetRecordsByPath.TryGetValue(
+                                NormalizePath(candidate.FullPath),
+                                out var target) &&
+                            (target.DeletedAtUtc == default ||
+                             candidate.LastUsnTimestampUtc == default ||
+                             Math.Abs(
+                                 (candidate.LastUsnTimestampUtc - target.DeletedAtUtc)
+                                     .TotalMinutes) <= 5))
+                        .ToList();
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS live path lookup: requested={recentTargetRecordsByPath.Count:N0}, " +
+                        $"scannedCandidates={pathCandidates.Count:N0}, " +
+                        $"timestampTrusted={directLiveCandidates.Count:N0}.");
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS live path lookup failed: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
             var candidates = _mftCandidateScanner.ScanForFileReferences(
                 rootPath,
                 targetRecords,
                 CancellationToken.None)
                 .ToList();
+
+            var candidatePaths = candidates
+                .Select(candidate => NormalizePath(candidate.FullPath))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var directCandidate in directLiveCandidates)
+            {
+                if (candidatePaths.Add(NormalizePath(directCandidate.FullPath)))
+                {
+                    candidates.Add(directCandidate);
+                }
+            }
 
             var missingDataCandidates = candidates
                 .Where(candidate => !candidate.DataStreamFound)
@@ -639,6 +714,16 @@ public partial class Form1 : Form
                                 "Live deletion history: AlgoLassi observed this deletion while the application was running."
                             }.Where(text => !string.IsNullOrWhiteSpace(text)));
                     }
+                    else if (recentTargetRecordsByPath.ContainsKey(NormalizePath(candidate.FullPath)))
+                    {
+                        evidence = string.Join(
+                            " ",
+                            new[]
+                            {
+                                evidence,
+                                "Recent deletion evidence: the current NTFS/MFT view matched a deletion recorded by AlgoLassi within the last 15 minutes."
+                            }.Where(text => !string.IsNullOrWhiteSpace(text)));
+                    }
 
                     return new RecoveryDisplayRow
                     {
@@ -674,9 +759,9 @@ public partial class Form1 : Form
             lblFiles.Text = $"NTFS candidates ({filtered.Count:N0})";
             lblStatus.Text = filtered.Count == 0
                 ? $"No deleted-file metadata candidates were found under {scanDirectory}."
-                : mergedLiveHistoryCount > 0 || mergedLiveUsnCount > 0
+                : mergedLiveHistoryCount > 0 || mergedLiveUsnCount > 0 || directLiveCandidates.Count > 0
                     ? $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}; " +
-                      $"{mergedLiveUsnCount + mergedLiveHistoryCount:N0} recent live deletion(s) were included."
+                      $"{mergedLiveUsnCount + mergedLiveHistoryCount + directLiveCandidates.Count:N0} recent live deletion evidence item(s) were included."
                     : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}.";
         }
         catch (UnauthorizedAccessException)
