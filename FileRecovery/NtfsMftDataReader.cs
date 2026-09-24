@@ -478,6 +478,113 @@ public sealed class NtfsMftDataReader
         return -1;
     }
 
+    public bool TryReadResidentDataForDeletedReference(
+        string rootPath,
+        ulong fileReferenceNumber,
+        ulong expectedParentFileReferenceNumber,
+        string expectedFileName,
+        string? expectedFullPath,
+        out byte[] data)
+    {
+        data = [];
+
+        if (string.IsNullOrWhiteSpace(rootPath) ||
+            fileReferenceNumber == 0 ||
+            expectedParentFileReferenceNumber == 0 ||
+            string.IsNullOrWhiteSpace(expectedFileName))
+        {
+            return false;
+        }
+
+        var root = GetNtfsVolumeRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return false;
+        }
+
+        try
+        {
+            WindowsPrivilege.EnableSeBackupPrivilege();
+
+            var volumeInfo = new NtfsVolumeInspector().Inspect(root);
+            using var volumeHandle = CreateVolumeHandle(
+                volumeInfo.RootPath,
+                overlapped: true);
+
+            var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
+            var sequenceNumber = (ushort)(fileReferenceNumber >> 48);
+
+            var record = ReadMftRecordByExtentMap(
+                volumeHandle,
+                volumeInfo,
+                segmentNumber,
+                sequenceNumber,
+                expectedBaseFileReference: fileReferenceNumber);
+
+            var usedRelaxedReference = false;
+
+            if (record is null)
+            {
+                record = ReadMftRecordByExtentMap(
+                    volumeHandle,
+                    volumeInfo,
+                    segmentNumber,
+                    expectedSequenceNumber: 0,
+                    expectedBaseFileReference: 0);
+
+                if (record is null ||
+                    !HasMatchingFileNameEntry(
+                        volumeHandle,
+                        record,
+                        expectedFileName,
+                        expectedParentFileReferenceNumber,
+                        expectedFullPath,
+                        expectedSequenceNumber: sequenceNumber))
+                {
+                    return false;
+                }
+
+                usedRelaxedReference = true;
+            }
+
+            var dataAttributes = FindUnnamedDataAttributes(
+                record,
+                volumeInfo);
+
+            var residentAttributes = dataAttributes
+                .Where(attribute =>
+                    attribute.IsResident &&
+                    attribute.ResidentData is { Length: > 0 })
+                .ToList();
+
+            if (residentAttributes.Count != 1)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS fresh resident $DATA lookup: segment={segmentNumber}, " +
+                    $"residentAttributes={residentAttributes.Count}, " +
+                    $"totalUnnamedDataAttributes={dataAttributes.Count}, " +
+                    $"relaxedReference={usedRelaxedReference}.");
+                return false;
+            }
+
+            data = residentAttributes[0].ResidentData!;
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS fresh resident $DATA evidence: segment={segmentNumber}, " +
+                $"fileName={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
+                $"size={data.Length:N0}, relaxedReference={usedRelaxedReference}.");
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS fresh resident $DATA lookup failed: " +
+                $"{ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
     public bool TryReadHistoricalFileNameSize(
         string rootPath,
         ulong fileReferenceNumber,
