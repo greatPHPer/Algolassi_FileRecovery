@@ -65,51 +65,6 @@ public sealed class MftCandidateScanner
             maxPages: maxPages);
     }
 
-    public IReadOnlyList<RecoveryCandidate> ScanDeletedDirectory(
-        string targetDirectory,
-        bool includeSubdirectories,
-        CancellationToken cancellationToken = default,
-        int maxPages = int.MaxValue)
-    {
-        WindowsPrivilege.EnableSeBackupPrivilege();
-
-        if (string.IsNullOrWhiteSpace(targetDirectory))
-        {
-            throw new ArgumentException(
-                "A directory must be selected for the deleted-file scan.",
-                nameof(targetDirectory));
-        }
-
-        if (!Directory.Exists(targetDirectory))
-        {
-            throw new DirectoryNotFoundException(
-                $"The selected scan directory no longer exists: {targetDirectory}");
-        }
-
-        if (maxPages <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(maxPages));
-        }
-
-        var fullDirectory = Path.GetFullPath(targetDirectory);
-        var root = Path.GetPathRoot(fullDirectory);
-
-        if (string.IsNullOrWhiteSpace(root))
-        {
-            throw new ArgumentException(
-                "The selected directory must be on a Windows volume.",
-                nameof(targetDirectory));
-        }
-
-        return ScanInternal(
-            root,
-            targetPaths: null,
-            targetDirectory: fullDirectory,
-            includeSubdirectories,
-            cancellationToken,
-            maxPages);
-    }
-
     public async Task<IReadOnlyList<RecoveryCandidate>> ScanRawMftForPathsAsync(
         string rootPath,
         IReadOnlyCollection<string> targetPaths,
