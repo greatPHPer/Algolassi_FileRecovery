@@ -70,6 +70,12 @@ public sealed class NtfsDeepFileRecoveryService
         var bitmapReader = new NtfsVolumeBitmapReader();
 
         long scannedBytes = 0;
+        var extentIndex = 0;
+        byte[] previousChunk = [];
+
+        System.Diagnostics.Debug.WriteLine(
+            $"Deep NTFS carve started: candidate={candidate.FullPath}, " +
+            $"extension={extension}, maxBytes={maxBytesToScan:N0}.");
 
         foreach (var freeExtent in bitmapReader.EnumerateFreeExtents(
                      volumeHandle,
@@ -77,6 +83,8 @@ public sealed class NtfsDeepFileRecoveryService
                      cancellationToken))
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            extentIndex++;
 
             var extentBytes = checked(
                 freeExtent.ClusterCount * (long)volumeInfo.BytesPerCluster);
@@ -111,8 +119,8 @@ public sealed class NtfsDeepFileRecoveryService
                     break;
                 }
 
-                var buffer = new byte[checked((int)bytesToRead)];
                 var physicalOffset = checked(extentOffset + extentBytesScanned);
+                var buffer = new byte[checked((int)bytesToRead)];
 
                 ReadAt(
                     volumeHandle,
@@ -123,26 +131,69 @@ public sealed class NtfsDeepFileRecoveryService
                 scannedBytes = checked(scannedBytes + bytesToRead);
                 extentBytesScanned = checked(extentBytesScanned + bytesToRead);
 
+                // Keep the previous 64 MB chunk as overlap. This lets a valid file
+                // whose header starts near the end of one chunk and whose trailer
+                // reaches into the next chunk be evaluated as one contiguous buffer.
+                var overlapLength = previousChunk.Length;
+                var scanWindow = new byte[checked(overlapLength + buffer.Length)];
+
+                if (overlapLength > 0)
+                {
+                    Buffer.BlockCopy(
+                        previousChunk,
+                        0,
+                        scanWindow,
+                        0,
+                        overlapLength);
+                }
+
+                Buffer.BlockCopy(
+                    buffer,
+                    0,
+                    scanWindow,
+                    overlapLength,
+                    buffer.Length);
+
+                var scanWindowOffset = checked(
+                    physicalOffset - overlapLength);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"Deep NTFS carve chunk: candidate={candidate.Name}, " +
+                    $"extent={extentIndex:N0}, offset={physicalOffset:N0}, " +
+                    $"bytes={bytesToRead:N0}, overlap={overlapLength:N0}, " +
+                    $"scanned={scannedBytes:N0}.");
+
                 if (!TryCarve(
                         extension,
-                        buffer,
+                        scanWindow,
                         out var startOffset,
                         out var carvedLength,
                         out var format))
                 {
+                    previousChunk = buffer;
                     continue;
                 }
 
                 if (carvedLength <= 0 ||
                     carvedLength > MaxCarvedFileBytes ||
                     startOffset < 0 ||
-                    startOffset > buffer.Length ||
-                    carvedLength > buffer.Length - startOffset)
+                    startOffset > scanWindow.Length ||
+                    carvedLength > scanWindow.Length - startOffset)
                 {
+                    previousChunk = buffer;
                     continue;
                 }
 
-                var absoluteByteOffset = checked(physicalOffset + startOffset);
+                var absoluteByteOffset = checked(scanWindowOffset + startOffset);
+
+                // A hit must overlap the newly-read chunk. Otherwise it would be a
+                // duplicate match wholly contained in the previous overlap buffer.
+                if (absoluteByteOffset + carvedLength <= physicalOffset)
+                {
+                    previousChunk = buffer;
+                    continue;
+                }
+
                 var firstCluster = absoluteByteOffset / volumeInfo.BytesPerCluster;
                 var lastByteExclusive = checked(
                     absoluteByteOffset + carvedLength);
@@ -153,6 +204,7 @@ public sealed class NtfsDeepFileRecoveryService
 
                 if (clusterCount <= 0)
                 {
+                    previousChunk = buffer;
                     continue;
                 }
 
@@ -173,8 +225,14 @@ public sealed class NtfsDeepFileRecoveryService
                     allocation[0].FreeClusterCount != clusterCount)
                 {
                     // The source changed while scanning. Do not trust or write this hit.
+                    previousChunk = buffer;
                     continue;
                 }
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"Deep NTFS carve hit: candidate={candidate.FullPath}, " +
+                    $"format={format}, offset={absoluteByteOffset:N0}, " +
+                    $"length={carvedLength:N0}, clusters={clusterCount:N0}.");
 
                 var destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
                     destinationDirectory,
@@ -190,9 +248,11 @@ public sealed class NtfsDeepFileRecoveryService
                         IoBufferSize,
                         FileOptions.SequentialScan);
 
+                    var writeOffset = checked((int)(absoluteByteOffset - scanWindowOffset));
+
                     output.Write(
-                        buffer,
-                        startOffset,
+                        scanWindow,
+                        writeOffset,
                         carvedLength);
                 }
                 catch
@@ -211,7 +271,13 @@ public sealed class NtfsDeepFileRecoveryService
                         $"Deep NTFS file carving recovered {carvedLength:N0} byte(s) as a structurally valid {format} file from currently free clusters."
                 };
             }
+
+            previousChunk = [];
         }
+
+        System.Diagnostics.Debug.WriteLine(
+            $"Deep NTFS carve complete: candidate={candidate.FullPath}, " +
+            $"scanned={scannedBytes:N0}, extents={extentIndex:N0}, noValidHit=true.");
 
         throw new InvalidOperationException(
             $"No structurally valid {extension} file was found in the first " +
