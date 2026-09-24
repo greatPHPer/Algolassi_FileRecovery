@@ -2435,6 +2435,29 @@ public sealed class NtfsMftDataReader
     // returns an in-use record at or below the requested MFT index. The physical
     // MFT mapping above is required when the target record itself is deleted.
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public uint CreationTimeLow;
+        public uint CreationTimeHigh;
+        public uint LastAccessTimeLow;
+        public uint LastAccessTimeHigh;
+        public uint LastWriteTimeLow;
+        public uint LastWriteTimeHigh;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle hFile,
+        out ByHandleFileInformation lpFileInformation);
+
     private static SafeFileHandle CreateVolumeHandle(
         string root,
         bool overlapped)
