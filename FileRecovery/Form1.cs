@@ -827,6 +827,40 @@ public partial class Form1 : Form
                 $"NTFS live evidence candidates: added={liveEvidenceCandidateCount:N0}, " +
                 $"trustedSources={liveEvidenceSources.Count:N0}, totalCandidates={candidates.Count:N0}.");
 
+            // A metadata-only candidate may have a valid historical deletion
+            // record with the original byte length even though its current MFT $DATA
+            // stream is gone. Carry that size into the candidate so exact-size deep
+            // carving can be attempted for formats such as plain text.
+            foreach (var candidate in candidates.Where(candidate => candidate.FileSizeBytes <= 0))
+            {
+                var sizeMatch = historyRecords
+                    .Where(record =>
+                        record.FileSizeBytes.HasValue &&
+                        string.Equals(
+                            NormalizePath(record.FullPath),
+                            NormalizePath(candidate.FullPath),
+                            StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(record =>
+                        Math.Abs(
+                            (record.DeletedAtUtc - candidate.LastUsnTimestampUtc)
+                                .TotalMinutes))
+                    .FirstOrDefault();
+
+                if (sizeMatch?.FileSizeBytes is long knownSize &&
+                    knownSize > 0 &&
+                    (candidate.LastUsnTimestampUtc == default ||
+                     Math.Abs(
+                         (sizeMatch.DeletedAtUtc - candidate.LastUsnTimestampUtc)
+                             .TotalMinutes) <= 5))
+                {
+                    candidate.FileSizeBytes = knownSize;
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS candidate size enrichment: path={candidate.FullPath}, " +
+                        $"size={knownSize:N0} bytes.");
+                }
+            }
+
             var liveHistoryByPath = recentHistoryRecords
                 .Where(record => record.FileReferenceNumber.HasValue)
                 .GroupBy(
@@ -1616,12 +1650,14 @@ public partial class Form1 : Form
                 // be recovered from raw free-space carving. In particular, plain-text
                 // files do not have a reliable end marker, so do not pretend to scan
                 // them indefinitely.
-                if (!NtfsDeepFileRecoveryService.SupportsDeepCarving(candidate.Name))
+                if (!NtfsDeepFileRecoveryService.SupportsDeepCarving(
+                        candidate.Name,
+                        candidate.FileSizeBytes))
                 {
                     failures.Add(
                         $"{candidate.Name}: deep NTFS carving is not supported for " +
-                        $"'{Path.GetExtension(candidate.Name)}' because the file type " +
-                        "does not provide a safe self-delimiting recovery boundary.");
+                        $"'{Path.GetExtension(candidate.Name)}'. " +
+                        "For plain text, recovery requires a known original byte length.");
                     continue;
                 }
 
@@ -1649,7 +1685,8 @@ public partial class Form1 : Form
                         destinationDirectory,
                         CancellationToken.None,
                         maxDeepCarveBytes,
-                        carveProgress));
+                        carveProgress,
+                        candidate.FileSizeBytes));
 
                 successes.Add(carved);
             }
