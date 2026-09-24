@@ -423,11 +423,24 @@ public partial class Form1 : Form
 
         try
         {
-            var candidates = await Task.Run(
-                () => _mftCandidateScanner.ScanDeletedDirectory(
+            var deletedRecords = await Task.Run(
+                () => _usnMonitor.ScanDeletedDirectory(
                     scanDirectory,
                     includeSubdirectories,
                     CancellationToken.None));
+
+            var candidates = deletedRecords.Count == 0
+                ? []
+                : _mftCandidateScanner.ScanForFileReferences(
+                    Path.GetPathRoot(scanDirectory)!,
+                    deletedRecords
+                        .Select(record => (
+                            record.FullPath,
+                            record.FileReferenceNumber,
+                            record.ParentFileReferenceNumber,
+                            record.DeletedAtUtc))
+                        .ToList(),
+                    CancellationToken.None);
 
             var filtered = candidates
                 .Select(candidate => new RecoveryDisplayRow
