@@ -454,36 +454,11 @@ public sealed class MftCandidateScanner
             $"historicalInUseSegmentsSeen={historicalInUseSegmentSeenCount:N0}, " +
             $"results={results.Count:N0}.");
 
-        if (results.Count == 0)
-        {
-            // Fresh deletions are usually represented in the bounded USN/MFT
-            // enumeration even when the raw MFT window did not contain the
-            // target record. Keep this lookup bounded; raw MFT remains the
-            // fallback for volumes/history predating the journal.
-            try
-            {
-                var usnCandidates = ScanForPaths(
-                    root,
-                    normalizedTargets.ToList(),
-                    cancellationToken,
-                    maxPages: 128);
-
-                if (usnCandidates.Count > 0)
-                {
-                    return usnCandidates;
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"Bounded USN fallback failed: {ex.GetType().Name}: {ex.Message}");
-            }
-        }
-
+        // Do not re-run the bounded USN scan here. The caller invokes this
+        // method only for candidates whose original data stream lookup failed,
+        // and it only consumes fallback candidates with DataStreamFound=true.
+        // Returning another USN metadata-only candidate therefore cannot improve
+        // recovery and only repeats the access-sensitive parent/reference lookup.
         return results;
     }
 
