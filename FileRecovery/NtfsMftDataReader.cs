@@ -95,6 +95,31 @@ public sealed class NtfsMftDataReader
 
             if (historicalFileNameOffset < 0 || historicalFileSize < 0)
             {
+                // A reused MFT record can retain the filename bytes while the
+                // surrounding $FILE_NAME header has already been overwritten.
+                // In that case the fully structural match above is unavailable,
+                // but an exact UTF-16 filename anchor is still useful forensic
+                // evidence. Try the nearby slack for a plausible resident
+                // unnamed $DATA attribute before giving up.
+                if (TryFindResidentDataNearRawFileName(
+                        record,
+                        slackStart,
+                        expectedNameBytes,
+                        out var heuristicData,
+                        out var rawNameOffset,
+                        out var heuristicDataAttributeOffset))
+                {
+                    data = heuristicData;
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS heuristic resident $DATA evidence: segment={segmentNumber}, " +
+                        $"fileName={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
+                        $"size={data.Length:N0}, rawNameOffset={rawNameOffset}, " +
+                        $"dataAttributeOffset={heuristicDataAttributeOffset}.");
+
+                    return true;
+                }
+
                 return false;
             }
 
@@ -216,6 +241,121 @@ public sealed class NtfsMftDataReader
         }
 
         return -1;
+    }
+
+    private static bool TryFindResidentDataNearRawFileName(
+        byte[] record,
+        int slackStart,
+        byte[] expectedNameBytes,
+        out byte[] data,
+        out int rawNameOffset,
+        out int dataAttributeOffset)
+    {
+        data = [];
+        rawNameOffset = -1;
+        dataAttributeOffset = -1;
+
+        if (slackStart < 0 ||
+            slackStart >= record.Length ||
+            expectedNameBytes.Length == 0)
+        {
+            return false;
+        }
+
+        const int maxRelatedSlackDistance = 1024;
+        const int minimumDataLength = 1;
+
+        var bestDistance = int.MaxValue;
+        byte[]? bestData = null;
+        var bestNameOffset = -1;
+        var bestAttributeOffset = -1;
+
+        for (var nameOffset = slackStart;
+             nameOffset + expectedNameBytes.Length <= record.Length;
+             nameOffset++)
+        {
+            if (!record.AsSpan(
+                    nameOffset,
+                    expectedNameBytes.Length)
+                .SequenceEqual(expectedNameBytes))
+            {
+                continue;
+            }
+
+            for (var attributeOffset = slackStart;
+                 attributeOffset + 24 <= record.Length;
+                 attributeOffset++)
+            {
+                var distance = Math.Abs(attributeOffset - nameOffset);
+                if (distance > maxRelatedSlackDistance ||
+                    distance >= bestDistance)
+                {
+                    continue;
+                }
+
+                var type = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(attributeOffset, 4));
+
+                if (type != NtfsAttributeData)
+                {
+                    continue;
+                }
+
+                var attributeLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(attributeOffset + 4, 4));
+
+                if (attributeLength < 24 ||
+                    attributeOffset + attributeLength > record.Length)
+                {
+                    continue;
+                }
+
+                var formCode = record[attributeOffset + 8];
+                var nameLength = record[attributeOffset + 9];
+
+                if (formCode != 0 || nameLength != 0)
+                {
+                    continue;
+                }
+
+                var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(attributeOffset + 16, 4));
+
+                var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(attributeOffset + 20, 2));
+
+                if (valueLength < minimumDataLength ||
+                    valueLength > (uint)MaxAttributeListBytes ||
+                    valueOffset < 24 ||
+                    valueOffset >= attributeLength ||
+                    valueLength > attributeLength - valueOffset)
+                {
+                    continue;
+                }
+
+                bestData = record.AsSpan(
+                        attributeOffset + valueOffset,
+                        checked((int)valueLength))
+                    .ToArray();
+
+                bestDistance = distance;
+                bestNameOffset = nameOffset;
+                bestAttributeOffset = attributeOffset;
+            }
+        }
+
+        if (bestData is null)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS heuristic resident $DATA search: no raw filename/data pair found. " +
+                $"slackStart={slackStart}, expectedName={Encoding.Unicode.GetString(expectedNameBytes)}.");
+            return false;
+        }
+
+        data = bestData;
+        rawNameOffset = bestNameOffset;
+        dataAttributeOffset = bestAttributeOffset;
+        return true;
     }
 
     private static int FindHistoricalFileNameValue(
