@@ -116,6 +116,50 @@ public sealed class NtfsMftDataReader
             return NotFound("NTFS could not read and validate the exact deleted MFT record for this file reference.");
         }
 
+        return ReadDefaultDataStreamFromMftRecord(
+            volumeInfo,
+            volumeHandle,
+            rawMftVolumeHandle,
+            fileReferenceNumber,
+            record);
+    }
+
+    internal NtfsDataStreamInfo ReadDefaultDataStreamFromScannedMftRecord(
+        NtfsVolumeInfo volumeInfo,
+        SafeFileHandle volumeHandle,
+        ulong fileReferenceNumber,
+        byte[] record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+
+        if (record.Length < volumeInfo.BytesPerFileRecordSegment ||
+            volumeInfo.BytesPerFileRecordSegment <= 0)
+        {
+            return NotFound("The scanned NTFS MFT record size is invalid.");
+        }
+
+        // The scanner already applied the update-sequence fixups while parsing
+        // this exact MFT record. Keep that record as the source of truth instead
+        // of attempting another lookup using an older USN file-reference sequence.
+        using var rawMftVolumeHandle = CreateVolumeHandle(
+            volumeInfo.RootPath,
+            overlapped: true);
+
+        return ReadDefaultDataStreamFromMftRecord(
+            volumeInfo,
+            volumeHandle,
+            rawMftVolumeHandle,
+            fileReferenceNumber,
+            record);
+    }
+
+    private NtfsDataStreamInfo ReadDefaultDataStreamFromMftRecord(
+        NtfsVolumeInfo volumeInfo,
+        SafeFileHandle volumeHandle,
+        SafeFileHandle rawMftVolumeHandle,
+        ulong fileReferenceNumber,
+        byte[] record)
+    {
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
         var dataAttributes = FindUnnamedDataAttributes(record, volumeInfo);
 
@@ -174,7 +218,9 @@ public sealed class NtfsMftDataReader
                 continue;
             }
 
-            if (entry.SegmentReference == fileReferenceNumber)
+            if ((entry.SegmentReference & 0x0000FFFFFFFFFFFFUL) ==
+                (fileReferenceNumber & 0x0000FFFFFFFFFFFFUL) &&
+                (ushort)(entry.SegmentReference >> 48) == (ushort)(fileReferenceNumber >> 48))
             {
                 continue;
             }
@@ -204,7 +250,7 @@ public sealed class NtfsMftDataReader
         return BuildDataStream(dataAttributes, Math.Max(1, dataAttributes.Count));
     }
 
-    private static List<DataAttributeDescriptor> FindUnnamedDataAttributes(
+    private static List<DataAttributeDescriptor> FindUnnamedDataAttributes(private static List<DataAttributeDescriptor> FindUnnamedDataAttributes(
         byte[] record,
         NtfsVolumeInfo volumeInfo)
     {
