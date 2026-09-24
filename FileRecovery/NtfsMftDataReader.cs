@@ -14,7 +14,6 @@ public sealed class NtfsMftDataReader
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOverlapped = 0x40000000;
-    private const uint FsctlGetNtfsFileRecord = 0x00090068;
     private const int ErrorIoPending = 997;
 
     private const uint NtfsAttributeList = 0x20;
