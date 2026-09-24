@@ -1839,6 +1839,7 @@ public partial class Form1 : Form
                 // This can retain fragments of recently deleted small text files
                 // after their clusters were reallocated, without scanning/reading
                 // the active file bodies as candidate data.
+                var slackRootPath = GetSourceVolumeRoot(candidate.FullPath);
                 var slackDirectory = candidate.DirectoryPath;
                 if (string.IsNullOrWhiteSpace(slackDirectory))
                 {
@@ -1850,13 +1851,14 @@ public partial class Form1 : Form
                 {
                     var slackReader = new NtfsMftDataReader();
 
-                    if (slackReader.TryReadAllocatedFileSlack(
-                        rootPath,
+                    if (!string.IsNullOrWhiteSpace(slackRootPath) &&
+                        slackReader.TryReadAllocatedFileSlack(
+                        slackRootPath,
                         slackDirectory,
                         Path.GetExtension(candidate.Name),
                         long.MaxValue,
                         progress: null,
-                        CancellationToken.None,
+                        cancellationToken: CancellationToken.None,
                         out var slackData,
                         out var slackSourceFile) &&
                         slackData.Length > 0)
@@ -2278,6 +2280,19 @@ public partial class Form1 : Form
 
         return string.Equals(left, right, StringComparison.OrdinalIgnoreCase)
             || left.StartsWith(right + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? GetSourceVolumeRoot(string path)
+    {
+        var normalized = path.Trim();
+
+        while (normalized.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+               normalized.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalized = normalized[4..];
+        }
+
+        return Path.GetPathRoot(normalized);
     }
 
     private static string NormalizePath(string value) =>
