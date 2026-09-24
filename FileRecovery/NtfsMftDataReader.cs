@@ -88,8 +88,13 @@ public sealed class NtfsMftDataReader
 
         if (!attributeList.IsResident && attributeList.ResidentData is null)
         {
-            return NotFound(
-                "The file retains a nonresident $ATTRIBUTE_LIST that could not be safely reconstructed.");
+            // The base record may still contain a complete unnamed $DATA stream.
+            // Preserve that evidence instead of failing the entire candidate just
+            // because an unrelated/nonresident $ATTRIBUTE_LIST could not be read.
+            return dataAttributes.Count > 0
+                ? BuildDataStream(dataAttributes, 1)
+                : NotFound(
+                    "The file retains a nonresident $ATTRIBUTE_LIST that could not be safely reconstructed.");
         }
 
         IReadOnlyList<NtfsAttributeListEntry> entries;
@@ -99,7 +104,15 @@ public sealed class NtfsMftDataReader
         }
         catch (Exception ex)
         {
-            return NotFound($"The NTFS $ATTRIBUTE_LIST could not be parsed: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $ATTRIBUTE_LIST parse failed for fileRef={fileReferenceNumber}: {ex.Message}");
+
+            // Keep any complete unnamed $DATA attribute already retained in the
+            // base MFT record. Extension records are an enhancement, not a reason
+            // to throw away otherwise usable recovery evidence.
+            return dataAttributes.Count > 0
+                ? BuildDataStream(dataAttributes, 1)
+                : NotFound($"The NTFS $ATTRIBUTE_LIST could not be parsed: {ex.Message}");
         }
 
         var referencedSources = new HashSet<(ulong FileReference, long LowestVcn)>();
