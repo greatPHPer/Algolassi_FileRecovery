@@ -782,8 +782,8 @@ public partial class Form1 : Form
                         lblStatus.Text =
                             $"Reading exact NTFS MFT records on {root} for {directRecords.Count:N0} selected item(s)...";
 
-                        var directCandidates = await Task.Run(() =>
-                            _mftCandidateScanner.ScanForFileReferences(root, directTargets));
+                        var directCandidates =
+                            _mftCandidateScanner.ScanForFileReferences(root, directTargets);
 
                         foreach (var record in directRecords)
                         {
@@ -979,6 +979,36 @@ public partial class Form1 : Form
         }
     }
 
+    private async Task<(List<RecoveryResult> successes, List<string> failures)> recvr(
+        IReadOnlyList<RecoveryCandidate> candidates,
+        string? destinationDirectory)
+    {
+        var failures = new List<string>();
+        var successes = new List<RecoveryResult>();
+
+        if (string.IsNullOrWhiteSpace(destinationDirectory))
+        {
+            failures.Add("Recovery destination was not selected.");
+            return (successes, failures);
+        }
+
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                successes.Add(_ntfsRecoveryService.Recover(
+                    candidate,
+                    destinationDirectory));
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{candidate.Name}: {ex.Message}");
+            }
+        }
+
+        return (successes, failures);
+    }
+
     private async Task RecoverNtfsCandidatesAsync(IReadOnlyList<RecoveryCandidate> candidates)
     {
         using var dialog = new FolderBrowserDialog
@@ -999,27 +1029,7 @@ public partial class Form1 : Form
 
         try
         {
-            var result = await Task.Run(() =>
-            {
-                var failures = new List<string>();
-                var successes = new List<RecoveryResult>();
-
-                foreach (var candidate in candidates)
-                {
-                    try
-                    {
-                        successes.Add(_ntfsRecoveryService.Recover(
-                            candidate,
-                            destinationDirectory));
-                    }
-                    catch (Exception ex)
-                    {
-                        failures.Add($"{candidate.Name}: {ex.Message}");
-                    }
-                }
-
-                return (successes, failures);
-            });
+            var result = await recvr(candidates, destinationDirectory);
 
             if (result.failures.Count > 0)
             {
