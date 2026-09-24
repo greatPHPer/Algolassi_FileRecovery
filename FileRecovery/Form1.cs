@@ -487,7 +487,7 @@ public partial class Form1 : Form
                         Math.Abs((candidate.DeletedAtUtc - record.DeletedAtUtc).TotalMinutes))
                     .FirstOrDefault();
 
-                if (match.FullPath is null)
+                if (match is null)
                 {
                     continue;
                 }
