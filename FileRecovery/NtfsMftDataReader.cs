@@ -23,6 +23,8 @@ public sealed class NtfsMftDataReader
     private const int MaxAttributeListBytes = 16 * 1024 * 1024;
     private const int RawReadBufferSize = 1024 * 1024;
 
+    private IReadOnlyList<NtfsDataExtent>? _mftExtents;
+
     public NtfsDataStreamInfo ReadDefaultDataStream(
         NtfsVolumeInfo volumeInfo,
         SafeFileHandle volumeHandle,
@@ -59,7 +61,7 @@ public sealed class NtfsMftDataReader
             volumeInfo.RootPath,
             overlapped: true);
 
-        var record = ReadRecord(
+        var record = ReadMftRecordByExtentMap(
             rawMftVolumeHandle,
             volumeInfo,
             segmentNumber,
@@ -74,10 +76,12 @@ public sealed class NtfsMftDataReader
             // The USN record already supplied the exact segment; retry that segment
             // without strict sequence/base checks, but only accept it when the
             // retained $FILE_NAME still identifies the expected parent/name.
-            var relaxedRecord = ReadRawRecord(
+            var relaxedRecord = ReadMftRecordByExtentMap(
                 rawMftVolumeHandle,
                 volumeInfo,
-                segmentNumber);
+                segmentNumber,
+                expectedSequenceNumber: 0,
+                expectedBaseFileReference: 0);
 
             if (relaxedRecord is not null &&
                 HasMatchingFileNameEntry(
@@ -627,6 +631,226 @@ public sealed class NtfsMftDataReader
             targetOffset = checked(targetOffset + chunk);
             remaining -= chunk;
         }
+    }
+
+    private byte[]? ReadMftRecordByExtentMap(
+        SafeFileHandle volumeHandle,
+        NtfsVolumeInfo volumeInfo,
+        ulong segmentNumber,
+        ushort expectedSequenceNumber,
+        ulong expectedBaseFileReference)
+    {
+        _mftExtents ??= ReadMftDataExtents(
+            volumeHandle,
+            volumeInfo);
+
+        if (_mftExtents.Count == 0)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                "NTFS MFT extent map: no $MFT $DATA extents were found.");
+            return null;
+        }
+
+        var logicalByteOffset = checked(
+            (long)segmentNumber * volumeInfo.BytesPerFileRecordSegment);
+
+        var record = new byte[checked((int)volumeInfo.BytesPerFileRecordSegment)];
+        var bytesRead = ReadMappedFileBytes(
+            volumeHandle,
+            volumeInfo.BytesPerCluster,
+            _mftExtents,
+            logicalByteOffset,
+            record);
+
+        if (bytesRead != record.Length)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS MFT extent map: segment={segmentNumber}, " +
+                $"logicalOffset={logicalByteOffset}, read={bytesRead}, expected={record.Length}.");
+            return null;
+        }
+
+        if (record.Length < 48 ||
+            record[0] != (byte)'F' ||
+            record[1] != (byte)'I' ||
+            record[2] != (byte)'L' ||
+            record[3] != (byte)'E')
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS MFT extent map: invalid FILE signature for segment={segmentNumber}, " +
+                $"logicalOffset={logicalByteOffset}.");
+            return null;
+        }
+
+        try
+        {
+            ApplyUpdateSequenceFixups(
+                record,
+                checked((int)volumeInfo.BytesPerSector));
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS MFT extent map: update-sequence fixup failed for segment={segmentNumber}: {ex.Message}");
+            return null;
+        }
+
+        var actualSequence = BinaryPrimitives.ReadUInt16LittleEndian(
+            record.AsSpan(16, 2));
+
+        if (expectedSequenceNumber != 0 &&
+            actualSequence != expectedSequenceNumber)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS MFT extent map: sequence mismatch segment={segmentNumber}, " +
+                $"expected={expectedSequenceNumber}, actual={actualSequence}.");
+            return null;
+        }
+
+        var actualBaseReference = BinaryPrimitives.ReadUInt64LittleEndian(
+            record.AsSpan(32, 8));
+
+        if (expectedBaseFileReference != 0 &&
+            actualBaseReference != 0 &&
+            actualBaseReference != expectedBaseFileReference)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS MFT extent map: base-reference mismatch segment={segmentNumber}, " +
+                $"expected={expectedBaseFileReference}, actual={actualBaseReference}.");
+            return null;
+        }
+
+        return record;
+    }
+
+    private static IReadOnlyList<NtfsDataExtent> ReadMftDataExtents(
+        SafeFileHandle volumeHandle,
+        NtfsVolumeInfo volumeInfo)
+    {
+        var recordSize = checked((int)volumeInfo.BytesPerFileRecordSegment);
+        var record0 = new byte[recordSize];
+
+        // MFT record 0 is always at the beginning of $MFT, so the starting LCN
+        // reported by FSCTL_GET_NTFS_VOLUME_DATA is sufficient to read this one
+        // bootstrap record. After that, use record 0's own $DATA mapping pairs
+        // for every other MFT segment.
+        var mftStartOffset = checked(
+            volumeInfo.MftStartLcn * (long)volumeInfo.BytesPerCluster);
+
+        ReadRawExact(
+            volumeHandle,
+            mftStartOffset,
+            record0);
+
+        if (record0.Length < 48 ||
+            record0[0] != (byte)'F' ||
+            record0[1] != (byte)'I' ||
+            record0[2] != (byte)'L' ||
+            record0[3] != (byte)'E')
+        {
+            throw new InvalidDataException(
+                "The NTFS $MFT bootstrap record does not contain a valid FILE signature.");
+        }
+
+        ApplyUpdateSequenceFixups(
+            record0,
+            checked((int)volumeInfo.BytesPerSector));
+
+        var dataAttributes = FindUnnamedDataAttributes(
+            record0,
+            volumeInfo);
+
+        var dataAttribute = dataAttributes
+            .Where(attribute => !attribute.IsResident)
+            .OrderBy(attribute => attribute.LowestVcn)
+            .FirstOrDefault();
+
+        if (dataAttribute is null ||
+            dataAttribute.Extents.Count == 0)
+        {
+            throw new InvalidDataException(
+                "The NTFS $MFT bootstrap record does not retain a nonresident $DATA mapping.");
+        }
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS MFT extent map: record0 DATA extents={dataAttribute.Extents.Count}, " +
+            $"fileSize={dataAttribute.FileSizeBytes}, validLength={dataAttribute.ValidDataLengthBytes}.");
+
+        return dataAttribute.Extents;
+    }
+
+    private static int ReadMappedFileBytes(
+        SafeFileHandle volumeHandle,
+        uint bytesPerCluster,
+        IReadOnlyList<NtfsDataExtent> extents,
+        long fileOffset,
+        byte[] destination)
+    {
+        if (fileOffset < 0 ||
+            destination.Length == 0 ||
+            bytesPerCluster == 0)
+        {
+            return 0;
+        }
+
+        var remaining = destination.Length;
+        var destinationOffset = 0;
+        var logicalOffset = fileOffset;
+
+        foreach (var extent in extents.OrderBy(x => x.VirtualClusterNumber))
+        {
+            if (extent.IsSparse)
+            {
+                continue;
+            }
+
+            var extentStart = checked(
+                extent.VirtualClusterNumber * (long)bytesPerCluster);
+            var extentLength = checked(
+                extent.ClusterCount * (long)bytesPerCluster);
+            var extentEnd = checked(extentStart + extentLength);
+
+            if (logicalOffset >= extentEnd ||
+                logicalOffset < extentStart)
+            {
+                continue;
+            }
+
+            var withinExtent = logicalOffset - extentStart;
+            var physicalOffset = checked(
+                extent.LogicalClusterNumber * (long)bytesPerCluster +
+                withinExtent);
+
+            var bytesAvailable = checked(extentEnd - logicalOffset);
+            var bytesToRead = (int)Math.Min(
+                (long)remaining,
+                bytesAvailable);
+
+            var temp = new byte[bytesToRead];
+
+            ReadRawExact(
+                volumeHandle,
+                physicalOffset,
+                temp);
+
+            Buffer.BlockCopy(
+                temp,
+                0,
+                destination,
+                destinationOffset,
+                bytesToRead);
+
+            destinationOffset += bytesToRead;
+            remaining -= bytesToRead;
+            logicalOffset += bytesToRead;
+
+            if (remaining == 0)
+            {
+                break;
+            }
+        }
+
+        return destinationOffset;
     }
 
     private static byte[]? ReadRawRecord(
