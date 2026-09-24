@@ -168,6 +168,12 @@ public partial class Form1 : Form
             return;
         }
 
+        var selectedDirectory = GetSelectedDirectory();
+        if (!string.IsNullOrWhiteSpace(selectedDirectory))
+        {
+            txtScanPath.Text = selectedDirectory;
+        }
+
         ShowHistoryRows();
     }
 
@@ -333,27 +339,75 @@ public partial class Form1 : Form
 
 
 
+    private void btnBrowseScanPath_Click(object? sender, EventArgs e)
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Select the directory whose deleted NTFS files you want to scan.",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = false
+        };
+
+        var currentPath = txtScanPath.Text.Trim();
+        if (Directory.Exists(currentPath))
+        {
+            dialog.SelectedPath = currentPath;
+        }
+
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            txtScanPath.Text = dialog.SelectedPath;
+            lstDirectories.SelectedIndex = -1;
+        }
+    }
+
     private async void btnScanNtfs_Click(object? sender, EventArgs e)
     {
-        var selectedDirectory = GetSelectedDirectory();
-        var root = selectedDirectory is null
-            ? GetDefaultNtfsRoot()
-            : Path.GetPathRoot(selectedDirectory);
+        var scanDirectory = NormalizePath(txtScanPath.Text);
 
-        if (string.IsNullOrWhiteSpace(root))
+        if (string.IsNullOrWhiteSpace(scanDirectory))
+        {
+            var selectedDirectory = GetSelectedDirectory();
+            if (!string.IsNullOrWhiteSpace(selectedDirectory))
+            {
+                scanDirectory = NormalizePath(selectedDirectory);
+                txtScanPath.Text = scanDirectory;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(scanDirectory) ||
+            !Directory.Exists(scanDirectory))
         {
             MessageBox.Show(
                 this,
-                "Select a recent deletion directory first, or record a deletion so the source volume can be identified.",
+                "Select an existing directory with Browse... before starting the NTFS deleted-file scan.",
                 "NTFS Scan",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
             return;
         }
 
+        var root = Path.GetPathRoot(scanDirectory);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            MessageBox.Show(
+                this,
+                "The selected directory is not on a valid Windows volume.",
+                "NTFS Scan",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        var includeSubdirectories = chkScanSubdirectories.Checked;
+
         var answer = MessageBox.Show(
             this,
-            $"Scan the NTFS volume {root} for deleted-file metadata candidates? This reads filesystem metadata only and does not write to the source volume.",
+            $"Scan deleted NTFS metadata under:\r\n\r\n{scanDirectory}\r\n\r\n" +
+            (includeSubdirectories
+                ? "Include all subdirectories."
+                : "Scan this directory only, not its subdirectories.") +
+            "\r\n\r\nThis reads filesystem metadata only and does not write to the source volume.",
             "NTFS Deleted-File Scan",
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Question);
@@ -363,16 +417,19 @@ public partial class Form1 : Form
             return;
         }
 
-        SetBusy(true, $"Scanning NTFS deleted-file metadata on {root}...");
+        SetBusy(
+            true,
+            $"Scanning deleted NTFS metadata under {scanDirectory}...");
+
         try
         {
-            var candidates = await Task.Run(() => _mftCandidateScanner.Scan(root));
+            var candidates = await Task.Run(
+                () => _mftCandidateScanner.ScanDeletedDirectory(
+                    scanDirectory,
+                    includeSubdirectories,
+                    CancellationToken.None));
 
             var filtered = candidates
-                .Where(candidate =>
-                    selectedDirectory is null ||
-                    string.IsNullOrWhiteSpace(candidate.DirectoryPath) ||
-                    IsDirectoryMatch(candidate.DirectoryPath, selectedDirectory))
                 .Select(candidate => new RecoveryDisplayRow
                 {
                     Name = candidate.Name,
@@ -389,8 +446,8 @@ public partial class Form1 : Form
             dgvResults.DataSource = filtered;
             lblFiles.Text = $"NTFS candidates ({filtered.Count:N0})";
             lblStatus.Text = filtered.Count == 0
-                ? "No deleted-file metadata candidates were returned for this volume."
-                : $"Found {filtered.Count:N0} deleted-file metadata candidate(s). No file contents were recovered yet.";
+                ? $"No deleted-file metadata candidates were found under {scanDirectory}."
+                : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}.";
         }
         catch (UnauthorizedAccessException)
         {
@@ -1272,6 +1329,9 @@ public partial class Form1 : Form
         btnShowHistory.Enabled = !busy;
         btnClearHistory.Enabled = !busy;
         btnScanNtfs.Enabled = !busy;
+        txtScanPath.Enabled = !busy;
+        btnBrowseScanPath.Enabled = !busy;
+        chkScanSubdirectories.Enabled = !busy;
         dgvResults.Enabled = true;
         UseWaitCursor = false;
 
