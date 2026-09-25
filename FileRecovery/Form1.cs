@@ -2002,10 +2002,10 @@ public partial class Form1 : Form
                 }
 
                 // Plain-text files do not contain a reliable end marker.
-                // First use an exact byte count that AlgoLassi already knows from its
-                // deletion history / NTFS metadata. This requires no user input.
-                // If no trusted size is available, fall back to the raw-volume
-                // markerless forensic scan.
+                // Prefer an exact size already known from NTFS/history. When no trusted
+                // size is available, use a user-supplied unique content marker for a
+                // forensic whole-volume search. Never guess a file boundary by selecting
+                // an arbitrary large text-like region elsewhere on the volume.
                 if (!candidate.DataStreamFound &&
                     Path.GetExtension(candidate.Name).Equals(
                         ".txt",
@@ -2042,38 +2042,61 @@ public partial class Form1 : Form
                         catch (Exception ex)
                         {
                             exactSizeFailure = ex;
+
                             System.Diagnostics.Debug.WriteLine(
                                 $"Exact-size text recovery failed for {candidate.FullPath}: {ex.Message}");
                         }
                     }
 
-                    var wholeVolumeRoot = GetSourceVolumeRoot(candidate.FullPath);
-                    if (string.IsNullOrWhiteSpace(wholeVolumeRoot))
+                    var markerKey = NormalizePath(candidate.FullPath);
+                    var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
+                        $"The original size of '{candidate.Name}' could not be recovered from NTFS metadata.\r\n\r\n" +
+                        "Enter a unique text string that was definitely contained in the deleted file. " +
+                        "AlgoLassi will search the entire raw source volume for that marker.\r\n\r\n" +
+                        "This mode is forensic/heuristic: plain-text files do not contain a reliable " +
+                        "file boundary, so the result may be only a partial fragment.\r\n\r\n" +
+                        "Leave this blank to stop recovery for this file.",
+                        "Forensic text marker",
+                        "");
+
+                    if (string.IsNullOrWhiteSpace(enteredMarker))
                     {
+                        var reason = exactSizeFailure is null
+                            ? string.Empty
+                            : $" Exact-size recovery failed: {exactSizeFailure.Message}";
+
                         failures.Add(
-                            $"{candidate.Name}: the source volume could not be determined for forensic text recovery.");
+                            $"{candidate.Name}: no original size was available and no forensic text marker was supplied.{reason}");
                         continue;
                     }
 
-                    var totalVolumeBytes = new DriveInfo(wholeVolumeRoot).TotalSize;
-                    var forensicProgress = new SynchronousProgress<long>(
-                        this,
-                        bytesScanned =>
-                        {
-                            lblStatus.Text =
-                                $"Forensic full-volume text-region scan for {candidate.Name}... " +
-                                $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
-                                $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
-                        });
-
                     try
                     {
+                        var wholeVolumeRoot = GetSourceVolumeRoot(candidate.FullPath);
+                        if (string.IsNullOrWhiteSpace(wholeVolumeRoot))
+                        {
+                            failures.Add(
+                                $"{candidate.Name}: the source volume could not be determined for forensic text recovery.");
+                            continue;
+                        }
+
+                        var totalVolumeBytes = new DriveInfo(wholeVolumeRoot).TotalSize;
+                        var forensicProgress = new SynchronousProgress<long>(
+                            this,
+                            bytesScanned =>
+                            {
+                                lblStatus.Text =
+                                    $"Forensic full-volume text scan for {candidate.Name}... " +
+                                    $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
+                                    $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
+                            });
+
                         forensicProgress.Report(0);
 
                         var forensicRecovery = _ntfsWholeVolumeTextRecoveryService.Recover(
                             candidate,
                             destinationDirectory,
-                            string.Empty,
+                            enteredMarker,
                             CancellationToken.None,
                             forensicProgress);
 
@@ -2082,27 +2105,26 @@ public partial class Form1 : Form
                             destinationDirectory,
                             candidate.Name);
 
-                        var exactFailureText = exactSizeFailure is null
+                        var reason = exactSizeFailure is null
                             ? string.Empty
-                            : $" Exact-size recovery had already failed: {exactSizeFailure.Message}";
+                            : $" Exact-size recovery failed first: {exactSizeFailure.Message}";
 
                         failures.Add(
-                            $"{candidate.Name}: markerless forensic text-region scan recovered " +
+                            $"{candidate.Name}: forensic marker scan recovered " +
                             $"{forensicRecovery.BytesRecovered:N0} byte(s). " +
-                            $"The result is heuristic/partial evidence, not an exact reconstruction." +
-                            $"{exactFailureText} Preserved copy: {partialPath}");
+                            $"This is heuristic/partial evidence, not an exact reconstruction.{reason} " +
+                            $"Preserved copy: {partialPath}");
 
                         continue;
                     }
                     catch (Exception ex)
                     {
-                        var exactFailureText = exactSizeFailure is null
+                        var reason = exactSizeFailure is null
                             ? string.Empty
-                            : $" Exact-size recovery had already failed: {exactSizeFailure.Message}";
+                            : $" Exact-size recovery failed first: {exactSizeFailure.Message}";
 
                         failures.Add(
-                            $"{candidate.Name}: markerless whole-volume forensic scan failed: {ex.Message}." +
-                            exactFailureText);
+                            $"{candidate.Name}: forensic marker scan failed: {ex.Message}.{reason}");
                         continue;
                     }
                 }
