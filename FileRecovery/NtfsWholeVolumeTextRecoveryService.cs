@@ -36,22 +36,6 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 progress);
         }
 
-        if (string.IsNullOrWhiteSpace(marker))
-        {
-            return RecoverTextRegionWithoutMarker(
-                candidate,
-                destinationDirectory,
-                cancellationToken,
-                progress);
-        }
-
-        if (string.IsNullOrWhiteSpace(marker))
-        {
-            throw new ArgumentException(
-                "A known text marker is required for the whole-volume forensic scan.",
-                nameof(marker));
-        }
-
         var markerVariants = new[]
         {
             (
@@ -462,8 +446,9 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             Evidence =
                 $"Whole-volume forensic text-region scan found the longest qualifying " +
                 $"{best.Encoding} text-like region at raw byte offset {best.Offset:N0} and " +
-                $"recovered {recoveredData.Length:N0} contiguous byte(s). No content marker " +
-                $"was supplied, so this is heuristic evidence and cannot prove that the " +
+                $"recovered {recoveredData.Length:N0} contiguous byte(s). " +
+                $"MARKERLESS MODE: no content marker was supplied. This is heuristic evidence " +
+                $"and cannot prove that the " +
                 $"region belongs to the deleted '{candidate.Name}'. {allocationDescription}"
         };
     }
