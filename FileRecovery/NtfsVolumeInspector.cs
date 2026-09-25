@@ -16,7 +16,15 @@ public sealed class NtfsVolumeInspector
 
     public NtfsVolumeInfo Inspect(string rootPath)
     {
-        var root = Path.GetPathRoot(rootPath);
+        var normalizedPath = rootPath.Trim();
+
+        while (normalizedPath.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+               normalizedPath.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalizedPath = normalizedPath[4..];
+        }
+
+        var root = Path.GetPathRoot(normalizedPath);
         if (string.IsNullOrWhiteSpace(root))
         {
             throw new ArgumentException("A valid Windows volume path is required.", nameof(rootPath));
