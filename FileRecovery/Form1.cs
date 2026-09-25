@@ -2020,7 +2020,7 @@ public partial class Form1 : Form
                         !forensicMarkerDeclined.Contains(markerKey))
                     {
                         var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
-                            $"The original size of '{candidate.Name}' is unknown.\\r\\n\\r\\n" +
+                            $"The original size of '{candidate.Name}' is unknown.\r\n\r\n" +
                             "Enter a unique text string that was definitely contained in this " +
                             "deleted file. AlgoLassi will search every byte of the source volume " +
                             "for that exact marker and recover the contiguous text region around it.\\r\\n\\r\\n" +
@@ -2096,7 +2096,8 @@ public partial class Form1 : Form
                 }
 
                 // If an exact historical size is already known from NTFS metadata,
-                // retain the normal structural/free-space carver below.                // The retained MFT metadata may be insufficient for this candidate,
+                // retain the normal structural/free-space carver below.
+                // The retained MFT metadata may be insufficient for this candidate,
                 // but structural carving can still recover many formats without an
                 // original size. Plain text is now handled separately above: exact-size
                 // recovery is preferred, while marker-only recovery is explicitly heuristic.
