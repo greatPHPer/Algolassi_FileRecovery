@@ -2182,15 +2182,122 @@ public partial class Form1 : Form
 
                 carveProgress.Report(0);
 
-                var carved = _ntfsDeepFileRecoveryService.Recover(
-                    candidate,
-                    destinationDirectory,
-                    CancellationToken.None,
-                    maxDeepCarveBytes,
-                    carveProgress,
-                    candidate.FileSizeBytes);
+                try
+                {
+                    var carved = _ntfsDeepFileRecoveryService.Recover(
+                        candidate,
+                        destinationDirectory,
+                        CancellationToken.None,
+                        maxDeepCarveBytes,
+                        carveProgress,
+                        candidate.FileSizeBytes);
 
-                successes.Add(carved);
+                    successes.Add(carved);
+                }
+                catch (Exception deepCarveException)
+                    when (Path.GetExtension(candidate.Name).Equals(
+                               ".txt",
+                               StringComparison.OrdinalIgnoreCase) &&
+                           candidate.FileSizeBytes > 0)
+                {
+                    // Exact-size free-space carving is the preferred path. If it
+                    // cannot find the deleted text there, fall back to the older
+                    // raw whole-volume marker scan. That scan can see allocated
+                    // clusters too, which is important for fragmented or partially
+                    // overwritten deleted text files.
+                    //
+                    // The fallback remains forensic/heuristic: preserve whatever
+                    // contiguous text region the raw scan finds, but do not silently
+                    // call it an exact historical reconstruction.
+                    var markerKey = NormalizePath(candidate.FullPath);
+                    string? forensicMarker = null;
+
+                    if (!forensicMarkers.TryGetValue(markerKey, out forensicMarker) &&
+                        !forensicMarkerDeclined.Contains(markerKey))
+                    {
+                        var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
+                            $"Exact-size free-space recovery of '{candidate.Name}' failed. " +
+                            $"The requested length was {candidate.FileSizeBytes:N0} byte(s).\r\n\r\n" +
+                            "Enter a unique text string that was definitely contained in this deleted file. " +
+                            "AlgoLassi will now search the entire raw source volume, including currently allocated clusters.\r\n\r\n" +
+                            "This fallback can recover a partial contiguous region, but it is heuristic because " +
+                            "plain-text files do not carry a self-delimiting boundary.\r\n\r\n" +
+                            "Leave this blank to stop the fallback.",
+                            "Raw-volume text recovery fallback",
+                            "");
+
+                        if (string.IsNullOrWhiteSpace(enteredMarker))
+                        {
+                            forensicMarkerDeclined.Add(markerKey);
+                        }
+                        else
+                        {
+                            forensicMarker = enteredMarker;
+                            forensicMarkers[markerKey] = enteredMarker;
+                        }
+                    }
+
+                    if (string.IsNullOrWhiteSpace(forensicMarker))
+                    {
+                        failures.Add(
+                            $"{candidate.Name}: exact-size free-space recovery failed: {deepCarveException.Message}");
+                        continue;
+                    }
+
+                    var wholeVolumeRoot = GetSourceVolumeRoot(candidate.FullPath);
+                    if (string.IsNullOrWhiteSpace(wholeVolumeRoot))
+                    {
+                        failures.Add(
+                            $"{candidate.Name}: exact-size free-space recovery failed and the source volume could not be determined for the raw-volume fallback.");
+                        continue;
+                    }
+
+                    var totalVolumeBytes = new DriveInfo(wholeVolumeRoot).TotalSize;
+                    var forensicProgress = new SynchronousProgress<long>(
+                        this,
+                        bytesScanned =>
+                        {
+                            lblStatus.Text =
+                                $"Forensic full-volume scan for {candidate.Name}... " +
+                                $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
+                                $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
+                        });
+
+                    try
+                    {
+                        forensicProgress.Report(0);
+
+                        var forensicRecovery = _ntfsWholeVolumeTextRecoveryService.Recover(
+                            candidate,
+                            destinationDirectory,
+                            forensicMarker,
+                            CancellationToken.None,
+                            forensicProgress);
+
+                        var partialPath = PreserveForensicRecoveryFile(
+                            forensicRecovery.DestinationPath,
+                            destinationDirectory,
+                            candidate.Name);
+
+                        var completeness = forensicRecovery.BytesRecovered == candidate.FileSizeBytes
+                            ? $"The raw scan returned exactly {forensicRecovery.BytesRecovered:N0} byte(s), matching the supplied size, but the result is still marker-based forensic evidence rather than proof of historical file identity."
+                            : $"The raw scan returned {forensicRecovery.BytesRecovered:N0} of the expected {candidate.FileSizeBytes:N0} byte(s); this is a partial forensic recovery.";
+
+                        failures.Add(
+                            $"{candidate.Name}: exact-size free-space recovery failed ({deepCarveException.Message}). " +
+                            $"{completeness} " +
+                            $"Preserved fallback copy: {partialPath}");
+
+                        continue;
+                    }
+                    catch (Exception forensicException)
+                    {
+                        failures.Add(
+                            $"{candidate.Name}: exact-size free-space recovery failed: {deepCarveException.Message}. " +
+                            $"Raw-volume fallback also failed: {forensicException.Message}");
+                        continue;
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -2522,6 +2629,28 @@ public partial class Form1 : Form
 
         return string.Equals(left, right, StringComparison.OrdinalIgnoreCase)
             || left.StartsWith(right + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string PreserveForensicRecoveryFile(
+        string sourcePath,
+        string destinationDirectory,
+        string originalName)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath) ||
+            !File.Exists(sourcePath))
+        {
+            throw new InvalidOperationException(
+                "The raw-volume forensic scan did not produce a recoverable output file.");
+        }
+
+        var forensicName = $"{originalName}.forensic.partial";
+        var destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
+            destinationDirectory,
+            forensicName);
+
+        File.Move(sourcePath, destinationPath);
+
+        return destinationPath;
     }
 
     private static void TryDeleteRecoveredFile(string? path)
