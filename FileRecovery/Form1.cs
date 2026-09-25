@@ -1371,7 +1371,7 @@ public partial class Form1 : Form
             var historicalMatches = await Task.Run(
                     () => _usnMonitor.ResolveHistoricalDeletionsFromJournal(
                         targets,
-                        scanCancellationToken))
+                        CancellationToken.None))
                 .ConfigureAwait(true);
 
             var matchesByPath = historicalMatches
@@ -1991,7 +1991,7 @@ public partial class Form1 : Form
                         Path.GetExtension(candidate.Name),
                         long.MaxValue,
                         progress: null,
-                        cancellationToken: scanCancellationToken,
+                        cancellationToken: CancellationToken.None,
                         out var slackData,
                         out var slackSourceFile) &&
                         slackData.Length > 0)
@@ -2069,7 +2069,7 @@ public partial class Form1 : Form
                             var exactRecovery = _ntfsDeepFileRecoveryService.Recover(
                                 candidate,
                                 destinationDirectory,
-                                scanCancellationToken,
+                                CancellationToken.None,
                                 NtfsDeepFileRecoveryService.DefaultMaxBytesToScan,
                                 exactProgress,
                                 candidate.FileSizeBytes);
@@ -2135,7 +2135,7 @@ public partial class Form1 : Form
                             candidate,
                             destinationDirectory,
                             enteredMarker,
-                            scanCancellationToken,
+                            CancellationToken.None,
                             forensicProgress);
 
                         var partialPath = PreserveForensicRecoveryFile(
@@ -2206,7 +2206,7 @@ public partial class Form1 : Form
                 var carved = _ntfsDeepFileRecoveryService.Recover(
                     candidate,
                     destinationDirectory,
-                    scanCancellationToken,
+                    CancellationToken.None,
                     maxDeepCarveBytes,
                     carveProgress,
                     candidate.FileSizeBytes);
