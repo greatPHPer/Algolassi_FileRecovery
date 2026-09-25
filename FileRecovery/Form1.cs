@@ -1112,9 +1112,25 @@ public partial class Form1 : Form
         }
         finally
         {
+            _ntfsScanCancellationSource = null;
             _ntfsScanInProgress = false;
             SetBusy(false);
             UpdateRecoverButton();
+        }
+    }
+
+    private void btnStopNtfsScan_Click(object? sender, EventArgs e)
+    {
+        if (!_ntfsScanInProgress || _ntfsScanCancellationSource is null)
+        {
+            return;
+        }
+
+        if (!_ntfsScanCancellationSource.IsCancellationRequested)
+        {
+            lblStatus.Text = "Stopping NTFS deleted-file scan...";
+            btnStopNtfsScan.Enabled = false;
+            _ntfsScanCancellationSource.Cancel();
         }
     }
 
