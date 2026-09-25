@@ -11,7 +11,8 @@ partial class Form1
     private ListBox lstDirectories = null!;
     private Button btnScanDirectory = null!;
     private Button btnScanNtfs = null!;
-    private Button btnStopNtfsScan = null!;
+    private Button btnPauseNtfsScan = null!;
+    private Button btnResumeNtfsScan = null!;
     private Button btnRawVolumeMarker = null!;
     private TextBox txtScanPath = null!;
     private Button btnBrowseScanPath = null!;
@@ -48,7 +49,8 @@ partial class Form1
         lstDirectories = new ListBox();
         btnScanDirectory = new Button();
         btnScanNtfs = new Button();
-        btnStopNtfsScan = new Button();
+        btnPauseNtfsScan = new Button();
+        btnResumeNtfsScan = new Button();
         btnRawVolumeMarker = new Button();
         txtScanPath = new TextBox();
         btnBrowseScanPath = new Button();
@@ -134,11 +136,18 @@ partial class Form1
         btnScanNtfs.UseVisualStyleBackColor = true;
         btnScanNtfs.Click += btnScanNtfs_Click;
 
-        btnStopNtfsScan.Location = new Point(704, 198);
-        btnStopNtfsScan.Size = new Size(156, 30);
-        btnStopNtfsScan.Text = "Stop NTFS Scan";
-        btnStopNtfsScan.UseVisualStyleBackColor = true;
-        btnStopNtfsScan.Click += btnStopNtfsScan_Click;
+        btnPauseNtfsScan.Location = new Point(704, 198);
+        btnPauseNtfsScan.Size = new Size(156, 30);
+        btnPauseNtfsScan.Text = "Pause History Scan";
+        btnPauseNtfsScan.UseVisualStyleBackColor = true;
+        btnPauseNtfsScan.Click += btnPauseNtfsScan_Click;
+
+        btnResumeNtfsScan.Location = new Point(704, 198);
+        btnResumeNtfsScan.Size = new Size(156, 30);
+        btnResumeNtfsScan.Text = "Resume History Scan";
+        btnResumeNtfsScan.UseVisualStyleBackColor = true;
+        btnResumeNtfsScan.Click += btnResumeNtfsScan_Click;
+        btnResumeNtfsScan.Visible = false;
 
         btnRawVolumeMarker.Location = new Point(704, 158);
         btnRawVolumeMarker.Size = new Size(156, 36);
@@ -156,7 +165,9 @@ partial class Form1
         chkScanSubdirectories.UseVisualStyleBackColor = true;
         chkScanSubdirectories.TabIndex = 1;
 
-        btnStopNtfsScan.Enabled = false;
+        btnPauseNtfsScan.Enabled = false;
+        btnResumeNtfsScan.Enabled = false;
+        btnResumeNtfsScan.Visible = false;
 
         lblFiles.AutoSize = true;
         lblFiles.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
@@ -239,7 +250,8 @@ partial class Form1
         Controls.Add(lblFiles);
         Controls.Add(chkScanSubdirectories);
         Controls.Add(btnScanNtfs);
-        Controls.Add(btnStopNtfsScan);
+        Controls.Add(btnPauseNtfsScan);
+        Controls.Add(btnResumeNtfsScan);
         Controls.Add(btnRawVolumeMarker);
         Controls.Add(btnBrowseScanPath);
         Controls.Add(txtScanPath);
