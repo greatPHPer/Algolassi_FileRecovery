@@ -23,7 +23,8 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         string destinationDirectory,
         string marker,
         CancellationToken cancellationToken = default,
-        IProgress<long>? progress = null)
+        IProgress<long>? progress = null,
+        bool allowRetainedDataRecoveryFailureFallback = false)
     {
         ArgumentNullException.ThrowIfNull(candidate);
 
@@ -61,10 +62,11 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 nameof(marker));
         }
 
-        if (candidate.DataStreamFound)
+        if (candidate.DataStreamFound &&
+            !allowRetainedDataRecoveryFailureFallback)
         {
             throw new InvalidOperationException(
-                "Whole-volume forensic text scanning is only required for candidates without retained NTFS $DATA evidence.");
+                "Whole-volume forensic text scanning is only required for candidates without retained NTFS $DATA evidence or after a retained $DATA recovery attempt has failed.");
         }
 
         if (!Path.GetExtension(candidate.Name).Equals(
