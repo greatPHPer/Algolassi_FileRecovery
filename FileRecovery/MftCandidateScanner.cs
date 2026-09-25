@@ -40,7 +40,8 @@ public sealed class MftCandidateScanner
         string rootPath,
         IReadOnlyCollection<string> targetPaths,
         CancellationToken cancellationToken = default,
-        int maxPages = 128)
+        int maxPages = 128,
+        Action? pauseAction = null)
     {
         ArgumentNullException.ThrowIfNull(targetPaths);
 
@@ -62,7 +63,8 @@ public sealed class MftCandidateScanner
             targetDirectory: null,
             includeSubdirectories: false,
             cancellationToken: cancellationToken,
-            maxPages: maxPages);
+            maxPages: maxPages,
+            pauseAction: pauseAction);
     }
 
     public async Task<IReadOnlyList<RecoveryCandidate>> ScanRawMftForPathsAsync(
@@ -71,7 +73,8 @@ public sealed class MftCandidateScanner
         CancellationToken cancellationToken = default,
         long maxBytesToScan = 512L * 1024L * 1024L,
         IProgress<long>? progress = null,
-        IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, DateTime DeletedAtUtc)>? targetReferences = null)
+        IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, DateTime DeletedAtUtc)>? targetReferences = null,
+        Action? pauseAction = null)
     {
         ArgumentNullException.ThrowIfNull(targetPaths);
 
@@ -193,6 +196,7 @@ public sealed class MftCandidateScanner
 
         while (scanned < bytesToScan)
         {
+            pauseAction?.Invoke();
             cancellationToken.ThrowIfCancellationRequested();
 
             var remaining = bytesToScan - scanned;
@@ -228,6 +232,11 @@ public sealed class MftCandidateScanner
 
             for (var offset = 0; offset < usableBytes; offset += recordSize)
             {
+                if ((offset / recordSize) % 256 == 0)
+                {
+                    pauseAction?.Invoke();
+                }
+
                 cancellationToken.ThrowIfCancellationRequested();
 
                 // Parse the FILE record directly from the read buffer. Avoid
@@ -538,7 +547,8 @@ public sealed class MftCandidateScanner
     public IReadOnlyList<RecoveryCandidate> ScanForFileReferences(
         string rootPath,
         IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, DateTime DeletedAtUtc)> targets,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Action? pauseAction = null)
     {
         ArgumentNullException.ThrowIfNull(targets);
 
@@ -580,6 +590,7 @@ public sealed class MftCandidateScanner
 
         foreach (var target in normalizedTargets)
         {
+            pauseAction?.Invoke();
             cancellationToken.ThrowIfCancellationRequested();
 
             var directoryPath = target.ParentFileReferenceNumber == 0
@@ -655,7 +666,8 @@ public sealed class MftCandidateScanner
         string? targetDirectory,
         bool includeSubdirectories,
         CancellationToken cancellationToken,
-        int maxPages)
+        int maxPages,
+        Action? pauseAction = null)
     {
         var root = Path.GetPathRoot(rootPath);
         if (string.IsNullOrWhiteSpace(root))
@@ -692,6 +704,8 @@ public sealed class MftCandidateScanner
         while (!cancellationToken.IsCancellationRequested &&
                pagesRead < maxPages)
         {
+            pauseAction?.Invoke();
+            cancellationToken.ThrowIfCancellationRequested();
             pagesRead++;
 
             var request = new MftEnumDataV0
