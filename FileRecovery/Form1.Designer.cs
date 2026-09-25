@@ -11,6 +11,7 @@ partial class Form1
     private ListBox lstDirectories = null!;
     private Button btnScanDirectory = null!;
     private Button btnScanNtfs = null!;
+    private Button btnStopNtfsScan = null!;
     private Button btnRawVolumeMarker = null!;
     private TextBox txtScanPath = null!;
     private Button btnBrowseScanPath = null!;
@@ -47,6 +48,7 @@ partial class Form1
         lstDirectories = new ListBox();
         btnScanDirectory = new Button();
         btnScanNtfs = new Button();
+        btnStopNtfsScan = new Button();
         btnRawVolumeMarker = new Button();
         txtScanPath = new TextBox();
         btnBrowseScanPath = new Button();
@@ -132,6 +134,12 @@ partial class Form1
         btnScanNtfs.UseVisualStyleBackColor = true;
         btnScanNtfs.Click += btnScanNtfs_Click;
 
+        btnStopNtfsScan.Location = new Point(704, 198);
+        btnStopNtfsScan.Size = new Size(156, 30);
+        btnStopNtfsScan.Text = "Stop NTFS Scan";
+        btnStopNtfsScan.UseVisualStyleBackColor = true;
+        btnStopNtfsScan.Click += btnStopNtfsScan_Click;
+
         btnRawVolumeMarker.Location = new Point(704, 158);
         btnRawVolumeMarker.Size = new Size(156, 36);
         btnRawVolumeMarker.Text = "Raw Volume Marker Test";
@@ -147,6 +155,8 @@ partial class Form1
         chkScanSubdirectories.Text = "Include subdirectories";
         chkScanSubdirectories.UseVisualStyleBackColor = true;
         chkScanSubdirectories.TabIndex = 1;
+
+        btnStopNtfsScan.Enabled = false;
 
         lblFiles.AutoSize = true;
         lblFiles.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
@@ -229,6 +239,7 @@ partial class Form1
         Controls.Add(lblFiles);
         Controls.Add(chkScanSubdirectories);
         Controls.Add(btnScanNtfs);
+        Controls.Add(btnStopNtfsScan);
         Controls.Add(btnRawVolumeMarker);
         Controls.Add(btnBrowseScanPath);
         Controls.Add(txtScanPath);
