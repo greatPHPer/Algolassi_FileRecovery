@@ -2095,7 +2095,9 @@ public partial class Form1 : Form
                                 destinationDirectory,
                                 forensicMarker,
                                 CancellationToken.None,
-                                forensicProgress);
+                                forensicProgress,
+                                allowRetainedDataRecoveryFailureFallback:
+                                    dataStreamRecoveryFailure is not null);
 
                             successes.Add(forensicRecovery);
                             continue;
