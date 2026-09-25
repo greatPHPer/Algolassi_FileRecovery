@@ -22,6 +22,12 @@ public sealed class NtfsVolumeInspector
             throw new ArgumentException("A valid Windows volume path is required.", nameof(rootPath));
         }
 
+        if (root is { Length: 2 } &&
+            root[1] == ':')
+        {
+            root += Path.DirectorySeparatorChar;
+        }
+
         var drive = new DriveInfo(root);
         if (!drive.IsReady)
         {
