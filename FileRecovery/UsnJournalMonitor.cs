@@ -172,7 +172,8 @@ public sealed class UsnJournalMonitor : IDisposable
     public IReadOnlyList<UsnDeletedFileRecord> ScanDeletedDirectory(
         string targetDirectory,
         bool includeSubdirectories,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Action? pauseAction = null)
     {
         WindowsPrivilege.EnableSeBackupPrivilege();
 
@@ -242,6 +243,9 @@ public sealed class UsnJournalMonitor : IDisposable
         while (!cancellationToken.IsCancellationRequested &&
                nextUsn < journal.NextUsn)
         {
+            pauseAction?.Invoke();
+            cancellationToken.ThrowIfCancellationRequested();
+
             var records = ReadRecords(
                 volumeHandle,
                 journal.JournalId,
@@ -276,6 +280,7 @@ public sealed class UsnJournalMonitor : IDisposable
 
         foreach (var record in latestDeletes.Values)
         {
+            pauseAction?.Invoke();
             cancellationToken.ThrowIfCancellationRequested();
 
             if (!parentPathCache.TryGetValue(
