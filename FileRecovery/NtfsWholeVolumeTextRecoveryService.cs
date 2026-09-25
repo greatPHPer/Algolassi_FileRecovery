@@ -1000,6 +1000,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                codeUnit is >= 0x0020 and <= 0x007E ||
                codeUnit is >= 0x00A0 and <= 0xD7FF ||
                codeUnit is >= 0xE000 and <= 0xFFFD;
+    }
 
     private static string? GetNtfsVolumeRoot(string path)
     {
