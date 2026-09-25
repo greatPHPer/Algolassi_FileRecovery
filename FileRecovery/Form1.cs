@@ -2002,13 +2002,13 @@ public partial class Form1 : Form
                 }
 
                 // Plain-text files do not contain a reliable end marker.
-                // When NTFS still knows the original size, the exact-size free-space
-                // carver is preferred. When the size is unknown (the normal deleted-
-                // file case), do NOT ask the user to guess or recover the byte count.
-                // Go directly to the marker-driven whole-volume forensic scan so that
+                // For deleted plain-text candidates without a retained $DATA stream,
+                // do not use an inferred/history/slack byte count to force a broad
+                // free-space exact-size carve. The practical forensic workflow is to
+                // use the known-content marker and scan the entire raw volume so that
                 // retained data in both free and currently allocated clusters can be
                 // found, matching the successful 27.17 workflow.
-                if (candidate.FileSizeBytes <= 0 &&
+                if (!candidate.DataStreamFound &&
                     Path.GetExtension(candidate.Name).Equals(
                         ".txt",
                         StringComparison.OrdinalIgnoreCase))
