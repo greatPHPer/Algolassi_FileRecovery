@@ -2002,95 +2002,66 @@ public partial class Form1 : Form
                 }
 
                 // Plain-text files do not contain a reliable end marker.
-                // For deleted plain-text candidates without a retained $DATA stream,
-                // do not use an inferred/history/slack byte count to force a broad
-                // free-space exact-size carve. The practical forensic workflow is to
-                // use the known-content marker and scan the entire raw volume so that
-                // retained data in both free and currently allocated clusters can be
-                // found, matching the successful 27.17 workflow.
+                // For deleted .txt files without a retained NTFS $DATA stream,
+                // use the markerless raw-volume forensic scan directly.
+                //
+                // Do not ask the user for the original byte count or a content marker:
+                // those values are often unavailable after deletion, and marker-based
+                // recovery can return only the marker itself. The markerless path is
+                // explicitly heuristic and preserves a partial candidate for inspection.
                 if (!candidate.DataStreamFound &&
                     Path.GetExtension(candidate.Name).Equals(
                         ".txt",
                         StringComparison.OrdinalIgnoreCase))
                 {
-                    var markerKey = NormalizePath(candidate.FullPath);
-                    string? forensicMarker = null;
-
-                    if (!forensicMarkers.TryGetValue(markerKey, out forensicMarker) &&
-                        !forensicMarkerDeclined.Contains(markerKey))
+                    var wholeVolumeRoot = GetSourceVolumeRoot(candidate.FullPath);
+                    if (string.IsNullOrWhiteSpace(wholeVolumeRoot))
                     {
-                        var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
-                            $"The original size of '{candidate.Name}' is unknown.\r\n\r\n" +
-                            "Enter a unique text string that was definitely contained in this " +
-                            "deleted file. AlgoLassi will search the entire raw source volume " +
-                            "for that marker and expand around it.\r\n\r\n" +
-                            "LEAVE THIS BLANK to search for the longest qualifying text-like " +
-                            "region instead. That mode is exploratory and cannot prove that " +
-                            "the selected region belongs to the deleted file.\r\n\r\n",
-                            "Forensic text recovery",
-                            "");
-
-                        if (string.IsNullOrWhiteSpace(enteredMarker))
-                        {
-                            forensicMarkerDeclined.Add(markerKey);
-                        }
-                        else
-                        {
-                            forensicMarker = enteredMarker;
-                            forensicMarkers[markerKey] = enteredMarker;
-                        }
+                        failures.Add(
+                            $"{candidate.Name}: the source volume could not be determined for the whole-volume forensic scan.");
+                        continue;
                     }
 
+                    var totalVolumeBytes = new DriveInfo(wholeVolumeRoot).TotalSize;
+                    var forensicProgress = new SynchronousProgress<long>(
+                        this,
+                        bytesScanned =>
+                        {
+                            lblStatus.Text =
+                                $"Forensic full-volume text-region scan for {candidate.Name}... " +
+                                $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
+                                $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
+                        });
+
+                    try
                     {
-                        var wholeVolumeRoot = GetSourceVolumeRoot(candidate.FullPath);
-                        if (string.IsNullOrWhiteSpace(wholeVolumeRoot))
-                        {
-                            failures.Add(
-                                $"{candidate.Name}: the source volume could not be determined for the whole-volume forensic scan.");
-                            continue;
-                        }
+                        forensicProgress.Report(0);
 
-                        var totalVolumeBytes = new DriveInfo(wholeVolumeRoot).TotalSize;
-                        var forensicProgress = new SynchronousProgress<long>(
-                            this,
-                            bytesScanned =>
-                            {
-                                lblStatus.Text =
-                                    $"Forensic full-volume scan for {candidate.Name}... " +
-                                    $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
-                                    $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
-                            });
+                        var forensicRecovery = _ntfsWholeVolumeTextRecoveryService.Recover(
+                            candidate,
+                            destinationDirectory,
+                            string.Empty,
+                            CancellationToken.None,
+                            forensicProgress);
 
-                        try
-                        {
-                            forensicProgress.Report(0);
+                        var partialPath = PreserveForensicRecoveryFile(
+                            forensicRecovery.DestinationPath,
+                            destinationDirectory,
+                            candidate.Name);
 
-                            var forensicRecovery = _ntfsWholeVolumeTextRecoveryService.Recover(
-                                candidate,
-                                destinationDirectory,
-                                forensicMarker,
-                                CancellationToken.None,
-                                forensicProgress);
+                        failures.Add(
+                            $"{candidate.Name}: markerless forensic text-region scan recovered " +
+                            $"{forensicRecovery.BytesRecovered:N0} byte(s). " +
+                            $"The result is heuristic/partial evidence, not an exact reconstruction. " +
+                            $"Preserved copy: {partialPath}");
 
-                            var partialPath = PreserveForensicRecoveryFile(
-                                forensicRecovery.DestinationPath,
-                                destinationDirectory,
-                                candidate.Name);
-
-                            failures.Add(
-                                $"{candidate.Name}: forensic text scan recovered " +
-                                $"{forensicRecovery.BytesRecovered:N0} byte(s). " +
-                                $"The result is heuristic/partial evidence, not an exact reconstruction. " +
-                                $"Preserved copy: {partialPath}");
-
-                            continue;
-                        }
-                        catch (Exception ex)
-                        {
-                            failures.Add(
-                                $"{candidate.Name}: whole-volume forensic scan failed: {ex.Message}");
-                            continue;
-                        }
+                        continue;
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add(
+                            $"{candidate.Name}: markerless whole-volume forensic scan failed: {ex.Message}");
+                        continue;
                     }
                 }
 
