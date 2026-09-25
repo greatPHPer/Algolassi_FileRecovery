@@ -98,6 +98,8 @@ public sealed class MftCandidateScanner
             throw new ArgumentException("A valid Windows volume path is required.", nameof(rootPath));
         }
 
+        root = NormalizeDriveRoot(root);
+
         if (!string.Equals(
                 new DriveInfo(root).DriveFormat,
                 "NTFS",
@@ -566,6 +568,8 @@ public sealed class MftCandidateScanner
             throw new ArgumentException("A valid Windows volume path is required.", nameof(rootPath));
         }
 
+        root = NormalizeDriveRoot(root);
+
         if (!string.Equals(new DriveInfo(root).DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException("Permanent deleted-file scanning currently supports NTFS volumes only.");
@@ -996,6 +1000,19 @@ public sealed class MftCandidateScanner
         ulong ParentFileReferenceNumber,
         string Name,
         DateTime TimestampUtc);
+
+    private static string NormalizeDriveRoot(string path)
+    {
+        var root = Path.GetPathRoot(path.Trim());
+
+        if (root is { Length: 2 } &&
+            root[1] == ':')
+        {
+            root += Path.DirectorySeparatorChar;
+        }
+
+        return root ?? path;
+    }
 
     private static string NormalizePath(string path) =>
         path.Trim().Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
