@@ -2526,7 +2526,15 @@ public partial class Form1 : Form
             normalized = normalized[4..];
         }
 
-        return Path.GetPathRoot(normalized);
+        var root = Path.GetPathRoot(normalized);
+
+        if (root is { Length: 2 } &&
+            root[1] == ':')
+        {
+            root += Path.DirectorySeparatorChar;
+        }
+
+        return root;
     }
 
     private static string NormalizePath(string value) =>
