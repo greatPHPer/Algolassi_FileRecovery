@@ -1816,7 +1816,6 @@ public partial class Form1 : Form
                         // Do not abandon a text candidate: fall through to the
                         // marker-driven whole-volume forensic path below.
                         dataStreamRecoveryFailure = ex;
-                        candidate.DataStreamFound = false;
 
                         System.Diagnostics.Debug.WriteLine(
                             $"NTFS $DATA recovery failed for text candidate " +
