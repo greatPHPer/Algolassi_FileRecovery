@@ -24,6 +24,7 @@ public partial class Form1 : Form
     private bool _operationInProgress;
     private bool _ntfsResultsDisplayed;
     private bool _ntfsScanInProgress;
+    private CancellationTokenSource? _ntfsScanCancellationSource;
 
     public void CloseFromApplication()
     {
@@ -516,18 +517,21 @@ public partial class Form1 : Form
             return;
         }
 
+        _ntfsScanInProgress = true;
+        using var ntfsScanCancellationSource = new CancellationTokenSource();
+        _ntfsScanCancellationSource = ntfsScanCancellationSource;
+        var scanCancellationToken = ntfsScanCancellationSource.Token;
+
         SetBusy(
             true,
             $"Scanning deleted NTFS metadata under {scanDirectory}...");
-
-        _ntfsScanInProgress = true;
 
         try
         {
             var deletedRecords = _usnMonitor.ScanDeletedDirectory(
                 scanDirectory,
                 includeSubdirectories,
-                CancellationToken.None);
+                scanCancellationToken);
 
             // The background monitor can observe a deletion immediately while this
             // on-demand historical journal reconstruction can still miss that same
@@ -617,7 +621,7 @@ public partial class Form1 : Form
 
             if (historyNeedingResolution.Count > 0)
             {
-                await ResolveMissingNtfsReferencesAsync(historyNeedingResolution);
+                await ResolveMissingNtfsReferencesAsync(historyNeedingResolution, scanCancellationToken);
             }
 
             historyRecords = _history.GetRecent()
@@ -739,7 +743,7 @@ public partial class Form1 : Form
                     var pathCandidates = _mftCandidateScanner.ScanForPaths(
                         rootPath,
                         recentTargetRecordsByPath.Keys.ToList(),
-                        CancellationToken.None,
+                        scanCancellationToken,
                         maxPages: 128);
 
                     directLiveCandidates = pathCandidates
@@ -773,7 +777,7 @@ public partial class Form1 : Form
             var candidates = _mftCandidateScanner.ScanForFileReferences(
                 rootPath,
                 targetRecords,
-                CancellationToken.None)
+                scanCancellationToken)
                 .ToList();
 
             var candidatePaths = candidates
@@ -807,7 +811,7 @@ public partial class Form1 : Form
                     await _mftCandidateScanner.ScanRawMftForPathsAsync(
                         rootPath,
                         missingDataPaths,
-                        CancellationToken.None,
+                        scanCancellationToken,
                         maxBytesToScan: long.MaxValue,
                         targetReferences: missingDataCandidates
                             .Where(candidate => candidate.FileReferenceNumber != 0)
@@ -1081,6 +1085,11 @@ public partial class Form1 : Form
                       $"{mergedLiveUsnCount + mergedLiveHistoryCount + directLiveCandidates.Count + liveEvidenceCandidateCount:N0} recent live deletion evidence item(s) were included."
                     : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}.";
         }
+        catch (OperationCanceledException) when (_ntfsScanCancellationSource?.IsCancellationRequested == true)
+        {
+            _ntfsResultsDisplayed = false;
+            lblStatus.Text = "NTFS scan stopped by user.";
+        }
         catch (UnauthorizedAccessException)
         {
             MessageBox.Show(
@@ -1272,7 +1281,8 @@ public partial class Form1 : Form
     }
 
     private async Task<List<DeletionRecord>> ResolveMissingNtfsReferencesAsync(
-        IReadOnlyList<DeletionRecord> records)
+        IReadOnlyList<DeletionRecord> records,
+        CancellationToken cancellationToken = default)
     {
         var resolved = new List<DeletionRecord>();
         var unresolved = new List<DeletionRecord>();
@@ -1280,6 +1290,7 @@ public partial class Form1 : Form
 
         foreach (var record in records)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (record.FileReferenceNumber.HasValue &&
                 record.ParentFileReferenceNumber.HasValue)
             {
@@ -1311,7 +1322,7 @@ public partial class Form1 : Form
 
                     if (attempt < 4)
                     {
-                        await Task.Delay(200).ConfigureAwait(true);
+                        await Task.Delay(200, cancellationToken).ConfigureAwait(true);
                     }
                 }
             }
@@ -1334,7 +1345,7 @@ public partial class Form1 : Form
             var historicalMatches = await Task.Run(
                     () => _usnMonitor.ResolveHistoricalDeletionsFromJournal(
                         targets,
-                        CancellationToken.None))
+                        scanCancellationToken))
                 .ConfigureAwait(true);
 
             var matchesByPath = historicalMatches
@@ -1370,6 +1381,7 @@ public partial class Form1 : Form
 
         foreach (var record in resolved)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             await Task.Run(() => _history.Upsert(record)).ConfigureAwait(true);
         }
 
@@ -1953,7 +1965,7 @@ public partial class Form1 : Form
                         Path.GetExtension(candidate.Name),
                         long.MaxValue,
                         progress: null,
-                        cancellationToken: CancellationToken.None,
+                        cancellationToken: scanCancellationToken,
                         out var slackData,
                         out var slackSourceFile) &&
                         slackData.Length > 0)
@@ -2031,7 +2043,7 @@ public partial class Form1 : Form
                             var exactRecovery = _ntfsDeepFileRecoveryService.Recover(
                                 candidate,
                                 destinationDirectory,
-                                CancellationToken.None,
+                                scanCancellationToken,
                                 NtfsDeepFileRecoveryService.DefaultMaxBytesToScan,
                                 exactProgress,
                                 candidate.FileSizeBytes);
@@ -2097,7 +2109,7 @@ public partial class Form1 : Form
                             candidate,
                             destinationDirectory,
                             enteredMarker,
-                            CancellationToken.None,
+                            scanCancellationToken,
                             forensicProgress);
 
                         var partialPath = PreserveForensicRecoveryFile(
@@ -2168,7 +2180,7 @@ public partial class Form1 : Form
                 var carved = _ntfsDeepFileRecoveryService.Recover(
                     candidate,
                     destinationDirectory,
-                    CancellationToken.None,
+                    scanCancellationToken,
                     maxDeepCarveBytes,
                     carveProgress,
                     candidate.FileSizeBytes);
@@ -2477,6 +2489,9 @@ public partial class Form1 : Form
         txtScanPath.Enabled = !busy;
         btnBrowseScanPath.Enabled = !busy;
         chkScanSubdirectories.Enabled = !busy;
+        btnStopNtfsScan.Enabled = _ntfsScanInProgress && busy &&
+                                  _ntfsScanCancellationSource is not null &&
+                                  !_ntfsScanCancellationSource.IsCancellationRequested;
         dgvResults.Enabled = true;
         UseWaitCursor = false;
 
