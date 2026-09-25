@@ -29,6 +29,24 @@ public sealed class NtfsWholeVolumeTextRecoveryService
 
         if (string.IsNullOrWhiteSpace(marker))
         {
+            return RecoverTextRegionWithoutMarker(
+                candidate,
+                destinationDirectory,
+                cancellationToken,
+                progress);
+        }
+
+        if (string.IsNullOrWhiteSpace(marker))
+        {
+            return RecoverTextRegionWithoutMarker(
+                candidate,
+                destinationDirectory,
+                cancellationToken,
+                progress);
+        }
+
+        if (string.IsNullOrWhiteSpace(marker))
+        {
             throw new ArgumentException(
                 "A known text marker is required for the whole-volume forensic scan.",
                 nameof(marker));
@@ -272,6 +290,366 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             $"The supplied text marker was not found in the first " +
             $"{scannedBytes:N0} byte(s) of the NTFS volume.");
     }
+
+    private RecoveryResult RecoverTextRegionWithoutMarker(
+        RecoveryCandidate candidate,
+        string destinationDirectory,
+        CancellationToken cancellationToken,
+        IProgress<long>? progress)
+    {
+        const int minimumCandidateBytes = 4096;
+
+        RecoveryDestinationPolicy.Validate(candidate.FullPath, destinationDirectory);
+        WindowsPrivilege.EnableSeBackupPrivilege();
+
+        var sourceRoot = GetNtfsVolumeRoot(candidate.FullPath);
+        if (string.IsNullOrWhiteSpace(sourceRoot))
+        {
+            throw new InvalidOperationException(
+                "The deleted file's source volume could not be determined.");
+        }
+
+        var volumeInfo = new NtfsVolumeInspector().Inspect(sourceRoot);
+        var totalVolumeBytes = checked(
+            volumeInfo.TotalClusters * (long)volumeInfo.BytesPerCluster);
+
+        if (totalVolumeBytes <= 0)
+        {
+            throw new InvalidOperationException(
+                "The NTFS volume reported an invalid total byte length.");
+        }
+
+        using var volumeHandle = CreateVolumeHandle(sourceRoot);
+
+        long scannedBytes = 0;
+        long lastReportedBytes = 0;
+        var best = new TextRegionCandidate(-1, 0, string.Empty);
+
+        progress?.Report(0);
+
+        while (scannedBytes < totalVolumeBytes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var remaining = totalVolumeBytes - scannedBytes;
+            var bytesToRead = (int)Math.Min(IoBufferSize, remaining);
+            bytesToRead -= bytesToRead % checked((int)volumeInfo.BytesPerCluster);
+
+            if (bytesToRead < volumeInfo.BytesPerCluster)
+            {
+                break;
+            }
+
+            var physicalOffset = scannedBytes;
+            byte[]? buffer = null;
+            var attemptedBytes = bytesToRead;
+
+            while (attemptedBytes >= volumeInfo.BytesPerCluster)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                try
+                {
+                    buffer = new byte[attemptedBytes];
+                    ReadAt(volumeHandle, physicalOffset, buffer, cancellationToken);
+                    break;
+                }
+                catch (Win32Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS whole-volume text-region scan read retry: " +
+                        $"offset={physicalOffset:N0}, requested={attemptedBytes:N0}, " +
+                        $"error={ex.NativeErrorCode}, message={ex.Message}.");
+
+                    attemptedBytes /= 2;
+                    attemptedBytes -=
+                        attemptedBytes % checked((int)volumeInfo.BytesPerCluster);
+                }
+            }
+
+            if (buffer is null)
+            {
+                scannedBytes = checked(
+                    scannedBytes + volumeInfo.BytesPerCluster);
+
+                if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
+                    scannedBytes == totalVolumeBytes)
+                {
+                    lastReportedBytes = scannedBytes;
+                    progress?.Report(scannedBytes);
+                }
+
+                continue;
+            }
+
+            var regions = FindTextRegions(
+                buffer,
+                physicalOffset,
+                minimumCandidateBytes);
+
+            foreach (var region in regions)
+            {
+                if (region.Length > best.Length)
+                {
+                    best = region;
+                }
+            }
+
+            scannedBytes = checked(scannedBytes + buffer.Length);
+
+            if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
+                scannedBytes == totalVolumeBytes)
+            {
+                lastReportedBytes = scannedBytes;
+                progress?.Report(scannedBytes);
+            }
+        }
+
+        progress?.Report(scannedBytes);
+
+        if (best.Offset < 0 || best.Length < minimumCandidateBytes)
+        {
+            throw new InvalidOperationException(
+                $"No text-like region of at least {minimumCandidateBytes:N0} byte(s) was found in the first " +
+                $"{scannedBytes:N0} byte(s) of the NTFS volume.");
+        }
+
+        var recoveredData = new byte[best.Length];
+        ReadAt(volumeHandle, best.Offset, recoveredData, cancellationToken);
+
+        var destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
+            destinationDirectory,
+            candidate.Name);
+
+        try
+        {
+            File.WriteAllBytes(destinationPath, recoveredData);
+        }
+        catch
+        {
+            TryDelete(destinationPath);
+            throw;
+        }
+
+        var firstCluster = best.Offset / volumeInfo.BytesPerCluster;
+        var lastClusterExclusive = checked(
+            (best.Offset + best.Length + volumeInfo.BytesPerCluster - 1) /
+            volumeInfo.BytesPerCluster);
+        var clusterCount = checked(lastClusterExclusive - firstCluster);
+
+        var allocation = new NtfsVolumeBitmapReader().CheckExtents(
+            volumeHandle,
+            [
+                new NtfsDataExtent
+                {
+                    VirtualClusterNumber = 0,
+                    LogicalClusterNumber = firstCluster,
+                    ClusterCount = clusterCount
+                }
+            ],
+            cancellationToken);
+
+        var allocationDescription = allocation.Count == 1
+            ? $"Bitmap classification: {allocation[0].AllocatedClusterCount:N0} allocated cluster(s), {allocation[0].FreeClusterCount:N0} free cluster(s)."
+            : "Bitmap classification was unavailable for the selected region.";
+
+        return new RecoveryResult
+        {
+            Success = true,
+            SourcePath = candidate.FullPath,
+            DestinationPath = destinationPath,
+            BytesRecovered = recoveredData.Length,
+            Evidence =
+                $"Whole-volume forensic text-region scan found the longest qualifying " +
+                $"{best.Encoding} text-like region at raw byte offset {best.Offset:N0} and " +
+                $"recovered {recoveredData.Length:N0} contiguous byte(s). No content marker " +
+                $"was supplied, so this is heuristic evidence and cannot prove that the " +
+                $"region belongs to the deleted '{candidate.Name}'. {allocationDescription}"
+        };
+    }
+
+    private static IReadOnlyList<TextRegionCandidate> FindTextRegions(
+        byte[] buffer,
+        long absoluteOffset,
+        int minimumLength)
+    {
+        var regions = new List<TextRegionCandidate>();
+
+        AddBestUtf8Region(buffer, absoluteOffset, minimumLength, regions);
+        AddBestUtf16Region(buffer, absoluteOffset, minimumLength, true, regions);
+        AddBestUtf16Region(buffer, absoluteOffset, minimumLength, false, regions);
+
+        return regions;
+    }
+
+    private static void AddBestUtf8Region(
+        byte[] buffer,
+        long absoluteOffset,
+        int minimumLength,
+        List<TextRegionCandidate> regions)
+    {
+        var runStart = -1;
+        var position = 0;
+
+        while (position < buffer.Length)
+        {
+            var sequenceLength = GetUtf8SequenceLength(buffer, position);
+
+            if (sequenceLength <= 0)
+            {
+                if (runStart >= 0)
+                {
+                    AddRegion(
+                        regions,
+                        absoluteOffset + runStart,
+                        position - runStart,
+                        "UTF-8",
+                        minimumLength);
+                }
+
+                runStart = -1;
+                position++;
+                continue;
+            }
+
+            if (runStart < 0)
+            {
+                runStart = position;
+            }
+
+            position += sequenceLength;
+        }
+
+        if (runStart >= 0)
+        {
+            AddRegion(
+                regions,
+                absoluteOffset + runStart,
+                position - runStart,
+                "UTF-8",
+                minimumLength);
+        }
+    }
+
+    private static void AddBestUtf16Region(
+        byte[] buffer,
+        long absoluteOffset,
+        int minimumLength,
+        bool littleEndian,
+        List<TextRegionCandidate> regions)
+    {
+        var bestStart = -1;
+        var bestLength = 0;
+
+        for (var alignment = 0; alignment < 2; alignment++)
+        {
+            var runStart = -1;
+            var position = alignment;
+
+            while (position + 1 < buffer.Length)
+            {
+                if (IsUtf16TextUnit(buffer, position, littleEndian))
+                {
+                    if (runStart < 0)
+                    {
+                        runStart = position;
+                    }
+
+                    position += 2;
+                    continue;
+                }
+
+                if (runStart >= 0)
+                {
+                    var runLength = position - runStart;
+                    if (runLength > bestLength)
+                    {
+                        bestStart = runStart;
+                        bestLength = runLength;
+                    }
+                }
+
+                runStart = -1;
+                position += 2;
+            }
+
+            if (runStart >= 0)
+            {
+                var runLength = position - runStart;
+                if (runLength > bestLength)
+                {
+                    bestStart = runStart;
+                    bestLength = runLength;
+                }
+            }
+        }
+
+        if (bestStart >= 0)
+        {
+            AddRegion(
+                regions,
+                absoluteOffset + bestStart,
+                bestLength,
+                littleEndian ? "UTF-16LE" : "UTF-16BE",
+                minimumLength);
+        }
+    }
+
+    private static void AddRegion(
+        List<TextRegionCandidate> regions,
+        long offset,
+        int length,
+        string encoding,
+        int minimumLength)
+    {
+        if (length >= minimumLength)
+        {
+            regions.Add(new TextRegionCandidate(offset, length, encoding));
+        }
+    }
+
+    private static int GetUtf8SequenceLength(
+        byte[] buffer,
+        int position)
+    {
+        var value = buffer[position];
+
+        if (value is 0x09 or 0x0A or 0x0D ||
+            value is >= 0x20 and <= 0x7E)
+        {
+            return 1;
+        }
+
+        if (value is < 0xC2 or > 0xF4)
+        {
+            return 0;
+        }
+
+        var length =
+            value <= 0xDF ? 2 :
+            value <= 0xEF ? 3 : 4;
+
+        if (position + length > buffer.Length)
+        {
+            return 0;
+        }
+
+        for (var i = 1; i < length; i++)
+        {
+            if (buffer[position + i] < 0x80 ||
+                buffer[position + i] > 0xBF)
+            {
+                return 0;
+            }
+        }
+
+        return length;
+    }
+
+    private readonly record struct TextRegionCandidate(
+        long Offset,
+        int Length,
+        string Encoding);
 
     public (bool Found, long Offset, string? Encoding, long ScannedBytes) FindMarkerOnVolume(
         string sourcePath,
