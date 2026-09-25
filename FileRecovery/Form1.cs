@@ -25,6 +25,7 @@ public partial class Form1 : Form
     private bool _ntfsResultsDisplayed;
     private bool _ntfsScanInProgress;
     private CancellationTokenSource? _ntfsScanCancellationSource;
+    private readonly ManualResetEventSlim _ntfsScanPauseGate = new(initialState: true);
 
     public void CloseFromApplication()
     {
@@ -528,11 +529,15 @@ public partial class Form1 : Form
 
         try
         {
+            var pauseAction = new Action(() =>
+                _ntfsScanPauseGate.Wait(scanCancellationToken));
+
             var deletedRecords = await Task.Run(
                 () => _usnMonitor.ScanDeletedDirectory(
                     scanDirectory,
                     includeSubdirectories,
-                    scanCancellationToken),
+                    scanCancellationToken,
+                    pauseAction),
                 scanCancellationToken);
 
             // The background monitor can observe a deletion immediately while this
@@ -750,7 +755,8 @@ public partial class Form1 : Form
                             rootPath,
                             recentTargetRecordsByPath.Keys.ToList(),
                             scanCancellationToken,
-                            maxPages: 128),
+                            maxPages: 128,
+                            pauseAction: pauseAction),
                         scanCancellationToken);
 
                     directLiveCandidates = pathCandidates
@@ -785,7 +791,8 @@ public partial class Form1 : Form
                     () => _mftCandidateScanner.ScanForFileReferences(
                         rootPath,
                         targetRecords,
-                        scanCancellationToken),
+                        scanCancellationToken,
+                        pauseAction),
                     scanCancellationToken))
                 .ToList();
 
@@ -829,7 +836,8 @@ public partial class Form1 : Form
                                 FileReferenceNumber: candidate.FileReferenceNumber,
                                 ParentFileReferenceNumber: candidate.ParentFileReferenceNumber,
                                 DeletedAtUtc: candidate.LastUsnTimestampUtc))
-                            .ToList());
+                            .ToList(),
+                        pauseAction: pauseAction);
 
                 if (fallbackCandidates.Count > 0)
                 {
@@ -1122,6 +1130,7 @@ public partial class Form1 : Form
         }
         finally
         {
+            _ntfsScanPauseGate.Set();
             _ntfsScanCancellationSource = null;
             _ntfsScanInProgress = false;
             SetBusy(false);
@@ -1129,19 +1138,32 @@ public partial class Form1 : Form
         }
     }
 
-    private void btnStopNtfsScan_Click(object? sender, EventArgs e)
+    private void btnPauseNtfsScan_Click(object? sender, EventArgs e)
     {
-        if (!_ntfsScanInProgress || _ntfsScanCancellationSource is null)
+        if (!_ntfsScanInProgress)
         {
             return;
         }
 
-        if (!_ntfsScanCancellationSource.IsCancellationRequested)
+        _ntfsScanPauseGate.Reset();
+        lblStatus.Text = "NTFS history scan paused.";
+        btnPauseNtfsScan.Visible = false;
+        btnResumeNtfsScan.Visible = true;
+        btnResumeNtfsScan.Enabled = true;
+    }
+
+    private void btnResumeNtfsScan_Click(object? sender, EventArgs e)
+    {
+        if (!_ntfsScanInProgress)
         {
-            lblStatus.Text = "Stopping NTFS deleted-file scan...";
-            btnStopNtfsScan.Enabled = false;
-            _ntfsScanCancellationSource.Cancel();
+            return;
         }
+
+        _ntfsScanPauseGate.Set();
+        lblStatus.Text = "Resuming NTFS history scan...";
+        btnPauseNtfsScan.Visible = true;
+        btnPauseNtfsScan.Enabled = true;
+        btnResumeNtfsScan.Visible = false;
     }
 
     private static string NormalizeForComparison(string path)
@@ -2515,9 +2537,9 @@ public partial class Form1 : Form
         txtScanPath.Enabled = !busy;
         btnBrowseScanPath.Enabled = !busy;
         chkScanSubdirectories.Enabled = !busy;
-        btnStopNtfsScan.Enabled = _ntfsScanInProgress && busy &&
-                                  _ntfsScanCancellationSource is not null &&
-                                  !_ntfsScanCancellationSource.IsCancellationRequested;
+        btnPauseNtfsScan.Visible = _ntfsScanInProgress && busy && !_ntfsScanPauseGate.IsSet;
+        btnPauseNtfsScan.Enabled = _ntfsScanInProgress && busy && _ntfsScanPauseGate.IsSet;
+        btnResumeNtfsScan.Visible = _ntfsScanInProgress && busy && !_ntfsScanPauseGate.IsSet;
         dgvResults.Enabled = true;
         UseWaitCursor = false;
 
