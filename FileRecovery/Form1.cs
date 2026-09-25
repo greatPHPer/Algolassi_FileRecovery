@@ -1793,14 +1793,36 @@ public partial class Form1 : Form
 
         foreach (var candidate in candidates)
         {
+            Exception? dataStreamRecoveryFailure = null;
+
             try
             {
                 if (candidate.DataStreamFound)
                 {
-                    successes.Add(_ntfsRecoveryService.Recover(
-                        candidate,
-                        destinationDirectory));
-                    continue;
+                    try
+                    {
+                        successes.Add(_ntfsRecoveryService.Recover(
+                            candidate,
+                            destinationDirectory));
+                        continue;
+                    }
+                    catch (Exception ex) when (
+                        Path.GetExtension(candidate.Name).Equals(
+                            ".txt",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        // The MFT still advertised a $DATA stream, but the retained
+                        // extents could not actually be read from the raw volume.
+                        // Do not abandon a text candidate: fall through to the
+                        // marker-driven whole-volume forensic path below.
+                        dataStreamRecoveryFailure = ex;
+                        candidate.DataStreamFound = false;
+
+                        System.Diagnostics.Debug.WriteLine(
+                            $"NTFS $DATA recovery failed for text candidate " +
+                            $"'{candidate.FullPath}'. Falling back to whole-volume " +
+                            $"marker recovery: {ex.Message}");
+                    }
                 }
 
                 // A fresh deletion can leave the resident $DATA stream in the
@@ -2006,7 +2028,7 @@ public partial class Form1 : Form
                 // whole-volume forensic scan before the broad free-space heuristic.
                 // The marker is deliberately required so allocated live-file bytes are
                 // never accepted merely because they happen to look printable.
-                if (candidate.FileSizeBytes <= 0 &&
+                if ((candidate.FileSizeBytes <= 0 || dataStreamRecoveryFailure is not null) &&
                     Path.GetExtension(candidate.Name).Equals(
                         ".txt",
                         StringComparison.OrdinalIgnoreCase))
@@ -2018,11 +2040,17 @@ public partial class Form1 : Form
                         !forensicMarkerDeclined.Contains(markerKey))
                     {
                         var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
-                            $"The original size of '{candidate.Name}' is unknown.\r\n\r\n" +
-                            "Enter a unique text string that was definitely contained in this " +
-                            "deleted file. AlgoLassi will search every byte of the source volume " +
-                            "for that exact UTF-8 marker before attempting broader carving.\r\n\r\n" +
-                            "Leave this blank to skip the whole-volume forensic scan.",
+                            dataStreamRecoveryFailure is null
+                                ? $"The original size of '{candidate.Name}' is unknown.\r\n\r\n" +
+                                  "Enter a unique text string that was definitely contained in this " +
+                                  "deleted file. AlgoLassi will search every byte of the source volume " +
+                                  "for that exact UTF-8 marker before attempting broader carving.\r\n\r\n" +
+                                  "Leave this blank to skip the whole-volume forensic scan."
+                                : $"NTFS retained $DATA was found for '{candidate.Name}', but the recorded " +
+                                  "data extents could not be read from the raw volume.\r\n\r\n" +
+                                  "Enter a unique text string that was definitely contained in this " +
+                                  "deleted file so AlgoLassi can fall back to a whole-volume forensic scan.\r\n\r\n" +
+                                  "Leave this blank to skip the forensic scan.",
                             "Full-volume forensic text scan",
                             "");
 
@@ -2075,8 +2103,12 @@ public partial class Form1 : Form
                         }
                         catch (Exception ex)
                         {
+                            var reason = dataStreamRecoveryFailure is null
+                                ? string.Empty
+                                : $" Retained $DATA recovery failed first: {dataStreamRecoveryFailure.Message}";
+
                             failures.Add(
-                                $"{candidate.Name}: whole-volume forensic scan failed: {ex.Message}");
+                                $"{candidate.Name}: whole-volume forensic scan failed: {ex.Message}.{reason}");
                             continue;
                         }
                     }
