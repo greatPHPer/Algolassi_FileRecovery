@@ -470,15 +470,47 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         }
 
         var start = markerOffsetInWindow;
-        while (start > 0 && IsPlainTextByte(scanWindow[start - 1]))
-        {
-            start--;
-        }
-
         var end = markerOffsetInWindow + markerBytes.Length;
-        while (end < scanWindow.Length && IsPlainTextByte(scanWindow[end]))
+
+        if (markerEncoding.Equals("UTF-16LE", StringComparison.OrdinalIgnoreCase) ||
+            markerEncoding.Equals("UTF-16BE", StringComparison.OrdinalIgnoreCase))
         {
-            end++;
+            // UTF-16 stores ASCII-range text as two-byte code units, so every other
+            // byte can legitimately be 0x00. The old byte-by-byte text test stopped
+            // immediately at those zeros and therefore recovered only the marker itself.
+            // Expand in whole UTF-16 code units around the matched marker.
+            var littleEndian =
+                markerEncoding.Equals("UTF-16LE", StringComparison.OrdinalIgnoreCase);
+
+            while (start >= 2 &&
+                   IsUtf16TextUnit(
+                       scanWindow,
+                       start - 2,
+                       littleEndian))
+            {
+                start -= 2;
+            }
+
+            while (end + 1 < scanWindow.Length &&
+                   IsUtf16TextUnit(
+                       scanWindow,
+                       end,
+                       littleEndian))
+            {
+                end += 2;
+            }
+        }
+        else
+        {
+            while (start > 0 && IsPlainTextByte(scanWindow[start - 1]))
+            {
+                start--;
+            }
+
+            while (end < scanWindow.Length && IsPlainTextByte(scanWindow[end]))
+            {
+                end++;
+            }
         }
 
         var recoveredLength = end - start;
@@ -571,6 +603,25 @@ public sealed class NtfsWholeVolumeTextRecoveryService
     private static bool IsPlainTextByte(byte value) =>
         value is 0x09 or 0x0A or 0x0D ||
         value is >= 0x20 and <= 0x7E;
+
+    private static bool IsUtf16TextUnit(
+        byte[] buffer,
+        int offset,
+        bool littleEndian)
+    {
+        if (offset < 0 || offset + 1 >= buffer.Length)
+        {
+            return false;
+        }
+
+        var codeUnit = littleEndian
+            ? (ushort)(buffer[offset] | (buffer[offset + 1] << 8))
+            : (ushort)((buffer[offset] << 8) | buffer[offset + 1]);
+
+        return codeUnit is 0x0009 or 0x000A or 0x000D ||
+               codeUnit is >= 0x0020 and <= 0x007E ||
+               codeUnit is >= 0x00A0 and <= 0xD7FF ||
+               codeUnit is >= 0xE000 and <= 0xFFFD;
 
     private static string? GetNtfsVolumeRoot(string path)
     {
