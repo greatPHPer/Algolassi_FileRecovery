@@ -383,6 +383,7 @@ public partial class Form1 : Form
                     "The selected file is not on a valid Windows volume.");
             }
 
+            root = NormalizeDriveRoot(root);
             var totalVolumeBytes = new DriveInfo(root).TotalSize;
             var progress = new SynchronousProgress<long>(
                 this,
@@ -2046,6 +2047,7 @@ public partial class Form1 : Form
                             continue;
                         }
 
+                        wholeVolumeRoot = NormalizeDriveRoot(wholeVolumeRoot);
                         var totalVolumeBytes = new DriveInfo(wholeVolumeRoot).TotalSize;
                         var forensicProgress = new SynchronousProgress<long>(
                             this,
@@ -2475,6 +2477,19 @@ public partial class Form1 : Form
         }
 
         return root;
+    }
+
+    private static string NormalizeDriveRoot(string path)
+    {
+        var root = Path.GetPathRoot(path.Trim());
+
+        if (root is { Length: 2 } &&
+            root[1] == ':')
+        {
+            root += Path.DirectorySeparatorChar;
+        }
+
+        return root ?? path;
     }
 
     private static string NormalizePath(string value) =>
