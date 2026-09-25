@@ -2472,6 +2472,28 @@ public partial class Form1 : Form
             || left.StartsWith(right + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static string PreserveForensicRecoveryFile(
+        string sourcePath,
+        string destinationDirectory,
+        string originalName)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath) ||
+            !File.Exists(sourcePath))
+        {
+            throw new InvalidOperationException(
+                "The raw-volume forensic scan did not produce a recoverable output file.");
+        }
+
+        var forensicName = $"{originalName}.forensic.partial";
+        var destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
+            destinationDirectory,
+            forensicName);
+
+        File.Move(sourcePath, destinationPath);
+
+        return destinationPath;
+    }
+
     private static void TryDeleteRecoveredFile(string? path)
     {
         if (string.IsNullOrWhiteSpace(path))
