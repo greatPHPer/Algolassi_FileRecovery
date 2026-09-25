@@ -528,9 +528,11 @@ public partial class Form1 : Form
 
         try
         {
-            var deletedRecords = _usnMonitor.ScanDeletedDirectory(
-                scanDirectory,
-                includeSubdirectories,
+            var deletedRecords = await Task.Run(
+                () => _usnMonitor.ScanDeletedDirectory(
+                    scanDirectory,
+                    includeSubdirectories,
+                    scanCancellationToken),
                 scanCancellationToken);
 
             // The background monitor can observe a deletion immediately while this
@@ -566,6 +568,7 @@ public partial class Form1 : Form
 
             foreach (var record in historyRecords)
             {
+                scanCancellationToken.ThrowIfCancellationRequested();
                 if (record.FileReferenceNumber.HasValue &&
                     record.ParentFileReferenceNumber.HasValue)
                 {
@@ -666,6 +669,7 @@ public partial class Form1 : Form
 
             foreach (var record in recentLiveUsnDeletes)
             {
+                scanCancellationToken.ThrowIfCancellationRequested();
                 var normalizedPath = NormalizePath(record.FullPath);
                 if (!targetPaths.Add(normalizedPath))
                 {
@@ -683,6 +687,7 @@ public partial class Form1 : Form
 
             foreach (var record in historyRecordsWithReferences)
             {
+                scanCancellationToken.ThrowIfCancellationRequested();
                 var normalizedPath = NormalizePath(record.FullPath);
                 if (!targetPaths.Add(normalizedPath))
                 {
@@ -740,11 +745,13 @@ public partial class Form1 : Form
                     // exact path for only those recent targets. The timestamp guard
                     // prevents an unrelated older deletion of the same path from
                     // being promoted.
-                    var pathCandidates = _mftCandidateScanner.ScanForPaths(
-                        rootPath,
-                        recentTargetRecordsByPath.Keys.ToList(),
-                        scanCancellationToken,
-                        maxPages: 128);
+                    var pathCandidates = await Task.Run(
+                        () => _mftCandidateScanner.ScanForPaths(
+                            rootPath,
+                            recentTargetRecordsByPath.Keys.ToList(),
+                            scanCancellationToken,
+                            maxPages: 128),
+                        scanCancellationToken);
 
                     directLiveCandidates = pathCandidates
                         .Where(candidate =>
@@ -774,10 +781,12 @@ public partial class Form1 : Form
                 }
             }
 
-            var candidates = _mftCandidateScanner.ScanForFileReferences(
-                rootPath,
-                targetRecords,
-                scanCancellationToken)
+            var candidates = (await Task.Run(
+                    () => _mftCandidateScanner.ScanForFileReferences(
+                        rootPath,
+                        targetRecords,
+                        scanCancellationToken),
+                    scanCancellationToken))
                 .ToList();
 
             var candidatePaths = candidates
@@ -887,6 +896,7 @@ public partial class Form1 : Form
 
             foreach (var source in liveEvidenceSources)
             {
+                scanCancellationToken.ThrowIfCancellationRequested();
                 var candidatePath = NormalizePath(source.FullPath);
                 if (!candidatePaths.Add(candidatePath))
                 {
