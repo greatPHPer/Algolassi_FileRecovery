@@ -2022,12 +2022,12 @@ public partial class Form1 : Form
                         var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
                             $"The original size of '{candidate.Name}' is unknown.\r\n\r\n" +
                             "Enter a unique text string that was definitely contained in this " +
-                            "deleted file. AlgoLassi will search every byte of the source volume " +
-                            "for that exact marker and recover the contiguous text region around it.\\r\\n\\r\\n" +
-                            "The recovered region is forensic/heuristic because plain-text files " +
-                            "do not contain a self-delimiting file boundary.\\r\\n\\r\\n" +
-                            "Leave this blank to skip the whole-volume forensic scan.",
-                            "Full-volume forensic text scan",
+                            "deleted file. AlgoLassi will search the entire raw source volume " +
+                            "for that marker and expand around it.\r\n\r\n" +
+                            "LEAVE THIS BLANK to search for the longest qualifying text-like " +
+                            "region instead. That mode is exploratory and cannot prove that " +
+                            "the selected region belongs to the deleted file.\r\n\r\n",
+                            "Forensic text recovery",
                             "");
 
                         if (string.IsNullOrWhiteSpace(enteredMarker))
@@ -2041,7 +2041,6 @@ public partial class Form1 : Form
                         }
                     }
 
-                    if (!string.IsNullOrWhiteSpace(forensicMarker))
                     {
                         var wholeVolumeRoot = GetSourceVolumeRoot(candidate.FullPath);
                         if (string.IsNullOrWhiteSpace(wholeVolumeRoot))
