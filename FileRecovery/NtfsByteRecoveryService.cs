@@ -86,10 +86,24 @@ public sealed class NtfsByteRecoveryService
 
         ValidateExtents(candidate);
 
-        var sourceRoot = Path.GetPathRoot(sourcePath);
+        var normalizedSourcePath = sourcePath.Trim();
+
+        while (normalizedSourcePath.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+               normalizedSourcePath.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalizedSourcePath = normalizedSourcePath[4..];
+        }
+
+        var sourceRoot = Path.GetPathRoot(normalizedSourcePath);
         if (string.IsNullOrWhiteSpace(sourceRoot))
         {
             throw new InvalidOperationException("The deleted file's source volume could not be determined.");
+        }
+
+        if (sourceRoot is { Length: 2 } &&
+            sourceRoot[1] == ':')
+        {
+            sourceRoot += Path.DirectorySeparatorChar;
         }
 
         var volumeInfo = new NtfsVolumeInspector().Inspect(sourceRoot);
