@@ -1078,6 +1078,8 @@ public sealed class NtfsMftDataReader
             sequenceNumber,
             expectedBaseFileReference: fileReferenceNumber);
 
+        var usedRelaxedReference = false;
+
         if (record is null &&
             !string.IsNullOrWhiteSpace(expectedFileName) &&
             expectedParentFileReferenceNumber.HasValue)
@@ -1103,9 +1105,12 @@ public sealed class NtfsMftDataReader
                     expectedSequenceNumber: sequenceNumber))
             {
                 System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $DATA lookup: accepted raw MFT record for " +
+                    $"NTFS $DATA lookup: relaxed MFT record matched the expected " +
+                    $"name/parent but not the deleted file-reference sequence. " +
+                    $"It will only be eligible for resident forensic inspection: " +
                     $"fileRef={fileReferenceNumber}, segment={segmentNumber}.");
                 record = relaxedRecord;
+                usedRelaxedReference = true;
             }
         }
 
@@ -1116,12 +1121,30 @@ public sealed class NtfsMftDataReader
             return NotFound("NTFS could not read and validate the exact deleted MFT record for this file reference.");
         }
 
-        return ReadDefaultDataStreamFromMftRecord(
+        var dataStream = ReadDefaultDataStreamFromMftRecord(
             volumeInfo,
             volumeHandle,
             rawMftVolumeHandle,
             fileReferenceNumber,
             record);
+
+        if (usedRelaxedReference &&
+            dataStream.Found &&
+            !dataStream.IsResident)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $DATA lookup: rejecting nonresident $DATA from a relaxed " +
+                $"same-name MFT record because the file-reference sequence did not " +
+                $"validate. fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
+                $"dataSize={dataStream.FileSizeBytes:N0}.");
+
+            return NotFound(
+                "The current MFT record matches the deleted file name and parent but " +
+                "has a different file-reference sequence; its nonresident $DATA cannot " +
+                "be treated as historical deleted-file data.");
+        }
+
+        return dataStream;
     }
 
     internal NtfsDataStreamInfo ReadDefaultDataStreamFromScannedMftRecord(
