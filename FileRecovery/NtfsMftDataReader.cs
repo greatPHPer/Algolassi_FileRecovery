@@ -1121,7 +1121,9 @@ public sealed class NtfsMftDataReader
             volumeHandle,
             rawMftVolumeHandle,
             fileReferenceNumber,
-            record);
+            record,
+            expectedFileName,
+            expectedParentFileReferenceNumber);
     }
 
     internal NtfsDataStreamInfo ReadDefaultDataStreamFromScannedMftRecord(
@@ -1158,7 +1160,9 @@ public sealed class NtfsMftDataReader
         SafeFileHandle volumeHandle,
         SafeFileHandle rawMftVolumeHandle,
         ulong fileReferenceNumber,
-        byte[] record)
+        byte[] record,
+        string? expectedFileName = null,
+        ulong? expectedParentFileReferenceNumber = null)
     {
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
         var dataAttributes = FindUnnamedDataAttributes(record, volumeInfo);
@@ -1175,10 +1179,20 @@ public sealed class NtfsMftDataReader
                 $"validLength={dataAttribute.ValidDataLengthBytes}, extents={dataAttribute.Extents.Count}.");
         }
 
+        var historicalFileSize = TryReadFileNameSize(
+            record,
+            volumeInfo.TotalClusters * (long)volumeInfo.BytesPerCluster,
+            expectedFileName,
+            expectedParentFileReferenceNumber);
+
         var attributeList = FindAttributeList(record, volumeInfo, volumeHandle);
         if (!attributeList.Found)
         {
-            return BuildDataStream(dataAttributes, 1);
+            return dataAttributes.Count > 0
+                ? BuildDataStream(dataAttributes, 1)
+                : BuildFileNameSizeOnlyResult(
+                    historicalFileSize,
+                    "No unnamed $DATA attribute was retained, but the deleted file's NTFS $FILE_NAME size was recovered.");
         }
 
         if (!attributeList.IsResident && attributeList.ResidentData is null)
@@ -1188,8 +1202,9 @@ public sealed class NtfsMftDataReader
             // because an unrelated/nonresident $ATTRIBUTE_LIST could not be read.
             return dataAttributes.Count > 0
                 ? BuildDataStream(dataAttributes, 1)
-                : NotFound(
-                    "The file retains a nonresident $ATTRIBUTE_LIST that could not be safely reconstructed.");
+                : BuildFileNameSizeOnlyResult(
+                    historicalFileSize,
+                    "The file retains a nonresident $ATTRIBUTE_LIST that could not be safely reconstructed, but the deleted file's NTFS $FILE_NAME size was recovered.");
         }
 
         IReadOnlyList<NtfsAttributeListEntry> entries;
@@ -1207,7 +1222,9 @@ public sealed class NtfsMftDataReader
             // to throw away otherwise usable recovery evidence.
             return dataAttributes.Count > 0
                 ? BuildDataStream(dataAttributes, 1)
-                : NotFound($"The NTFS $ATTRIBUTE_LIST could not be parsed: {ex.Message}");
+                : BuildFileNameSizeOnlyResult(
+                    historicalFileSize,
+                    $"The NTFS $ATTRIBUTE_LIST could not be parsed safely, but the deleted file's NTFS $FILE_NAME size was recovered. Parser error: {ex.Message}");
         }
 
         var referencedSources = new HashSet<(ulong FileReference, long LowestVcn)>();
@@ -1247,7 +1264,138 @@ public sealed class NtfsMftDataReader
             dataAttributes.AddRange(extensionData);
         }
 
-        return BuildDataStream(dataAttributes, Math.Max(1, dataAttributes.Count));
+        return dataAttributes.Count > 0
+            ? BuildDataStream(dataAttributes, Math.Max(1, dataAttributes.Count))
+            : BuildFileNameSizeOnlyResult(
+                historicalFileSize,
+                "The deleted MFT record retained the historical NTFS $FILE_NAME size, but no usable unnamed $DATA attribute was found.");
+    }
+
+    private static NtfsDataStreamInfo BuildFileNameSizeOnlyResult(
+        long fileSizeBytes,
+        string evidence)
+    {
+        return new NtfsDataStreamInfo
+        {
+            Found = false,
+            FileSizeBytes = fileSizeBytes,
+            Evidence = fileSizeBytes > 0
+                ? $"{evidence} File size={fileSizeBytes:N0} bytes."
+                : evidence
+        };
+    }
+
+    private static long TryReadFileNameSize(
+        byte[] record,
+        long volumeSizeBytes,
+        string? expectedFileName,
+        ulong? expectedParentFileReferenceNumber)
+    {
+        const uint NtfsFileNameAttribute = 0x30;
+        const int ParentReferenceOffset = 0;
+        const int AllocatedSizeOffset = 40;
+        const int RealSizeOffset = 48;
+        const int NameLengthOffset = 64;
+        const int NameNamespaceOffset = 65;
+        const int NameOffset = 66;
+
+        try
+        {
+            foreach (var attribute in EnumerateAttributes(record))
+            {
+                if (attribute.Type != NtfsFileNameAttribute ||
+                    attribute.FormCode != 0 ||
+                    attribute.NameLength != 0)
+                {
+                    continue;
+                }
+
+                if (attribute.Offset < 0 ||
+                    attribute.Length < 24 ||
+                    attribute.Offset + attribute.Length > record.Length)
+                {
+                    continue;
+                }
+
+                var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(attribute.Offset + 16, sizeof(uint)));
+                var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(attribute.Offset + 20, sizeof(ushort)));
+
+                if (valueLength < 66 ||
+                    valueOffset < 24 ||
+                    valueOffset + valueLength > attribute.Length)
+                {
+                    continue;
+                }
+
+                var valueStart = attribute.Offset + valueOffset;
+
+                var storedNameLength = record[valueStart + NameLengthOffset];
+                var nameNamespace = record[valueStart + NameNamespaceOffset];
+
+                if (storedNameLength == 0 || nameNamespace > 3)
+                {
+                    continue;
+                }
+
+                var nameByteLength = checked(storedNameLength * 2);
+                if (NameOffset + nameByteLength > valueLength)
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(expectedFileName))
+                {
+                    var storedName = System.Text.Encoding.Unicode.GetString(
+                        record,
+                        valueStart + NameOffset,
+                        nameByteLength);
+
+                    if (!string.Equals(
+                            storedName,
+                            expectedFileName,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                }
+
+                if (expectedParentFileReferenceNumber.HasValue)
+                {
+                    var parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                        record.AsSpan(valueStart + ParentReferenceOffset, sizeof(ulong)));
+
+                    if (parentReference != expectedParentFileReferenceNumber.Value)
+                    {
+                        continue;
+                    }
+                }
+
+                var allocatedSize = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(valueStart + AllocatedSizeOffset, sizeof(long)));
+                var realSize = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(valueStart + RealSizeOffset, sizeof(long)));
+
+                if (realSize < 0 ||
+                    allocatedSize < 0 ||
+                    realSize > allocatedSize ||
+                    (volumeSizeBytes > 0 && realSize > volumeSizeBytes))
+                {
+                    continue;
+                }
+
+                return realSize;
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $FILE_NAME size extraction failed: " +
+                $"{ex.GetType().Name}: {ex.Message}");
+        }
+
+        return 0;
     }
 
     private static List<DataAttributeDescriptor> FindUnnamedDataAttributes(
