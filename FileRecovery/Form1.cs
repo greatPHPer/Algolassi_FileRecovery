@@ -1929,77 +1929,12 @@ public partial class Form1 : Form
                     }
                 }
 
-                // Before broad free-space carving, inspect slack in currently
-                // allocated files under the deleted file's original directory.
-                // This can retain fragments of recently deleted small text files
-                // after their clusters were reallocated, without scanning/reading
-                // the active file bodies as candidate data.
-                var slackRootPath = GetSourceVolumeRoot(candidate.FullPath);
-                var slackDirectory = candidate.DirectoryPath;
-                if (string.IsNullOrWhiteSpace(slackDirectory))
-                {
-                    slackDirectory = Path.GetDirectoryName(candidate.FullPath);
-                }
-
-                if (!string.IsNullOrWhiteSpace(slackDirectory) &&
-                    Directory.Exists(slackDirectory))
-                {
-                    var slackReader = new NtfsMftDataReader();
-
-                    if (!string.IsNullOrWhiteSpace(slackRootPath) &&
-                        slackReader.TryReadAllocatedFileSlack(
-                        slackRootPath,
-                        slackDirectory,
-                        Path.GetExtension(candidate.Name),
-                        long.MaxValue,
-                        progress: null,
-                        cancellationToken: CancellationToken.None,
-                        out var slackData,
-                        out var slackSourceFile) &&
-                        slackData.Length > 0)
-                    {
-                        var destinationPath =
-                            RecoveryDestinationPolicy.CreateSafeFilePath(
-                                destinationDirectory,
-                                candidate.Name);
-
-                        try
-                        {
-                            File.WriteAllBytes(destinationPath, slackData);
-                        }
-                        catch
-                        {
-                            try
-                            {
-                                File.Delete(destinationPath);
-                            }
-                            catch
-                            {
-                                // Preserve the original recovery failure.
-                            }
-
-                            throw;
-                        }
-
-                        candidate.FileSizeBytes = slackData.Length;
-
-                        successes.Add(new RecoveryResult
-                        {
-                            Success = true,
-                            SourcePath = candidate.FullPath,
-                            DestinationPath = destinationPath,
-                            BytesRecovered = slackData.Length,
-                            Evidence =
-                                $"Recovered {slackData.Length:N0} byte(s) from allocated " +
-                                $"file slack in '{slackSourceFile}'. The bytes were found " +
-                                "after the current file's logical EOF, so this is heuristic " +
-                                "evidence of retained deleted data rather than an exact " +
-                                "historical file-identity match."
-                        });
-
-                        continue;
-                    }
-                }
+                // Do not use generic allocated-file slack as a successful recovery source here.
+                // It is not tied strongly enough to the deleted file's identity and can
+                // return unrelated bytes from another live file in the same directory.
+                // Continue to the marker-driven forensic or structural free-space recovery
+                // paths instead. This keeps a successful result tied to the deleted
+                // candidate rather than accepting a coincidental text-like slack prefix.
 
                 // For an unknown-size .txt candidate, offer a marker-driven
                 // whole-volume forensic scan before the broad free-space heuristic.
