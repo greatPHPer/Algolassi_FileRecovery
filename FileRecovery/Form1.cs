@@ -966,6 +966,11 @@ public partial class Form1 : Form
                             candidate.NtfsDataSnapshot.FileSizeBytes;
                     }
 
+                    if (candidate.NtfsDataSnapshot.IsComplete)
+                    {
+                        candidate.Strength = RecoveryStrength.Strong;
+                    }
+
                     System.Diagnostics.Debug.WriteLine(
                         $"NTFS candidate snapshot enrichment: path={candidate.FullPath}, " +
                         $"fileRef={candidate.FileReferenceNumber}, " +
@@ -1188,6 +1193,12 @@ public partial class Form1 : Form
         if (!string.IsNullOrWhiteSpace(candidate.DataEvidence))
         {
             parts.Add(candidate.DataEvidence);
+        }
+
+        if (candidate.NtfsDataSnapshot?.IsComplete == true)
+        {
+            parts.Add(
+                $"NTFS deletion snapshot retained {candidate.NtfsDataSnapshot.CapturedByteCount:N0} byte(s) at delete time.");
         }
 
         if (!string.IsNullOrWhiteSpace(candidate.DirectoryPath))
