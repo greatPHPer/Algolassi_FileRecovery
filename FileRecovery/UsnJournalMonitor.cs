@@ -28,6 +28,7 @@ public sealed class UsnJournalMonitor : IDisposable
     private const int ErrorHandleEof = 38;
 
     private const uint UsnReasonFileDelete = 0x00000200;
+    private const uint UsnReasonRenameOldName = 0x00001000;
     private const uint FileAttributeDirectory = 0x00000010;
     private const int UsnRecordV2MinimumLength = 60;
 
@@ -1437,7 +1438,8 @@ public sealed class UsnJournalMonitor : IDisposable
                 volumeHandle,
                 journal.JournalId,
                 nextUsn,
-                out var returnedNextUsn);
+                out var returnedNextUsn,
+                UsnReasonFileDelete | UsnReasonRenameOldName);
 
             if (returnedNextUsn <= nextUsn)
             {
@@ -1446,7 +1448,12 @@ public sealed class UsnJournalMonitor : IDisposable
 
             foreach (var record in records)
             {
-                if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                var isFileDelete =
+                    (record.Reason & UsnReasonFileDelete) != 0;
+                var isRenameOldName =
+                    (record.Reason & UsnReasonRenameOldName) != 0;
+
+                if ((!isFileDelete && !isRenameOldName) ||
                     (record.FileAttributes & FileAttributeDirectory) != 0 ||
                     !string.Equals(
                         record.FileName,
@@ -1505,7 +1512,10 @@ public sealed class UsnJournalMonitor : IDisposable
                 System.Diagnostics.Debug.WriteLine(
                     $"NTFS live deletion snapshot: matched USN tail record " +
                     $"path={candidatePath}, fileRef={fileReferenceNumber}, " +
-                    $"parentRef={parentFileReferenceNumber}, usnTime={record.TimestampUtc:O}, " +
+                    $"parentRef={parentFileReferenceNumber}, " +
+                    $"reason=0x{record.Reason:X8}, " +
+                    $"source={(isFileDelete ? "FileDelete" : "RenameOldName")}, " +
+                    $"usnTime={record.TimestampUtc:O}, " +
                     $"deltaMinutes={timestampDeltaMinutes:0.###}.");
 
                 return true;
@@ -2073,14 +2083,15 @@ public sealed class UsnJournalMonitor : IDisposable
         SafeFileHandle volumeHandle,
         ulong journalId,
         long startUsn,
-        out long nextUsn)
+        out long nextUsn,
+        uint reasonMask = UsnReasonFileDelete)
     {
         // Use the V0 NTFS input layout. Modern NTFS volumes can return
         // USN_RECORD_V3 records with 128-bit file IDs.
         var request = new ReadUsnJournalRequest
         {
             StartUsn = startUsn,
-            ReasonMask = UsnReasonFileDelete,
+            ReasonMask = reasonMask,
             ReturnOnlyOnClose = 0,
             Timeout = 0,
             BytesToWaitFor = 0,
