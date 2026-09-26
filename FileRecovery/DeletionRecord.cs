@@ -11,4 +11,5 @@ public sealed class DeletionRecord
     public DateTime DeletedAtUtc { get; set; }
     public long? FileSizeBytes { get; set; }
     public string RecoveryStrength { get; set; } = "Unknown";
+    public NtfsDeletionDataSnapshot? NtfsDataSnapshot { get; set; }
 }
