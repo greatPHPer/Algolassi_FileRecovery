@@ -1025,6 +1025,48 @@ public sealed class NtfsMftDataReader
         return false;
     }
 
+    /// <summary>
+    /// Reads the default unnamed $DATA stream from an NTFS metadata-file MFT
+    /// segment. This intentionally ignores the normal file-reference sequence
+    /// validation because reserved metadata files are addressed by fixed segment
+    /// numbers (for example, segment 2 is $LogFile).
+    /// </summary>
+    internal NtfsDataStreamInfo ReadMetadataFileDataStream(
+        NtfsVolumeInfo volumeInfo,
+        SafeFileHandle volumeHandle,
+        ulong segmentNumber)
+    {
+        if (volumeInfo.BytesPerFileRecordSegment == 0 ||
+            string.IsNullOrWhiteSpace(volumeInfo.RootPath))
+        {
+            return NotFound("The NTFS volume did not report usable MFT geometry.");
+        }
+
+        using var rawMftVolumeHandle = CreateVolumeHandle(
+            volumeInfo.RootPath,
+            overlapped: true);
+
+        var record = ReadMftRecordByExtentMap(
+            rawMftVolumeHandle,
+            volumeInfo,
+            segmentNumber,
+            expectedSequenceNumber: 0,
+            expectedBaseFileReference: 0);
+
+        if (record is null)
+        {
+            return NotFound(
+                $"Could not read NTFS metadata MFT segment {segmentNumber}.");
+        }
+
+        return ReadDefaultDataStreamFromMftRecord(
+            volumeInfo,
+            volumeHandle,
+            rawMftVolumeHandle,
+            segmentNumber,
+            record);
+    }
+
     public NtfsDataStreamInfo ReadDefaultDataStream(
         NtfsVolumeInfo volumeInfo,
         SafeFileHandle volumeHandle,
