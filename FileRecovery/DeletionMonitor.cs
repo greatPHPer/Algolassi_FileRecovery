@@ -8,11 +8,17 @@ public sealed class DeletionMonitor : IDisposable
     private readonly ConcurrentDictionary<string, long> _knownSizes =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly RecycleBinService _recycleBinService = new();
+    private readonly UsnJournalMonitor _usnMonitor;
     private readonly object _gate = new();
     private bool _started;
 
     public event EventHandler<DeletionDetectedEventArgs>? DeletionDetected;
     public event EventHandler<string>? StatusChanged;
+
+    public DeletionMonitor(UsnJournalMonitor usnMonitor)
+    {
+        _usnMonitor = usnMonitor ?? throw new ArgumentNullException(nameof(usnMonitor));
+    }
 
     public void Start()
     {
@@ -141,6 +147,18 @@ public sealed class DeletionMonitor : IDisposable
             FileSizeBytes = size,
             RecoveryStrength = "Weak"
         };
+
+        // FileSystemWatcher sees the deletion immediately. Capture NTFS $DATA now,
+        // before the background USN cursor can spend time draining an old journal
+        // backlog and before the deleted MFT record can be reused.
+        try
+        {
+            _usnMonitor.TryCaptureRecentDeletedSnapshot(record);
+        }
+        catch
+        {
+            // USN snapshot capture is best-effort; keep the normal deletion event alive.
+        }
 
         DeletionDetected?.Invoke(this, new DeletionDetectedEventArgs(record));
 
