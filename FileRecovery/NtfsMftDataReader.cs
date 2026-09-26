@@ -1359,10 +1359,15 @@ public sealed class NtfsMftDataReader
             !string.IsNullOrWhiteSpace(expectedFileName) &&
             expectedParentFileReferenceNumber.HasValue)
         {
-            // A very recent deletion can race the MFT sequence bookkeeping.
-            // The USN record already supplied the exact segment; retry that segment
-            // without strict sequence/base checks, but only accept it when the
-            // retained $FILE_NAME still identifies the expected parent/name.
+            // NTFS increments the MFT record sequence when the record is freed by
+            // deletion. The USN record can therefore carry sequence N while the
+            // just-deleted FILE record is already showing sequence N+1.
+            // Retry the exact segment without strict sequence/base checks, but only
+            // accept the record when:
+            //   1. the sequence advanced by exactly one (with circular wrap), and
+            //   2. the retained $FILE_NAME still identifies the expected file.
+            // This avoids the old false-acceptance case where an arbitrarily reused
+            // MFT generation happened to contain the same name/path.
             var relaxedRecord = ReadMftRecordByExtentMap(
                 rawMftVolumeHandle,
                 volumeInfo,
@@ -1370,19 +1375,39 @@ public sealed class NtfsMftDataReader
                 expectedSequenceNumber: 0,
                 expectedBaseFileReference: 0);
 
-            if (relaxedRecord is not null &&
-                HasMatchingFileNameEntry(
-                    rawMftVolumeHandle,
-                    relaxedRecord,
-                    expectedFileName,
-                    expectedParentFileReferenceNumber.Value,
-                    expectedFullPath,
-                    expectedSequenceNumber: sequenceNumber))
+            if (relaxedRecord is not null)
             {
-                System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $DATA lookup: accepted raw MFT record for " +
-                    $"fileRef={fileReferenceNumber}, segment={segmentNumber}.");
-                record = relaxedRecord;
+                var actualSequence = BinaryPrimitives.ReadUInt16LittleEndian(
+                    relaxedRecord.AsSpan(16, 2));
+
+                var expectedNextSequence =
+                    sequenceNumber == ushort.MaxValue
+                        ? (ushort)1
+                        : (ushort)(sequenceNumber + 1);
+
+                if (sequenceNumber != 0 &&
+                    actualSequence == expectedNextSequence &&
+                    HasMatchingFileNameEntry(
+                        rawMftVolumeHandle,
+                        relaxedRecord,
+                        expectedFileName,
+                        expectedParentFileReferenceNumber.Value,
+                        expectedFullPath,
+                        expectedSequenceNumber: sequenceNumber))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS $DATA lookup: accepted delete-transition MFT record " +
+                        $"for fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
+                        $"expectedSequence={sequenceNumber}, actualSequence={actualSequence}.");
+                    record = relaxedRecord;
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS $DATA lookup: rejected relaxed MFT record for " +
+                        $"fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
+                        $"expectedSequence={sequenceNumber}, actualSequence={actualSequence}.");
+                }
             }
         }
 
