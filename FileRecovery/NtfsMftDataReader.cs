@@ -1067,6 +1067,179 @@ public sealed class NtfsMftDataReader
             record);
     }
 
+    public bool TryCaptureDeletedData(
+        string rootPath,
+        ulong fileReferenceNumber,
+        ulong expectedParentFileReferenceNumber,
+        string expectedFileName,
+        string? expectedFullPath,
+        long maxCaptureBytes,
+        out NtfsDataStreamInfo stream,
+        out byte[] capturedData)
+    {
+        stream = NotFound("The deleted file's NTFS $DATA stream could not be read.");
+        capturedData = [];
+
+        if (string.IsNullOrWhiteSpace(rootPath) ||
+            fileReferenceNumber == 0 ||
+            expectedParentFileReferenceNumber == 0 ||
+            string.IsNullOrWhiteSpace(expectedFileName) ||
+            maxCaptureBytes <= 0)
+        {
+            return false;
+        }
+
+        var root = GetNtfsVolumeRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return false;
+        }
+
+        try
+        {
+            WindowsPrivilege.EnableSeBackupPrivilege();
+
+            var volumeInfo = new NtfsVolumeInspector().Inspect(root);
+            using var volumeHandle = CreateVolumeHandle(
+                volumeInfo.RootPath,
+                overlapped: false);
+
+            stream = ReadDefaultDataStream(
+                volumeInfo,
+                volumeHandle,
+                fileReferenceNumber,
+                expectedFileName,
+                expectedParentFileReferenceNumber,
+                expectedFullPath);
+
+            if (!stream.Found)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS deletion snapshot: $DATA unavailable for fileRef={fileReferenceNumber}. " +
+                    $"evidence={stream.Evidence}");
+                return false;
+            }
+
+            if (stream.FileSizeBytes < 0)
+            {
+                return false;
+            }
+
+            if (stream.FileSizeBytes > maxCaptureBytes)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS deletion snapshot: metadata retained but content capture skipped because " +
+                    $"size={stream.FileSizeBytes:N0} exceeds maxCaptureBytes={maxCaptureBytes:N0}.");
+                return true;
+            }
+
+            if (stream.IsResident)
+            {
+                var resident = stream.ResidentData ?? [];
+                if (resident.LongLength != stream.FileSizeBytes)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS deletion snapshot: resident size mismatch fileRef={fileReferenceNumber}, " +
+                        $"streamSize={stream.FileSizeBytes:N0}, residentBytes={resident.LongLength:N0}.");
+                    return false;
+                }
+
+                capturedData = resident.ToArray();
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS deletion snapshot: captured resident data fileRef={fileReferenceNumber}, " +
+                    $"size={capturedData.LongLength:N0}.");
+                return true;
+            }
+
+            var targetLength = checked((int)stream.FileSizeBytes);
+            capturedData = new byte[targetLength];
+
+            var initializedBytes = Math.Min(
+                stream.ValidDataLengthBytes > 0
+                    ? stream.ValidDataLengthBytes
+                    : stream.FileSizeBytes,
+                stream.FileSizeBytes);
+
+            var remaining = stream.FileSizeBytes;
+            var remainingInitialized = initializedBytes;
+            var destinationOffset = 0;
+            var expectedVcn = 0L;
+
+            foreach (var extent in stream.Extents)
+            {
+                if (extent.ClusterCount <= 0 ||
+                    extent.VirtualClusterNumber != expectedVcn)
+                {
+                    capturedData = [];
+                    return false;
+                }
+
+                var extentBytes = checked(
+                    extent.ClusterCount * (long)volumeInfo.BytesPerCluster);
+                var bytesForExtent = Math.Min(extentBytes, remaining);
+
+                if (bytesForExtent > 0 &&
+                    remainingInitialized > 0)
+                {
+                    var initializedForExtent = Math.Min(
+                        bytesForExtent,
+                        remainingInitialized);
+
+                    if (!extent.IsSparse)
+                    {
+                        ReadRawClusters(
+                            volumeHandle,
+                            extent.LogicalClusterNumber,
+                            initializedForExtent,
+                            volumeInfo.BytesPerCluster,
+                            capturedData,
+                            destinationOffset);
+                    }
+
+                    destinationOffset = checked(
+                        destinationOffset + (int)bytesForExtent);
+                    remainingInitialized -= initializedForExtent;
+                }
+                else if (bytesForExtent > 0)
+                {
+                    destinationOffset = checked(
+                        destinationOffset + (int)bytesForExtent);
+                }
+
+                remaining -= bytesForExtent;
+                expectedVcn = checked(
+                    expectedVcn + extent.ClusterCount);
+
+                if (remaining == 0)
+                {
+                    break;
+                }
+            }
+
+            if (remaining != 0)
+            {
+                capturedData = [];
+                return false;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS deletion snapshot: captured nonresident data fileRef={fileReferenceNumber}, " +
+                $"size={capturedData.LongLength:N0}, extents={stream.Extents.Count:N0}.");
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            capturedData = [];
+            stream = NotFound(
+                $"NTFS deletion snapshot capture failed: {ex.Message}");
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS deletion snapshot capture failed: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
     public bool TryReadDataStreamForDeletedReference(
         string rootPath,
         ulong fileReferenceNumber,
