@@ -1969,15 +1969,8 @@ public partial class Form1 : Form
                                     $"size={historicalLogFileSize:N0} bytes, " +
                                     $"evidence={logFileEvidence}");
 
-                                candidate.Strength = RecoveryStrength.Medium;
-
-                                candidate.DataEvidence = string.Join(
-                                    " ",
-                                    new[]
-                                    {
-                                        candidate.DataEvidence,
-                                        logFileEvidence
-                                    }.Where(text => !string.IsNullOrWhiteSpace(text)));
+                                System.Diagnostics.Debug.WriteLine(
+                                    $"NTFS candidate size enrichment: $LogFile evidence: {logFileEvidence}");
                             }
                             else
                             {
