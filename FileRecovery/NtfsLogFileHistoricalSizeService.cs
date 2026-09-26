@@ -22,6 +22,7 @@ public sealed class NtfsLogFileHistoricalSizeService
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagSequentialScan = 0x08000000;
+    private const uint FileFlagOverlapped = 0x40000000;
 
     private const int BufferSize = 1024 * 1024;
     private const uint NtfsFileNameAttributeType = 0x30;
@@ -78,7 +79,7 @@ public sealed class NtfsLogFileHistoricalSizeService
                 FileShareRead | FileShareWrite | FileShareDelete,
                 IntPtr.Zero,
                 OpenExisting,
-                FileFlagBackupSemantics | FileFlagSequentialScan,
+                FileFlagBackupSemantics | FileFlagSequentialScan | FileFlagOverlapped,
                 IntPtr.Zero);
 
             if (handle.IsInvalid)
@@ -283,13 +284,6 @@ public sealed class NtfsLogFileHistoricalSizeService
             return;
         }
 
-        if (!SetFilePointerEx(handle, offset, IntPtr.Zero, 0))
-        {
-            throw new Win32Exception(
-                Marshal.GetLastWin32Error(),
-                $"Could not seek NTFS $LogFile to byte offset {offset:N0}.");
-        }
-
         using var completionEvent = new ManualResetEvent(initialState: false);
 
         var overlapped = new NativeOverlapped
@@ -387,13 +381,6 @@ public sealed class NtfsLogFileHistoricalSizeService
     private static extern bool GetFileSizeEx(
         SafeFileHandle hFile,
         out long lpFileSize);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetFilePointerEx(
-        SafeFileHandle hFile,
-        long liDistanceToMove,
-        IntPtr lpNewFilePointer,
-        uint dwMoveMethod);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetOverlappedResult(
