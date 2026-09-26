@@ -1043,7 +1043,7 @@ public partial class Form1 : Form
                     {
                         Name = candidate.Name,
                         DeletedOn = candidate.LastUsnTimestampUtc.ToLocalTime().ToString("g"),
-                        FileSize = candidate.DataStreamFound
+                        FileSize = candidate.FileSizeBytes > 0
                             ? FormatSize(candidate.FileSizeBytes)
                             : liveHistory?.FileSizeBytes is long historySize
                                 ? FormatSize(historySize)
