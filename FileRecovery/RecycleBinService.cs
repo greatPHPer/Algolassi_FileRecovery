@@ -38,19 +38,20 @@ public sealed class RecycleBinService
 
             string name = SafeString(() => item.Name, "Unknown item");
 
-            // The Recycle Bin exposes the original location through its Shell
-            // property system. Prefer that stable property over the localized
-            // Details-view column, then fall back to the column if necessary.
-            string originalLocation = SafeString(
-                () => item.ExtendedProperty("{9B174B33-40FF-11D2-A27E-00C04FC30871} 2"),
-                string.Empty);
+            // Prefer the normal Details-view value first. Shell ExtendedProperty
+            // access can be substantially slower when many Recycle Bin entries
+            // exist, and the Details-view column already provides the original
+            // location on supported Windows configurations.
+            string originalLocation = SafeDetails(
+                folder,
+                item,
+                columns.OriginalLocation);
 
             if (string.IsNullOrWhiteSpace(originalLocation))
             {
-                originalLocation = SafeDetails(
-                    folder,
-                    item,
-                    columns.OriginalLocation);
+                originalLocation = SafeString(
+                    () => item.ExtendedProperty("{9B174B33-40FF-11D2-A27E-00C04FC30871} 2"),
+                    string.Empty);
             }
 
             string deletedDate = SafeDetails(folder, item, columns.DeletedDate);
