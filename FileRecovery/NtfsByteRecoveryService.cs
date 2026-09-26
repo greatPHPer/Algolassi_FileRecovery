@@ -86,7 +86,7 @@ public sealed class NtfsByteRecoveryService
 
         ValidateExtents(candidate);
 
-        var sourceRoot = Path.GetPathRoot(sourcePath);
+        var sourceRoot = GetNtfsVolumeRoot(sourcePath);
         if (string.IsNullOrWhiteSpace(sourceRoot))
         {
             throw new InvalidOperationException("The deleted file's source volume could not be determined.");
@@ -282,7 +282,12 @@ public sealed class NtfsByteRecoveryService
 
     private static SafeFileHandle CreateVolumeHandle(string root)
     {
-        var volumeName = root.TrimEnd(Path.DirectorySeparatorChar);
+        var normalizedRoot = GetNtfsVolumeRoot(root)
+            ?? throw new ArgumentException(
+                "A valid Windows volume root is required.",
+                nameof(root));
+
+        var volumeName = normalizedRoot.TrimEnd(Path.DirectorySeparatorChar);
 
         var handle = CreateFile(
             $@"\\.\{volumeName[..2]}",
@@ -302,6 +307,19 @@ public sealed class NtfsByteRecoveryService
         }
 
         return handle;
+    }
+
+    private static string? GetNtfsVolumeRoot(string path)
+    {
+        var normalized = path.Trim();
+
+        while (normalized.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+               normalized.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalized = normalized[4..];
+        }
+
+        return Path.GetPathRoot(normalized);
     }
 
     private static void TryDelete(string path)
