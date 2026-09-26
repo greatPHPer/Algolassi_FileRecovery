@@ -7,7 +7,7 @@ public sealed class RecoveryCandidate
     public string Name { get; init; } = string.Empty;
     public string DirectoryPath { get; init; } = string.Empty;
     public DateTime LastUsnTimestampUtc { get; init; }
-    public RecoveryStrength Strength { get; init; } = RecoveryStrength.Weak;
+    public RecoveryStrength Strength { get; set; } = RecoveryStrength.Weak;
     public string Evidence { get; init; } = string.Empty;
 
     public bool DataStreamFound { get; init; }
