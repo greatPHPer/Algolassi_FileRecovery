@@ -269,8 +269,9 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             $"volumeBytes={totalVolumeBytes:N0}, markerFound=false.");
 
         throw new InvalidOperationException(
-            $"The supplied text marker was not found in the first " +
-            $"{scannedBytes:N0} byte(s) of the NTFS volume.");
+            $"The supplied text marker was not found anywhere in the NTFS volume. " +
+            $"The forensic scan examined {scannedBytes:N0} byte(s) of the " +
+            $"{totalVolumeBytes:N0}-byte volume.");
     }
 
     public (bool Found, long Offset, string? Encoding, long ScannedBytes) FindMarkerOnVolume(
