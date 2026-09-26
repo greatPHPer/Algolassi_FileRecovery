@@ -2015,10 +2015,23 @@ public partial class Form1 : Form
                     }
                 }
 
-                // The retained MFT metadata may be insufficient for this candidate,
-                // but structural carving can still recover many formats without an
-                // original size. Plain text now has a deliberately heuristic fallback
-                // when no historical size can be recovered.
+                // Structural carving is safe for formats with intrinsic boundaries.
+                // Plain text is different: without the original size or a user-supplied
+                // marker, there is no reliable end boundary and automatically accepting the
+                // first printable region can return unrelated data.
+                if (Path.GetExtension(candidate.Name).Equals(
+                        ".txt",
+                        StringComparison.OrdinalIgnoreCase) &&
+                    candidate.FileSizeBytes <= 0)
+                {
+                    failures.Add(
+                        $"{candidate.Name}: the original text-file size could not be established. " +
+                        "Without a marker, automatic full free-space carving cannot safely " +
+                        "identify the deleted text. Provide a distinctive marker or restore " +
+                        "the known original size evidence before retrying.");
+                    continue;
+                }
+
                 if (!NtfsDeepFileRecoveryService.SupportsDeepCarving(
                         candidate.Name,
                         candidate.FileSizeBytes))
