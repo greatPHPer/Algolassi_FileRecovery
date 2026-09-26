@@ -109,12 +109,81 @@ public sealed class DeletionMonitor : IDisposable
 
     private void OnRenamed(object sender, RenamedEventArgs e)
     {
-        if (!string.IsNullOrWhiteSpace(e.OldFullPath))
+        long? originalSize = null;
+
+        if (!string.IsNullOrWhiteSpace(e.OldFullPath) &&
+            _knownSizes.TryRemove(e.OldFullPath, out var cachedSize))
         {
-            _knownSizes.TryRemove(e.OldFullPath, out _);
+            originalSize = cachedSize;
+        }
+
+        var oldPath = NormalizePath(e.OldFullPath);
+        var newPath = NormalizePath(e.FullPath);
+
+        // A normal Delete performed through Windows Explorer commonly moves the
+        // file into the volume's Recycle Bin rather than generating a direct
+        // FileSystemWatcher Deleted event for the original path. Treat that
+        // old->Recycle.Bin rename as a live deletion observation so the USN
+        // snapshot path can capture the file before its metadata/data become
+        // harder to recover.
+        if (IsRecycleBinPath(newPath) &&
+            !IsRecycleBinPath(oldPath))
+        {
+            var directory = Path.GetDirectoryName(oldPath) ?? string.Empty;
+            var fileName = Path.GetFileName(oldPath);
+
+            if (!string.IsNullOrWhiteSpace(fileName))
+            {
+                var record = new DeletionRecord
+                {
+                    FullPath = oldPath,
+                    FileName = fileName,
+                    DirectoryPath = directory,
+                    DeletedAtUtc = DateTime.UtcNow,
+                    FileSizeBytes = originalSize,
+                    RecoveryStrength = "Strong"
+                };
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS immediate Recycle Bin rename detected: " +
+                    $"oldPath={oldPath}, newPath={newPath}, size={originalSize?.ToString() ?? "(unknown)"}.");
+
+                DeletionDetected?.Invoke(
+                    this,
+                    new DeletionDetectedEventArgs(record));
+
+                _ = Task.Run(() => UpdateRecoveryStrength(record));
+            }
         }
 
         RememberSize(e.FullPath);
+    }
+
+    private static bool IsRecycleBinPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        var normalized = NormalizePath(path);
+        var root = Path.GetPathRoot(normalized);
+
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return false;
+        }
+
+        var recycleRoot = Path.Combine(
+            root.TrimEnd(Path.DirectorySeparatorChar),
+            "$Recycle.Bin");
+
+        return normalized.Equals(
+                   recycleRoot,
+                   StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith(
+                   recycleRoot + Path.DirectorySeparatorChar,
+                   StringComparison.OrdinalIgnoreCase);
     }
 
     private void OnDeleted(object sender, FileSystemEventArgs e)
