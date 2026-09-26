@@ -2,13 +2,13 @@ namespace FileRecovery;
 
 public sealed class NtfsDeletionDataSnapshot
 {
-    public bool DataCaptured { get; init; }
+    public bool DataCaptured { get; set; }
     public bool IsResident { get; init; }
     public long FileSizeBytes { get; init; }
     public long ValidDataLengthBytes { get; init; }
     public long CapturedByteCount { get; init; }
     public string? DataFileName { get; set; }
-    public string Sha256 { get; init; } = string.Empty;
+    public string Sha256 { get; set; } = string.Empty;
     public List<NtfsDataExtent> DataExtents { get; init; } = [];
     public DateTime CapturedAtUtc { get; init; }
     public string Evidence { get; init; } = string.Empty;
