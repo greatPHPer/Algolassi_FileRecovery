@@ -1507,24 +1507,28 @@ public partial class Form1 : Form
                     {
                         var expectedFullPath = NormalizePath(record.FullPath);
 
-                        var match = availableItems.FirstOrDefault(item =>
-                            !string.IsNullOrWhiteSpace(item.OriginalLocation) &&
-                            !item.OriginalLocation.Equals(
-                                "(Unavailable)",
-                                StringComparison.OrdinalIgnoreCase) &&
-                            string.Equals(
-                                NormalizePath(Path.Combine(item.OriginalLocation, item.Name)),
-                                expectedFullPath,
-                                StringComparison.OrdinalIgnoreCase));
+                        // Multiple Recycle Bin entries can have the exact same
+                        // filename and original folder. Pick the entry whose Shell
+                        // deletion time is closest to the selected history record.
+                        var match = FindBestRecycleBinMatch(
+                            availableItems,
+                            expectedFullPath,
+                            record.DeletedAtUtc);
 
                         if (match is null)
                         {
                             // Fallback only when Shell does not expose the original
-                            // location. Name + deletion metadata is less precise,
-                            // so use it only after the path-based match fails.
+                            // location. Require the exact displayed deletion timestamp
+                            // so duplicate same-name entries are not silently mixed.
                             match = availableItems.FirstOrDefault(item =>
-                                string.Equals(item.Name, record.FileName, StringComparison.OrdinalIgnoreCase) &&
-                                string.Equals(item.DeletedDate, record.DeletedAtUtc.ToLocalTime().ToString("g"), StringComparison.OrdinalIgnoreCase));
+                                string.Equals(
+                                    item.Name,
+                                    record.FileName,
+                                    StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(
+                                    item.DeletedDate,
+                                    record.DeletedAtUtc.ToLocalTime().ToString("g"),
+                                    StringComparison.OrdinalIgnoreCase));
                         }
 
                         if (match is not null)
@@ -1546,7 +1550,7 @@ public partial class Form1 : Form
                 if (recycleOutcome.TimedOut)
                 {
                     lblStatus.Text =
-                        "Recycle Bin lookup timed out after 15 seconds; continuing with NTFS recovery.";
+                        "Recycle Bin lookup timed out after 60 seconds; continuing with NTFS recovery.";
                 }
                 else if (recycleOutcome.Error is not null)
                 {
@@ -1815,7 +1819,10 @@ public partial class Form1 : Form
         Exception? Error)> ResolveRecycleBinMatchesWithTimeoutAsync(
             Task<Dictionary<Guid, RecoveryItem>> recycleResolutionTask)
     {
-        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(15));
+        // Shell automation can legitimately take longer when the Recycle Bin
+        // contains many entries. Keep a bounded safety timeout, but do not fail
+        // normal mouse-delete recovery after only 15 seconds.
+        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(60));
 
         var completed = await Task.WhenAny(
                 recycleResolutionTask,
@@ -1838,6 +1845,67 @@ public partial class Form1 : Form
             // failure stage to the Recovery Center status text.
             return ([], false, ex);
         }
+    }
+
+    private static RecoveryItem? FindBestRecycleBinMatch(
+        IReadOnlyList<RecoveryItem> availableItems,
+        string expectedFullPath,
+        DateTime deletedAtUtc)
+    {
+        var pathMatches = availableItems
+            .Where(item =>
+                !string.IsNullOrWhiteSpace(item.OriginalLocation) &&
+                !item.OriginalLocation.Equals(
+                    "(Unavailable)",
+                    StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(
+                    NormalizePath(Path.Combine(item.OriginalLocation, item.Name)),
+                    expectedFullPath,
+                    StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (pathMatches.Count == 0)
+        {
+            return null;
+        }
+
+        if (pathMatches.Count == 1 || deletedAtUtc == default)
+        {
+            return pathMatches.Count == 1 ? pathMatches[0] : null;
+        }
+
+        var expectedLocalTime = deletedAtUtc.ToLocalTime();
+
+        var datedMatches = pathMatches
+            .Select(item =>
+            {
+                var parsed = DateTime.TryParse(
+                    item.DeletedDate,
+                    System.Globalization.CultureInfo.CurrentCulture,
+                    System.Globalization.DateTimeStyles.AllowWhiteSpaces,
+                    out var parsedDate);
+
+                return new
+                {
+                    Item = item,
+                    Parsed = parsed,
+                    Delta = parsed
+                        ? Math.Abs((parsedDate - expectedLocalTime).TotalMilliseconds)
+                        : double.MaxValue
+                };
+            })
+            .Where(match => match.Parsed)
+            .OrderBy(match => match.Delta)
+            .ToList();
+
+        if (datedMatches.Count == 0)
+        {
+            // Several identical path entries without usable dates are ambiguous.
+            // Do not silently restore the wrong deleted instance.
+            return null;
+        }
+
+        return datedMatches[0].Item;
     }
 
     private static bool TryRecoverFromNtfsSnapshot(
