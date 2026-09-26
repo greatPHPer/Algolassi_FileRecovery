@@ -305,10 +305,12 @@ public sealed class NtfsDeepFileRecoveryService
 
         if (extension.Equals(".txt", StringComparison.OrdinalIgnoreCase))
         {
-            // Plain text can be carved without the original length only as a
-            // deliberately heuristic prefix search. When the original length is
-            // known, the exact-size path remains preferred.
-            return true;
+            // Plain text has no intrinsic end marker. Only attempt automatic
+            // free-space recovery when the original file size is known so the
+            // scanner can validate an exact-length text candidate. Without the
+            // original size, returning the first printable block can silently
+            // recover unrelated files (for example a Git DIRC/index block).
+            return knownFileSizeBytes > 0;
         }
 
         return SupportsExtension(extension);
