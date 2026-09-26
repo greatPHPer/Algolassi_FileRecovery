@@ -537,9 +537,45 @@ public sealed class UsnJournalMonitor : IDisposable
                     continue;
                 }
 
-                var directory = cache.TryGetValue(record.ParentFileReferenceNumber, out var knownPath)
+                // Snapshot NTFS $DATA before resolving the parent directory.
+                // The parent lookup touches MFT metadata and can give MFT sequence
+                // reuse more time to invalidate a just-deleted record.
+                var cachedDirectory = cache.TryGetValue(
+                    record.ParentFileReferenceNumber,
+                    out var knownPath)
                     ? knownPath
-                    : ResolveParentDirectory(volumeHandle, record.ParentFileReferenceNumber);
+                    : null;
+
+                var initialDirectory = string.IsNullOrWhiteSpace(cachedDirectory)
+                    ? "(Parent directory unavailable)"
+                    : cachedDirectory;
+
+                var initialPath = string.IsNullOrWhiteSpace(cachedDirectory)
+                    ? record.FileName
+                    : Path.Combine(cachedDirectory, record.FileName);
+
+                var deletion = new DeletionRecord
+                {
+                    FileReferenceNumber = record.FileReferenceNumber,
+                    ParentFileReferenceNumber = record.ParentFileReferenceNumber,
+                    FullPath = NormalizePath(initialPath),
+                    FileName = record.FileName,
+                    DirectoryPath = initialDirectory,
+                    DeletedAtUtc = record.TimestampUtc,
+                    FileSizeBytes = null,
+                    RecoveryStrength = "Weak"
+                };
+
+                CaptureNtfsDeletionSnapshot(
+                    deletion,
+                    volumeKey,
+                    record.FileReferenceNumber,
+                    record.ParentFileReferenceNumber,
+                    record.FileName,
+                    cachedDirectory ?? string.Empty);
+
+                var directory = cachedDirectory ??
+                    ResolveParentDirectory(volumeHandle, record.ParentFileReferenceNumber);
 
                 if (!string.IsNullOrWhiteSpace(directory))
                 {
@@ -551,7 +587,8 @@ public sealed class UsnJournalMonitor : IDisposable
                     directory = "(Parent directory unavailable)";
                 }
 
-                var recordPath = Path.Combine(directory, record.FileName);
+                deletion.DirectoryPath = directory;
+                deletion.FullPath = NormalizePath(Path.Combine(directory, record.FileName));
 
                 _recentDeletedRecords.Enqueue(
                     new RecentDeletedRecord(
@@ -568,26 +605,6 @@ public sealed class UsnJournalMonitor : IDisposable
                        _recentDeletedRecords.TryDequeue(out _))
                 {
                 }
-
-                var deletion = new DeletionRecord
-                {
-                    FileReferenceNumber = record.FileReferenceNumber,
-                    ParentFileReferenceNumber = record.ParentFileReferenceNumber,
-                    FullPath = recordPath,
-                    FileName = record.FileName,
-                    DirectoryPath = directory,
-                    DeletedAtUtc = record.TimestampUtc,
-                    FileSizeBytes = null,
-                    RecoveryStrength = "Weak"
-                };
-
-                CaptureNtfsDeletionSnapshot(
-                    deletion,
-                    volumeKey,
-                    record.FileReferenceNumber,
-                    record.ParentFileReferenceNumber,
-                    record.FileName,
-                    directory);
 
                 DeletionDetected?.Invoke(this, new DeletionDetectedEventArgs(deletion, historical: true));
             }
