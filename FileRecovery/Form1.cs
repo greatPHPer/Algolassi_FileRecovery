@@ -1802,6 +1802,66 @@ public partial class Form1 : Form
                     continue;
                 }
 
+                // Re-check the complete default NTFS $DATA stream at recovery time.
+                // The scan can legitimately retain only metadata when the MFT record
+                // changes between scan and recovery. When the trusted file reference,
+                // parent reference and historical path still validate, recover directly
+                // from the retained resident/nonresident $DATA stream before any heuristic
+                // or carving path is considered.
+                if (candidate.FileReferenceNumber != 0 &&
+                    candidate.ParentFileReferenceNumber != 0)
+                {
+                    var directMftReader = new NtfsMftDataReader();
+
+                    if (directMftReader.TryReadDataStreamForDeletedReference(
+                        candidate.FullPath,
+                        candidate.FileReferenceNumber,
+                        candidate.ParentFileReferenceNumber,
+                        candidate.Name,
+                        candidate.FullPath,
+                        out var directDataStream) &&
+                        directDataStream.Found)
+                    {
+                        if (candidate.FileSizeBytes > 0 &&
+                            directDataStream.FileSizeBytes > 0 &&
+                            directDataStream.FileSizeBytes != candidate.FileSizeBytes)
+                        {
+                            System.Diagnostics.Debug.WriteLine(
+                                $"NTFS recovery-time $DATA size mismatch: " +
+                                $"path={candidate.FullPath}, candidateSize={candidate.FileSizeBytes:N0}, " +
+                                $"streamSize={directDataStream.FileSizeBytes:N0}.");
+                        }
+                        else
+                        {
+                            var directCandidate = new RecoveryCandidate
+                            {
+                                FileReferenceNumber = candidate.FileReferenceNumber,
+                                ParentFileReferenceNumber = candidate.ParentFileReferenceNumber,
+                                Name = candidate.Name,
+                                DirectoryPath = candidate.DirectoryPath,
+                                LastUsnTimestampUtc = candidate.LastUsnTimestampUtc,
+                                Strength = candidate.Strength,
+                                Evidence = candidate.Evidence,
+                                DataStreamFound = directDataStream.Found,
+                                DataStreamResident = directDataStream.IsResident,
+                                FileSizeBytes = directDataStream.FileSizeBytes,
+                                ValidDataLengthBytes = directDataStream.ValidDataLengthBytes,
+                                ResidentData = directDataStream.ResidentData,
+                                DataExtents = directDataStream.Extents,
+                                ExtentAllocations = [],
+                                FreeDataClusterCount = 0,
+                                AllocatedDataClusterCount = 0,
+                                DataEvidence = directDataStream.Evidence
+                            };
+
+                            successes.Add(_ntfsRecoveryService.Recover(
+                                directCandidate,
+                                destinationDirectory));
+                            continue;
+                        }
+                    }
+                }
+
                 // A fresh deletion can leave the resident $DATA stream in the
                 // normal MFT record even when the regular data-stream lookup did not
                 // promote that record to DataStreamFound. Try that source before
