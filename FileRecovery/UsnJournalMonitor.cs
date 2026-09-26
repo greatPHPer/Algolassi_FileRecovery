@@ -2075,16 +2075,13 @@ public sealed class UsnJournalMonitor : IDisposable
         long startUsn,
         out long nextUsn)
     {
-        // Use the V0 NTFS input layout here. The V1 extension adds
-        // MinMajorVersion/MaxMajorVersion, and Windows can reject the larger
-        // input buffer with ERROR_INVALID_PARAMETER (87) for NTFS journals.
+        // Use the V0 NTFS input layout. Modern NTFS volumes can return
+        // USN_RECORD_V3 records with 128-bit file IDs.
         var request = new ReadUsnJournalRequest
         {
             StartUsn = startUsn,
             ReasonMask = UsnReasonFileDelete,
             ReturnOnlyOnClose = 0,
-            // This is a bounded historical lookup, not a live wait for new
-            // journal entries. BytesToWaitFor = 0 means do not wait for new data.
             Timeout = 0,
             BytesToWaitFor = 0,
             UsnJournalId = journalId
@@ -2123,59 +2120,135 @@ public sealed class UsnJournalMonitor : IDisposable
             return [];
         }
 
-        nextUsn = BinaryPrimitives.ReadInt64LittleEndian(output.AsSpan(0, 8));
+        nextUsn = BinaryPrimitives.ReadInt64LittleEndian(
+            output.AsSpan(0, 8));
 
         var records = new List<UsnRecord>();
         var offset = 8;
 
         while (offset + 4 <= bytesReturned)
         {
-            var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(output.AsSpan(offset, 4));
+            var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                output.AsSpan(offset, 4));
+
             if (recordLength < UsnRecordV2MinimumLength ||
                 recordLength > bytesReturned - offset)
             {
                 break;
             }
 
-            var recordSpan = output.AsSpan(offset, checked((int)recordLength));
-            var majorVersion = BinaryPrimitives.ReadUInt16LittleEndian(recordSpan.Slice(4, 2));
-            if (majorVersion != 2)
+            var recordSpan = output.AsSpan(
+                offset,
+                checked((int)recordLength));
+
+            var majorVersion = BinaryPrimitives.ReadUInt16LittleEndian(
+                recordSpan.Slice(4, 2));
+
+            ulong fileReference;
+            ulong parentReference;
+            long timestampFileTime;
+            uint reason;
+            uint fileAttributes;
+            ushort nameLength;
+            ushort nameOffset;
+
+            if (majorVersion == 2)
+            {
+                // USN_RECORD_V2
+                fileReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(8, 8));
+
+                parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(16, 8));
+
+                timestampFileTime = BinaryPrimitives.ReadInt64LittleEndian(
+                    recordSpan.Slice(32, 8));
+
+                reason = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(40, 4));
+
+                fileAttributes = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(52, 4));
+
+                nameLength = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(56, 2));
+
+                nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(58, 2));
+            }
+            else if (majorVersion == 3)
+            {
+                // USN_RECORD_V3
+                //
+                // FileReferenceNumber and ParentFileReferenceNumber are
+                // FILE_ID_128 values. On this NTFS volume the traditional
+                // NTFS MFT reference is in the lower 64 bits.
+                if (recordSpan.Length < 76)
+                {
+                    offset += checked((int)recordLength);
+                    continue;
+                }
+
+                fileReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(16, 8));
+
+                parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(32, 8));
+
+                timestampFileTime = BinaryPrimitives.ReadInt64LittleEndian(
+                    recordSpan.Slice(48, 8));
+
+                reason = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(56, 4));
+
+                fileAttributes = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(68, 4));
+
+                nameLength = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(72, 2));
+
+                nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(74, 2));
+            }
+            else
+            {
+                // USN_RECORD_V4 or an unknown future version.
+                // Do not guess its layout.
+                offset += checked((int)recordLength);
+                continue;
+            }
+
+            if (nameLength == 0 ||
+                nameOffset + nameLength > recordSpan.Length ||
+                (nameLength & 1) != 0)
             {
                 offset += checked((int)recordLength);
                 continue;
             }
 
-            var fileReference = BinaryPrimitives.ReadUInt64LittleEndian(recordSpan.Slice(8, 8));
-            var parentReference = BinaryPrimitives.ReadUInt64LittleEndian(recordSpan.Slice(16, 8));
-            var timestampFileTime = BinaryPrimitives.ReadInt64LittleEndian(recordSpan.Slice(32, 8));
-            var reason = BinaryPrimitives.ReadUInt32LittleEndian(recordSpan.Slice(40, 4));
-            var fileAttributes = BinaryPrimitives.ReadUInt32LittleEndian(recordSpan.Slice(52, 4));
-            var nameLength = BinaryPrimitives.ReadUInt16LittleEndian(recordSpan.Slice(56, 2));
-            var nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(recordSpan.Slice(58, 2));
+            var name = System.Text.Encoding.Unicode.GetString(
+                recordSpan.Slice(nameOffset, nameLength));
 
-            if (nameOffset + nameLength <= recordSpan.Length)
+            DateTime timestampUtc;
+
+            try
             {
-                var name = System.Text.Encoding.Unicode.GetString(
-                    recordSpan.Slice(nameOffset, nameLength));
+                timestampUtc = DateTime.FromFileTimeUtc(
+                    timestampFileTime);
+            }
+            catch
+            {
+                timestampUtc = DateTime.UtcNow;
+            }
 
-                DateTime timestampUtc;
-                try
-                {
-                    timestampUtc = DateTime.FromFileTimeUtc(timestampFileTime);
-                }
-                catch
-                {
-                    timestampUtc = DateTime.UtcNow;
-                }
-
-                records.Add(new UsnRecord(
+            records.Add(
+                new UsnRecord(
                     fileReference,
                     parentReference,
                     reason,
                     fileAttributes,
                     name,
                     timestampUtc));
-            }
 
             offset += checked((int)recordLength);
         }
