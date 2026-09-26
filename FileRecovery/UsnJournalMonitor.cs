@@ -867,6 +867,65 @@ public sealed class UsnJournalMonitor : IDisposable
         return true;
     }
 
+    public bool TryCaptureRecentDeletionSnapshot(DeletionRecord deletion)
+    {
+        if (deletion is null ||
+            string.IsNullOrWhiteSpace(deletion.FullPath) ||
+            string.IsNullOrWhiteSpace(deletion.FileName))
+        {
+            return false;
+        }
+
+        var root = Path.GetPathRoot(deletion.FullPath);
+        if (string.IsNullOrWhiteSpace(root) ||
+            !string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!TryResolveRecentDeletedFileBounded(
+                deletion.FullPath,
+                deletion.DeletedAtUtc,
+                out var fileReferenceNumber,
+                out var parentFileReferenceNumber))
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: no matching USN delete found for path={deletion.FullPath}.");
+            return false;
+        }
+
+        deletion.FileReferenceNumber = fileReferenceNumber;
+        deletion.ParentFileReferenceNumber = parentFileReferenceNumber;
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        var directoryPath = Path.GetDirectoryName(deletion.FullPath) ?? string.Empty;
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS live deletion snapshot: matched path={deletion.FullPath}, " +
+            $"fileRef={fileReferenceNumber}, parentRef={parentFileReferenceNumber}.");
+
+        CaptureNtfsDeletionSnapshot(
+            deletion,
+            volumeKey,
+            fileReferenceNumber,
+            parentFileReferenceNumber,
+            deletion.FileName,
+            directoryPath);
+
+        if (deletion.NtfsDataSnapshot is not null)
+        {
+            if (deletion.NtfsDataSnapshot.IsComplete ||
+                deletion.NtfsDataSnapshot.FileSizeBytes > DeleteSnapshotMaxBytes)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
     public bool TryResolveRecentDeletedFile(
         string fullPath,
         DateTime deletedAtUtc,
