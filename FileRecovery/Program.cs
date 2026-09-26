@@ -31,11 +31,11 @@ internal static class Program
                 logDirectory,
                 "AlgoLassi-FileRecovery-debug.txt");
 
-            Debug.Listeners.Clear();
-            Debug.Listeners.Add(new BoundedFileTraceListener(logPath));
-            Debug.AutoFlush = true;
+            Trace.Listeners.Clear();
+            Trace.Listeners.Add(new BoundedFileTraceListener(logPath));
+            Trace.AutoFlush = true;
 
-            Debug.WriteLine(
+            Trace.WriteLine(
                 $"[{DateTime.UtcNow:O}] AlgoLassi diagnostic logging started: {logPath}");
         }
         catch
