@@ -254,6 +254,7 @@ public sealed class DeletionHistoryStore
         DirectoryPath = item.DirectoryPath,
         DeletedAtUtc = item.DeletedAtUtc,
         FileSizeBytes = item.FileSizeBytes,
-        RecoveryStrength = item.RecoveryStrength
+        RecoveryStrength = item.RecoveryStrength,
+        NtfsDataSnapshot = item.NtfsDataSnapshot?.Clone()
     };
 }
