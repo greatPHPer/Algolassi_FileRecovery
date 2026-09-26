@@ -7,9 +7,12 @@ namespace FileRecovery;
 
 /// <summary>
 /// Conservative forensic helper for extracting a historical file size from the
-/// NTFS $LogFile transaction journal. This does not attempt to replay the NTFS
-/// transaction log. It searches the currently retained log payload for a
-/// structurally valid $FILE_NAME value matching the deleted file name and parent.
+/// NTFS $LogFile transaction journal.
+///
+/// NTFS metadata files such as $LogFile can be hidden/protected from ordinary
+/// Win32 path access. Instead of opening E:\$LogFile directly, this service reads
+/// MFT metadata record 2 ($LogFile) to obtain its $DATA runlist and then reads the
+/// mapped clusters through the raw volume handle.
 ///
 /// $LogFile is a finite circular journal, so absence of a match is normal.
 /// </summary>
@@ -21,8 +24,8 @@ public sealed class NtfsLogFileHistoricalSizeService
     private const uint FileShareDelete = 0x00000004;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
-    private const uint FileFlagSequentialScan = 0x08000000;
     private const uint FileFlagOverlapped = 0x40000000;
+    private const int ErrorIoPending = 997;
 
     private const int BufferSize = 1024 * 1024;
     private const uint NtfsFileNameAttributeType = 0x30;
@@ -32,6 +35,10 @@ public sealed class NtfsLogFileHistoricalSizeService
     private const int NameLengthOffset = 64;
     private const int NameNamespaceOffset = 65;
     private const int NameOffset = 66;
+
+    // NTFS reserves the first MFT records for well-known metadata files.
+    // Record 2 is $LogFile.
+    private const ulong LogFileMftSegment = 2;
 
     public bool TryRecoverFileSize(
         string rootPath,
@@ -52,143 +59,231 @@ public sealed class NtfsLogFileHistoricalSizeService
             return false;
         }
 
-        var root = Path.GetPathRoot(rootPath);
-        if (string.IsNullOrWhiteSpace(root))
+        var normalizedRoot = GetNtfsVolumeRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(normalizedRoot))
         {
+            evidence = "The source path is not on a valid NTFS volume.";
             return false;
         }
-
-        var volumeName = root.TrimEnd(Path.DirectorySeparatorChar);
-        var logFilePath = Path.Combine(
-            volumeName + Path.DirectorySeparatorChar,
-            "$LogFile");
-
-        var expectedNameBytes = System.Text.Encoding.Unicode.GetBytes(expectedFileName);
-        if (expectedNameBytes.Length == 0)
-        {
-            return false;
-        }
-
-        WindowsPrivilege.EnableSeBackupPrivilege();
 
         try
         {
-            using var handle = CreateFile(
-                logFilePath,
-                GenericRead,
-                FileShareRead | FileShareWrite | FileShareDelete,
-                IntPtr.Zero,
-                OpenExisting,
-                FileFlagBackupSemantics | FileFlagSequentialScan | FileFlagOverlapped,
-                IntPtr.Zero);
+            WindowsPrivilege.EnableSeBackupPrivilege();
 
-            if (handle.IsInvalid)
+            var volumeInfo = new NtfsVolumeInspector().Inspect(normalizedRoot);
+            using var metadataVolumeHandle = CreateVolumeHandle(
+                normalizedRoot,
+                overlapped: false);
+
+            using var rawVolumeHandle = CreateVolumeHandle(
+                normalizedRoot,
+                overlapped: true);
+
+            var dataReader = new NtfsMftDataReader();
+
+            var logStream = dataReader.ReadMetadataFileDataStream(
+                volumeInfo,
+                metadataVolumeHandle,
+                LogFileMftSegment);
+
+            if (!logStream.Found ||
+                logStream.IsResident ||
+                logStream.Extents.Count == 0 ||
+                logStream.FileSizeBytes <= 0)
             {
-                var error = Marshal.GetLastWin32Error();
-                evidence = $"Could not open NTFS $LogFile for read-only forensic inspection. Win32 error={error}.";
+                evidence =
+                    $"NTFS metadata MFT record {LogFileMftSegment} did not expose a usable " +
+                    $"nonresident $LogFile $DATA stream. " +
+                    $"Found={logStream.Found}, resident={logStream.IsResident}, " +
+                    $"fileSize={logStream.FileSizeBytes:N0}, extents={logStream.Extents.Count:N0}. " +
+                    logStream.Evidence;
                 return false;
             }
 
-            if (!GetFileSizeEx(handle, out var logFileSize) || logFileSize <= 0)
+            var expectedNameBytes = System.Text.Encoding.Unicode.GetBytes(expectedFileName);
+            if (expectedNameBytes.Length == 0)
             {
-                evidence = "NTFS $LogFile did not report a readable size.";
+                evidence = "The deleted filename could not be encoded as UTF-16.";
                 return false;
             }
 
-            // Keep enough overlap to reconstruct a complete $FILE_NAME value if
-            // the UTF-16 filename or its preceding 66-byte header crosses a chunk.
-            var overlapLength = Math.Max(expectedNameBytes.Length + NameOffset + 16, 256);
-            var previousTail = Array.Empty<byte>();
+            var overlapLength = Math.Max(
+                expectedNameBytes.Length + NameOffset + 16,
+                512);
+
             long scannedBytes = 0;
+            var previousTail = Array.Empty<byte>();
             long bestSize = 0;
             long matchCount = 0;
+            var expectedVcn = 0L;
 
-            while (scannedBytes < logFileSize)
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile raw extent scan started: " +
+                $"logicalSize={logStream.FileSizeBytes:N0}, " +
+                $"extents={logStream.Extents.Count:N0}, " +
+                $"target={expectedFileName}.");
+
+            foreach (var extent in logStream.DataExtents.OrderBy(
+                         x => x.VirtualClusterNumber))
             {
-                var remaining = logFileSize - scannedBytes;
-                var bytesToRead = (int)Math.Min(BufferSize, remaining);
-                var buffer = new byte[bytesToRead];
-
-                ReadFileExact(handle, buffer, scannedBytes);
-
-                var window = new byte[previousTail.Length + buffer.Length];
-                if (previousTail.Length > 0)
+                if (extent.VirtualClusterNumber != expectedVcn)
                 {
-                    Buffer.BlockCopy(previousTail, 0, window, 0, previousTail.Length);
+                    evidence =
+                        $"The retained $LogFile $DATA mapping contains a VCN gap at " +
+                        $"{expectedVcn:N0}; safe historical-size scanning was stopped.";
+                    return false;
                 }
 
-                Buffer.BlockCopy(
-                    buffer,
-                    0,
-                    window,
-                    previousTail.Length,
-                    buffer.Length);
+                var extentBytes = checked(
+                    extent.ClusterCount * (long)volumeInfo.BytesPerCluster);
 
-                var windowAbsoluteOffset = scannedBytes - previousTail.Length;
-
-                for (var searchOffset = 0;
-                     searchOffset + expectedNameBytes.Length <= window.Length;
-                     searchOffset++)
+                if (extentBytes <= 0)
                 {
-                    if (!window.AsSpan(
-                            searchOffset,
-                            expectedNameBytes.Length)
-                        .SequenceEqual(expectedNameBytes))
+                    expectedVcn = checked(
+                        expectedVcn + extent.ClusterCount);
+                    continue;
+                }
+
+                if (extent.IsSparse)
+                {
+                    // A sparse region has no physical bytes to search. It also cannot
+                    // safely bridge a UTF-16 filename match across the logical hole.
+                    previousTail = Array.Empty<byte>();
+                    scannedBytes = checked(scannedBytes + extentBytes);
+                    expectedVcn = checked(
+                        expectedVcn + extent.ClusterCount);
+                    continue;
+                }
+
+                var physicalExtentOffset = checked(
+                    extent.LogicalClusterNumber *
+                    (long)volumeInfo.BytesPerCluster);
+
+                var extentBytesScanned = 0L;
+
+                while (extentBytesScanned < extentBytes)
+                {
+                    var bytesToRead = (int)Math.Min(
+                        BufferSize,
+                        extentBytes - extentBytesScanned);
+
+                    var physicalOffset = checked(
+                        physicalExtentOffset + extentBytesScanned);
+
+                    var logicalOffset = checked(
+                        extent.VirtualClusterNumber *
+                        (long)volumeInfo.BytesPerCluster +
+                        extentBytesScanned);
+
+                    var buffer = new byte[bytesToRead];
+
+                    ReadRawExact(
+                        rawVolumeHandle,
+                        physicalOffset,
+                        buffer);
+
+                    var window = new byte[checked(
+                        previousTail.Length + buffer.Length)];
+
+                    if (previousTail.Length > 0)
                     {
-                        continue;
+                        Buffer.BlockCopy(
+                            previousTail,
+                            0,
+                            window,
+                            0,
+                            previousTail.Length);
                     }
 
-                    var valueOffset = searchOffset - NameOffset;
-                    if (valueOffset < 0 ||
-                        valueOffset + NameOffset + expectedNameBytes.Length > window.Length)
-                    {
-                        continue;
-                    }
-
-                    var candidateSize = TryReadFileNameValue(
+                    Buffer.BlockCopy(
+                        buffer,
+                        0,
                         window,
-                        valueOffset,
-                        expectedFileName,
-                        expectedParentFileReferenceNumber,
-                        maximumValidFileSize);
+                        previousTail.Length,
+                        buffer.Length);
 
-                    if (candidateSize <= 0)
+                    var windowLogicalOffset = checked(
+                        logicalOffset - previousTail.Length);
+
+                    for (var searchOffset = 0;
+                         searchOffset + expectedNameBytes.Length <= window.Length;
+                         searchOffset++)
                     {
-                        continue;
+                        if (!window.AsSpan(
+                                searchOffset,
+                                expectedNameBytes.Length)
+                            .SequenceEqual(expectedNameBytes))
+                        {
+                            continue;
+                        }
+
+                        var valueOffset = searchOffset - NameOffset;
+                        if (valueOffset < 0)
+                        {
+                            continue;
+                        }
+
+                        var candidateSize = TryReadFileNameValue(
+                            window,
+                            valueOffset,
+                            expectedFileName,
+                            expectedParentFileReferenceNumber,
+                            maximumValidFileSize);
+
+                        if (candidateSize <= 0)
+                        {
+                            continue;
+                        }
+
+                        matchCount++;
+                        if (candidateSize > bestSize)
+                        {
+                            bestSize = candidateSize;
+                        }
+
+                        System.Diagnostics.Debug.WriteLine(
+                            $"NTFS $LogFile historical $FILE_NAME match: " +
+                            $"name={expectedFileName}, size={candidateSize:N0}, " +
+                            $"logicalOffset={windowLogicalOffset + searchOffset:N0}.");
                     }
 
-                    matchCount++;
-                    if (candidateSize > bestSize)
-                    {
-                        bestSize = candidateSize;
-                    }
+                    extentBytesScanned = checked(
+                        extentBytesScanned + buffer.Length);
 
-                    System.Diagnostics.Debug.WriteLine(
-                        $"NTFS $LogFile historical $FILE_NAME match: " +
-                        $"fileName={expectedFileName}, size={candidateSize:N0}, " +
-                        $"offset={windowAbsoluteOffset + searchOffset:N0}.");
+                    scannedBytes = checked(
+                        scannedBytes + buffer.Length);
+
+                    previousTail = buffer.Length <= overlapLength
+                        ? buffer
+                        : buffer.AsSpan(
+                            buffer.Length - overlapLength,
+                            overlapLength)
+                          .ToArray();
                 }
 
-                scannedBytes = checked(scannedBytes + buffer.Length);
-
-                previousTail = buffer.Length <= overlapLength
-                    ? buffer
-                    : buffer.AsSpan(buffer.Length - overlapLength).ToArray();
+                expectedVcn = checked(
+                    expectedVcn + extent.ClusterCount);
             }
 
             if (bestSize <= 0)
             {
                 evidence =
-                    $"NTFS $LogFile was scanned completely ({logFileSize:N0} bytes), " +
-                    $"but no structurally valid $FILE_NAME size was found for " +
-                    $"'{expectedFileName}' with the expected parent reference.";
+                    $"$LogFile was read successfully through MFT record {LogFileMftSegment} " +
+                    $"and {logStream.Extents.Count:N0} physical extent(s), " +
+                    $"but no structurally valid $FILE_NAME size matching " +
+                    $"'{expectedFileName}' and parent reference {expectedParentFileReferenceNumber} " +
+                    $"was found after scanning {scannedBytes:N0} bytes of the " +
+                    $"{logStream.FileSizeBytes:N0}-byte log stream. " +
+                    $"$LogFile evidence: {logStream.Evidence}";
                 return false;
             }
 
             fileSizeBytes = bestSize;
             evidence =
-                $"Recovered historical file size {bestSize:N0} bytes from NTFS $LogFile " +
-                $"($FILE_NAME evidence; {matchCount:N0} matching log payload occurrence(s)).";
+                $"Recovered historical file size {bestSize:N0} bytes from the retained NTFS " +
+                $"$LogFile data stream through MFT record {LogFileMftSegment}. " +
+                $"Matched {matchCount:N0} structurally valid $FILE_NAME occurrence(s) " +
+                $"while scanning {scannedBytes:N0} bytes.";
 
             return true;
         }
@@ -274,22 +369,17 @@ public sealed class NtfsLogFileHistoricalSizeService
         return realSize;
     }
 
-    private static void ReadFileExact(
-        SafeFileHandle handle,
-        byte[] buffer,
-        long offset)
+    private static void ReadRawExact(
+        SafeFileHandle volumeHandle,
+        long fileOffset,
+        byte[] buffer)
     {
-        if (buffer.Length == 0)
-        {
-            return;
-        }
-
         using var completionEvent = new ManualResetEvent(initialState: false);
 
         var overlapped = new NativeOverlapped
         {
-            OffsetLow = unchecked((int)(offset & 0xFFFFFFFF)),
-            OffsetHigh = unchecked((int)(offset >> 32)),
+            OffsetLow = unchecked((int)(fileOffset & 0xFFFFFFFF)),
+            OffsetHigh = unchecked((int)(fileOffset >> 32)),
             HEvent = completionEvent.SafeWaitHandle.DangerousGetHandle()
         };
 
@@ -310,7 +400,7 @@ public sealed class NtfsLogFileHistoricalSizeService
             try
             {
                 var started = ReadFile(
-                    handle,
+                    volumeHandle,
                     bufferHandle.AddrOfPinnedObject(),
                     checked((uint)buffer.Length),
                     IntPtr.Zero,
@@ -319,31 +409,32 @@ public sealed class NtfsLogFileHistoricalSizeService
                 if (!started)
                 {
                     var error = Marshal.GetLastWin32Error();
-                    if (error != 997)
+
+                    if (error != ErrorIoPending)
                     {
                         throw new Win32Exception(
                             error,
-                            $"Could not read NTFS $LogFile at byte offset {offset:N0}.");
+                            $"Could not read NTFS $LogFile data at physical byte offset {fileOffset:N0}.");
                     }
                 }
 
                 completionEvent.WaitOne();
 
                 if (!GetOverlappedResult(
-                        handle,
+                        volumeHandle,
                         overlappedPtr,
                         out var bytesRead,
                         bWait: false))
                 {
                     throw new Win32Exception(
                         Marshal.GetLastWin32Error(),
-                        $"Could not complete NTFS $LogFile read at byte offset {offset:N0}.");
+                        $"Could not complete NTFS $LogFile data read at physical byte offset {fileOffset:N0}.");
                 }
 
                 if (bytesRead != (uint)buffer.Length)
                 {
                     throw new EndOfStreamException(
-                        $"NTFS $LogFile returned {bytesRead:N0} byte(s) instead of {buffer.Length:N0}.");
+                        $"NTFS $LogFile data read returned {bytesRead:N0} byte(s) instead of {buffer.Length:N0}.");
                 }
             }
             finally
@@ -355,6 +446,54 @@ public sealed class NtfsLogFileHistoricalSizeService
         {
             Marshal.FreeHGlobal(overlappedPtr);
         }
+    }
+
+    private static SafeFileHandle CreateVolumeHandle(
+        string root,
+        bool overlapped)
+    {
+        var normalizedRoot = GetNtfsVolumeRoot(root)
+            ?? throw new ArgumentException(
+                "A valid NTFS volume root is required.",
+                nameof(root));
+
+        var volumeName = normalizedRoot.TrimEnd(Path.DirectorySeparatorChar);
+        var flags = FileFlagBackupSemantics |
+                    (overlapped ? FileFlagOverlapped : 0);
+
+        var handle = CreateFile(
+            $@"\\.\{volumeName[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            flags,
+            IntPtr.Zero);
+
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+
+            throw new Win32Exception(
+                error,
+                $"Could not open NTFS source volume {normalizedRoot} for $LogFile forensic reading.");
+        }
+
+        return handle;
+    }
+
+    private static string? GetNtfsVolumeRoot(string path)
+    {
+        var normalized = path.Trim();
+
+        while (normalized.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+               normalized.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalized = normalized[4..];
+        }
+
+        return Path.GetPathRoot(normalized);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -376,11 +515,6 @@ public sealed class NtfsLogFileHistoricalSizeService
         uint dwCreationDisposition,
         uint dwFlagsAndAttributes,
         IntPtr hTemplateFile);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GetFileSizeEx(
-        SafeFileHandle hFile,
-        out long lpFileSize);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetOverlappedResult(
