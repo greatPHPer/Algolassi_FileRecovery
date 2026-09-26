@@ -103,6 +103,8 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         var previousTail = Array.Empty<byte>();
         long scannedBytes = 0;
         long lastReportedBytes = 0;
+        long unreadableBytes = 0;
+        var unreadableRegions = 0;
 
         progress?.Report(0);
 
@@ -170,6 +172,8 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     $"offset={physicalOffset:N0}, bytes={skippedBytes:N0}.");
 
                 scannedBytes = checked(scannedBytes + skippedBytes);
+                unreadableBytes = checked(unreadableBytes + skippedBytes);
+                unreadableRegions++;
                 previousTail = [];
 
                 if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
@@ -268,11 +272,16 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         System.Diagnostics.Debug.WriteLine(
             $"NTFS whole-volume target scan complete: " +
             $"candidate={candidate.FullPath}, scanned={scannedBytes:N0}, " +
-            $"volumeBytes={totalVolumeBytes:N0}, markerFound=false.");
+            $"volumeBytes={totalVolumeBytes:N0}, markerFound=false, " +
+            $"unreadableBytes={unreadableBytes:N0}, unreadableRegions={unreadableRegions}.");
+
+        var unreadableDiagnostic = unreadableBytes > 0
+            ? $" The scan had to skip {unreadableBytes:N0} byte(s) across {unreadableRegions:N0} unreadable region(s); the marker may reside inside one of those skipped regions."
+            : " No unreadable regions were skipped during the scan.";
 
         throw new InvalidOperationException(
             $"The supplied text marker was not found in the first " +
-            $"{scannedBytes:N0} byte(s) of the NTFS volume.");
+            $"{scannedBytes:N0} byte(s) of the NTFS volume.{unreadableDiagnostic}");
     }
 
     public (bool Found, long Offset, string? Encoding, long ScannedBytes) FindMarkerOnVolume(
