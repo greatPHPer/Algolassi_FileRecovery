@@ -2189,11 +2189,14 @@ public sealed class UsnJournalMonitor : IDisposable
                     continue;
                 }
 
+                // NTFS places its traditional 64-bit MFT file reference in
+                // the first 8 bytes of each FILE_ID_128. The remaining 8 bytes
+                // are the high half of the 128-bit identifier.
                 fileReference = BinaryPrimitives.ReadUInt64LittleEndian(
-                    recordSpan.Slice(16, 8));
+                    recordSpan.Slice(8, 8));
 
                 parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
-                    recordSpan.Slice(32, 8));
+                    recordSpan.Slice(24, 8));
 
                 timestampFileTime = BinaryPrimitives.ReadInt64LittleEndian(
                     recordSpan.Slice(48, 8));
