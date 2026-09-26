@@ -2146,8 +2146,12 @@ public partial class Form1 : Form
                         StringComparison.OrdinalIgnoreCase))
                 {
                     failures.Add(
-                        $"{candidate.Name}: no retained NTFS $DATA evidence was available and the original " +
-                        "text-file size is unknown. Provide a distinctive marker for forensic recovery.");
+                        candidate.FileSizeBytes > 0
+                            ? $"{candidate.Name}: no retained NTFS $DATA evidence was available for the known " +
+                              $"{candidate.FileSizeBytes:N0}-byte file; automatic free-space carving is disabled " +
+                              "for plain-text files because size alone cannot prove file identity."
+                            : $"{candidate.Name}: no retained NTFS $DATA evidence was available and the original " +
+                              "text-file size is unknown. Provide a distinctive marker for forensic recovery.");
                     continue;
                 }
 
