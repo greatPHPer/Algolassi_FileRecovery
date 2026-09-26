@@ -92,7 +92,7 @@ public sealed class MftCandidateScanner
             return [];
         }
 
-        var root = Path.GetPathRoot(rootPath);
+        var root = GetNtfsVolumeRoot(rootPath);
         if (string.IsNullOrWhiteSpace(root))
         {
             throw new ArgumentException("A valid Windows volume path is required.", nameof(rootPath));
@@ -1202,6 +1202,19 @@ public sealed class MftCandidateScanner
         public int OffsetLow;
         public int OffsetHigh;
         public IntPtr HEvent;
+    }
+
+    private static string? GetNtfsVolumeRoot(string path)
+    {
+        var normalized = path.Trim();
+
+        while (normalized.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+               normalized.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalized = normalized[4..];
+        }
+
+        return Path.GetPathRoot(normalized);
     }
 
     private static SafeFileHandle CreateVolumeHandle(
