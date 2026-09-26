@@ -920,6 +920,61 @@ public partial class Form1 : Form
                 $"NTFS live evidence candidates: added={liveEvidenceCandidateCount:N0}, " +
                 $"trustedSources={liveEvidenceSources.Count:N0}, totalCandidates={candidates.Count:N0}.");
 
+            // Prefer the exact persisted NTFS deletion snapshot when the
+            // candidate's historical file reference or path matches a deletion record.
+            // The snapshot was captured at delete time, before MFT sequence reuse.
+            foreach (var candidate in candidates)
+            {
+                var snapshotMatch = candidate.FileReferenceNumber != 0
+                    ? historyRecords
+                        .Where(record =>
+                            record.FileReferenceNumber.HasValue &&
+                            record.FileReferenceNumber.Value == candidate.FileReferenceNumber &&
+                            record.NtfsDataSnapshot is not null)
+                        .OrderBy(record =>
+                            Math.Abs(
+                                (record.DeletedAtUtc - candidate.LastUsnTimestampUtc)
+                                    .TotalMinutes))
+                        .FirstOrDefault()
+                    : null;
+
+                snapshotMatch ??= historyRecords
+                    .Where(record =>
+                        record.NtfsDataSnapshot is not null &&
+                        string.Equals(
+                            NormalizeForComparison(record.FullPath),
+                            NormalizeForComparison(candidate.FullPath),
+                            StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(record =>
+                        Math.Abs(
+                            (record.DeletedAtUtc - candidate.LastUsnTimestampUtc)
+                                .TotalMinutes))
+                    .FirstOrDefault();
+
+                if (snapshotMatch?.NtfsDataSnapshot is not null &&
+                    (candidate.LastUsnTimestampUtc == default ||
+                     Math.Abs(
+                         (snapshotMatch.DeletedAtUtc - candidate.LastUsnTimestampUtc)
+                             .TotalMinutes) <= 5))
+                {
+                    candidate.NtfsDataSnapshot = snapshotMatch.NtfsDataSnapshot.Clone();
+
+                    if (candidate.FileSizeBytes <= 0 &&
+                        candidate.NtfsDataSnapshot.FileSizeBytes >= 0)
+                    {
+                        candidate.FileSizeBytes =
+                            candidate.NtfsDataSnapshot.FileSizeBytes;
+                    }
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS candidate snapshot enrichment: path={candidate.FullPath}, " +
+                        $"fileRef={candidate.FileReferenceNumber}, " +
+                        $"captured={candidate.NtfsDataSnapshot.IsComplete}, " +
+                        $"size={candidate.NtfsDataSnapshot.FileSizeBytes:N0}, " +
+                        $"snapshotFile={candidate.NtfsDataSnapshot.DataFileName ?? "(none)"}.");
+                }
+            }
+
             // A metadata-only candidate may have a valid historical deletion
             // record with the original byte length even though its current MFT $DATA
             // stream is gone. Carry that size into the candidate so exact-size deep
@@ -1775,6 +1830,106 @@ public partial class Form1 : Form
         }
     }
 
+    private static bool TryRecoverFromNtfsSnapshot(
+        RecoveryCandidate candidate,
+        string destinationDirectory,
+        out RecoveryResult result)
+    {
+        result = new RecoveryResult();
+
+        var snapshot = candidate.NtfsDataSnapshot;
+        if (snapshot is null ||
+            !snapshot.IsComplete ||
+            string.IsNullOrWhiteSpace(snapshot.DataFileName))
+        {
+            return false;
+        }
+
+        var store = new NtfsDeletionSnapshotStore();
+
+        if (!store.TryLoad(snapshot.DataFileName, out var data))
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS deletion snapshot recovery: snapshot file is unavailable. " +
+                $"path={candidate.FullPath}, file={snapshot.DataFileName}.");
+            return false;
+        }
+
+        if (data.LongLength != snapshot.FileSizeBytes ||
+            data.LongLength != snapshot.CapturedByteCount)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS deletion snapshot recovery: size mismatch. " +
+                $"path={candidate.FullPath}, expected={snapshot.FileSizeBytes:N0}, " +
+                $"captured={snapshot.CapturedByteCount:N0}, actual={data.LongLength:N0}.");
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(snapshot.Sha256))
+        {
+            var actualHash = Convert.ToHexString(
+                System.Security.Cryptography.SHA256.HashData(data));
+
+            if (!string.Equals(
+                    actualHash,
+                    snapshot.Sha256,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS deletion snapshot recovery: hash mismatch. " +
+                    $"path={candidate.FullPath}, expected={snapshot.Sha256}, actual={actualHash}.");
+                return false;
+            }
+        }
+
+        RecoveryDestinationPolicy.Validate(
+            candidate.FullPath,
+            destinationDirectory);
+
+        var destinationPath =
+            RecoveryDestinationPolicy.CreateSafeFilePath(
+                destinationDirectory,
+                candidate.Name);
+
+        try
+        {
+            File.WriteAllBytes(destinationPath, data);
+        }
+        catch
+        {
+            try
+            {
+                if (File.Exists(destinationPath))
+                {
+                    File.Delete(destinationPath);
+                }
+            }
+            catch
+            {
+                // Preserve the original write failure.
+            }
+
+            throw;
+        }
+
+        result = new RecoveryResult
+        {
+            Success = true,
+            SourcePath = candidate.FullPath,
+            DestinationPath = destinationPath,
+            BytesRecovered = data.LongLength,
+            Evidence =
+                $"Recovered {data.LongLength:N0} byte(s) from an NTFS $DATA snapshot " +
+                "captured immediately when the deletion was observed by the USN monitor."
+        };
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS deletion snapshot recovery succeeded: path={candidate.FullPath}, " +
+            $"bytes={data.LongLength:N0}, destination={destinationPath}.");
+
+        return true;
+    }
+
     private async Task<(List<RecoveryResult> successes, List<string> failures)> recvr(
         IReadOnlyList<RecoveryCandidate> candidates,
         string? destinationDirectory)
@@ -1794,6 +1949,15 @@ public partial class Form1 : Form
         {
             try
             {
+                if (TryRecoverFromNtfsSnapshot(
+                        candidate,
+                        destinationDirectory,
+                        out var snapshotRecovery))
+                {
+                    successes.Add(snapshotRecovery);
+                    continue;
+                }
+
                 if (candidate.DataStreamFound)
                 {
                     successes.Add(_ntfsRecoveryService.Recover(
