@@ -1411,27 +1411,114 @@ public sealed class UsnJournalMonitor : IDisposable
             return false;
         }
 
-        // The live-deletion path must not start from the background monitor cursor:
-        // that cursor can be tens of minutes behind while it drains historical USN
-        // records. Search the newest USN/MFT window first.
-        const long recentUsnWindow = 10_000_000;
+        // FSCTL_ENUM_USN_DATA enumerates current MFT records. A file that has
+        // already been deleted may therefore be absent even though its deletion
+        // is present in the USN journal. For the live snapshot path, read the
+        // actual USN journal tail with FSCTL_READ_USN_JOURNAL instead.
+        const long recentUsnWindow = 1_000_000;
         var lowUsn = Math.Max(
-            journal.FirstUsn,
+            Math.Max(journal.FirstUsn, journal.LowestValidUsn),
             journal.NextUsn - recentUsnWindow);
 
-        System.Diagnostics.Debug.WriteLine(
-            $"NTFS live deletion snapshot: tail lookup start={lowUsn}, " +
-            $"high={journal.NextUsn}, target={NormalizePath(fullPath)}.");
+        var normalizedTarget = NormalizePath(fullPath);
 
-        return TryResolveRecentUsnEnumData(
-            volumeHandle,
-            volumeKey,
-            lowUsn,
-            journal.NextUsn,
-            NormalizePath(fullPath),
-            deletedAtUtc,
-            out fileReferenceNumber,
-            out parentFileReferenceNumber);
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS live deletion snapshot: journal tail start={lowUsn}, " +
+            $"high={journal.NextUsn}, target={normalizedTarget}.");
+
+        var nextUsn = lowUsn;
+        const int maxBatches = 64;
+
+        for (var batch = 0;
+             batch < maxBatches && nextUsn < journal.NextUsn;
+             batch++)
+        {
+            var records = ReadRecords(
+                volumeHandle,
+                journal.JournalId,
+                nextUsn,
+                out var returnedNextUsn);
+
+            if (returnedNextUsn <= nextUsn)
+            {
+                break;
+            }
+
+            foreach (var record in records)
+            {
+                if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                    (record.FileAttributes & FileAttributeDirectory) != 0 ||
+                    !string.Equals(
+                        record.FileName,
+                        Path.GetFileName(normalizedTarget),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var timestampDeltaMinutes = deletedAtUtc == default
+                    ? 0
+                    : Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes);
+
+                if (deletedAtUtc != default &&
+                    timestampDeltaMinutes > 5)
+                {
+                    continue;
+                }
+
+                var directory = ResolveParentDirectory(
+                    volumeHandle,
+                    record.ParentFileReferenceNumber);
+
+                if (string.IsNullOrWhiteSpace(directory))
+                {
+                    continue;
+                }
+
+                var candidatePath = NormalizePath(
+                    Path.Combine(directory, record.FileName));
+
+                if (!string.Equals(
+                        candidatePath,
+                        normalizedTarget,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                fileReferenceNumber = record.FileReferenceNumber;
+                parentFileReferenceNumber = record.ParentFileReferenceNumber;
+
+                _recentDeletedRecords.Enqueue(
+                    new RecentDeletedRecord(
+                        fileReferenceNumber,
+                        parentFileReferenceNumber,
+                        record.FileName,
+                        directory,
+                        record.TimestampUtc));
+
+                while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+                       _recentDeletedRecords.TryDequeue(out _))
+                {
+                }
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS live deletion snapshot: matched USN tail record " +
+                    $"path={candidatePath}, fileRef={fileReferenceNumber}, " +
+                    $"parentRef={parentFileReferenceNumber}, usnTime={record.TimestampUtc:O}, " +
+                    $"deltaMinutes={timestampDeltaMinutes:0.###}.");
+
+                return true;
+            }
+
+            nextUsn = returnedNextUsn;
+        }
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS live deletion snapshot: journal tail search found no matching delete " +
+            $"for path={normalizedTarget}, start={lowUsn}, high={journal.NextUsn}.");
+
+        return false;
     }
 
     public bool TryResolveRecentDeletedFileBounded(
