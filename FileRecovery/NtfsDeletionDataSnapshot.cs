@@ -9,7 +9,7 @@ public sealed class NtfsDeletionDataSnapshot
     public long CapturedByteCount { get; init; }
     public string? DataFileName { get; set; }
     public string Sha256 { get; init; } = string.Empty;
-    public IReadOnlyList<NtfsDataExtent> DataExtents { get; init; } = [];
+    public List<NtfsDataExtent> DataExtents { get; init; } = [];
     public DateTime CapturedAtUtc { get; init; }
     public string Evidence { get; init; } = string.Empty;
 
