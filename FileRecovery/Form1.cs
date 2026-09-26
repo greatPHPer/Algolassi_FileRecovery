@@ -1599,6 +1599,27 @@ public partial class Form1 : Form
 
                             if (match is not null)
                             {
+                                // The delete-time snapshot is the strongest source
+                                // for a freshly deleted file. Attach it to the candidate
+                                // so recovery uses the bytes captured before later NTFS
+                                // cluster reuse can change the raw data.
+                                if (record.NtfsDataSnapshot?.IsComplete == true)
+                                {
+                                    match.NtfsDataSnapshot =
+                                        record.NtfsDataSnapshot.Clone();
+
+                                    if (match.FileSizeBytes <= 0)
+                                    {
+                                        match.FileSizeBytes =
+                                            match.NtfsDataSnapshot.FileSizeBytes;
+                                    }
+
+                                    System.Diagnostics.Debug.WriteLine(
+                                        $"NTFS recovery candidate: attached complete delete-time snapshot " +
+                                        $"path={record.FullPath}, fileRef={record.FileReferenceNumber}, " +
+                                        $"bytes={match.NtfsDataSnapshot.CapturedByteCount:N0}.");
+                                }
+
                                 ntfsCandidates.Add(match);
                             }
                             else
@@ -1657,6 +1678,25 @@ public partial class Form1 : Form
 
                             if (match is not null)
                             {
+                                // Legacy candidates can also benefit from a
+                                // persisted delete-time snapshot when the selected
+                                // history record already has one.
+                                if (record.NtfsDataSnapshot?.IsComplete == true)
+                                {
+                                    match.NtfsDataSnapshot =
+                                        record.NtfsDataSnapshot.Clone();
+
+                                    if (match.FileSizeBytes <= 0)
+                                    {
+                                        match.FileSizeBytes =
+                                            match.NtfsDataSnapshot.FileSizeBytes;
+                                    }
+
+                                    System.Diagnostics.Debug.WriteLine(
+                                        $"NTFS legacy candidate: attached complete delete-time snapshot " +
+                                        $"path={record.FullPath}, bytes={match.NtfsDataSnapshot.CapturedByteCount:N0}.");
+                                }
+
                                 ntfsCandidates.Add(match);
                             }
                             else
