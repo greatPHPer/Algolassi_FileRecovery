@@ -107,6 +107,18 @@ public sealed class DeletionHistoryStore
                         record.ParentFileReferenceNumber = existing.ParentFileReferenceNumber;
                     }
 
+                    if (!record.FileSizeBytes.HasValue &&
+                        existing.FileSizeBytes.HasValue)
+                    {
+                        record.FileSizeBytes = existing.FileSizeBytes;
+                    }
+
+                    if (record.NtfsDataSnapshot is null &&
+                        existing.NtfsDataSnapshot is not null)
+                    {
+                        record.NtfsDataSnapshot = existing.NtfsDataSnapshot.Clone();
+                    }
+
                     _records[index] = record;
                 }
                 else
