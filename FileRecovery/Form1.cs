@@ -1498,65 +1498,7 @@ public partial class Form1 : Form
                     true,
                     "Checking the Windows Recycle Bin for the selected deleted file...");
 
-                var recycleResolutionTask = RunInStaAsync(() =>
-                {
-                    var availableItems = _recycleBinService.Scan();
-                    var matches = new Dictionary<Guid, RecoveryItem>();
-
-                    foreach (var record in historyRecords)
-                    {
-                        var expectedFullPath = NormalizePath(record.FullPath);
-
-                        // Multiple Recycle Bin entries can have the exact same
-                        // filename and original folder. Pick the entry whose Shell
-                        // deletion time is closest to the selected history record.
-                        var match = FindBestRecycleBinMatch(
-                            availableItems,
-                            expectedFullPath,
-                            record.DeletedAtUtc);
-
-                        if (match is null)
-                        {
-                            // Fallback only when Shell does not expose the original
-                            // location. Require the exact displayed deletion timestamp
-                            // so duplicate same-name entries are not silently mixed.
-                            match = availableItems.FirstOrDefault(item =>
-                                string.Equals(
-                                    item.Name,
-                                    record.FileName,
-                                    StringComparison.OrdinalIgnoreCase) &&
-                                string.Equals(
-                                    item.DeletedDate,
-                                    record.DeletedAtUtc.ToLocalTime().ToString("g"),
-                                    StringComparison.OrdinalIgnoreCase));
-                        }
-
-                        if (match is not null)
-                        {
-                            matches[record.Id] = match;
-                        }
-                    }
-
-                    return matches;
-                });
-
-                // Shell automation must never hold Recover Selected indefinitely.
-                // Keep the timeout decision off the WinForms synchronization context.
-                var recycleOutcome = await ResolveRecycleBinMatchesWithTimeoutAsync(
-                    recycleResolutionTask);
-
-                recycleResolution = recycleOutcome.Matches;
-
-                if (recycleOutcome.TimedOut)
-                {
-                    lblStatus.Text =
-                        "Recycle Bin lookup timed out after 60 seconds; continuing with NTFS recovery.";
-                }
-                else if (recycleOutcome.Error is not null)
-                {
-                    lblStatus.Text =
-                        $"Recycle Bin lookup failed ({recycleOutcome.Error.GetType().Name}); continuing with NTFS recovery.";
-                }
+                recycleResolution = ResolveRecycleBinMatches(historyRecords);
 
                 missingRecords = historyRecords
                     .Where(record => !recycleResolution.ContainsKey(record.Id))
@@ -1813,38 +1755,47 @@ public partial class Form1 : Form
         }
     }
     
-    private static async Task<(
-        Dictionary<Guid, RecoveryItem> Matches,
-        bool TimedOut,
-        Exception? Error)> ResolveRecycleBinMatchesWithTimeoutAsync(
-            Task<Dictionary<Guid, RecoveryItem>> recycleResolutionTask)
+    private Dictionary<Guid, RecoveryItem> ResolveRecycleBinMatches(
+        IReadOnlyList<DeletionRecord> historyRecords)
     {
-        // Shell automation can legitimately take longer when the Recycle Bin
-        // contains many entries. Keep a bounded safety timeout, but do not fail
-        // normal mouse-delete recovery after only 15 seconds.
-        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(60));
+        var availableItems = _recycleBinService.Scan();
+        var matches = new Dictionary<Guid, RecoveryItem>();
 
-        var completed = await Task.WhenAny(
-                recycleResolutionTask,
-                timeoutTask)
-            .ConfigureAwait(false);
-
-        if (completed != recycleResolutionTask)
+        foreach (var record in historyRecords)
         {
-            return ([], true, null);
+            var expectedFullPath = NormalizePath(record.FullPath);
+
+            // Multiple Recycle Bin entries can have the exact same
+            // filename and original folder. Pick the entry whose Shell
+            // deletion time is closest to the selected history record.
+            var match = FindBestRecycleBinMatch(
+                availableItems,
+                expectedFullPath,
+                record.DeletedAtUtc);
+
+            if (match is null)
+            {
+                // Fallback only when Shell does not expose the original
+                // location. Require the exact displayed deletion timestamp
+                // so duplicate same-name entries are not silently mixed.
+                match = availableItems.FirstOrDefault(item =>
+                    string.Equals(
+                        item.Name,
+                        record.FileName,
+                        StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(
+                        item.DeletedDate,
+                        record.DeletedAtUtc.ToLocalTime().ToString("g"),
+                        StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (match is not null)
+            {
+                matches[record.Id] = match;
+            }
         }
 
-        try
-        {
-            return (await recycleResolutionTask.ConfigureAwait(false), false, null);
-        }
-        catch (Exception ex)
-        {
-            // A failed or unavailable Shell lookup must not block Shift+Delete
-            // recovery. Continue with the NTFS path instead, but expose the
-            // failure stage to the Recovery Center status text.
-            return ([], false, ex);
-        }
+        return matches;
     }
 
     private static RecoveryItem? FindBestRecycleBinMatch(
