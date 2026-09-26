@@ -1355,35 +1355,19 @@ public sealed class NtfsMftDataReader
             sequenceNumber,
             expectedBaseFileReference: fileReferenceNumber);
 
-        if (record is null &&
-            !string.IsNullOrWhiteSpace(expectedFileName) &&
-            expectedParentFileReferenceNumber.HasValue)
+        if (record is null)
         {
-            // A very recent deletion can race the MFT sequence bookkeeping.
-            // The USN record already supplied the exact segment; retry that segment
-            // without strict sequence/base checks, but only accept it when the
-            // retained $FILE_NAME still identifies the expected parent/name.
-            var relaxedRecord = ReadMftRecordByExtentMap(
-                rawMftVolumeHandle,
-                volumeInfo,
-                segmentNumber,
-                expectedSequenceNumber: 0,
-                expectedBaseFileReference: 0);
-
-            if (relaxedRecord is not null &&
-                HasMatchingFileNameEntry(
-                    rawMftVolumeHandle,
-                    relaxedRecord,
-                    expectedFileName,
-                    expectedParentFileReferenceNumber.Value,
-                    expectedFullPath,
-                    expectedSequenceNumber: sequenceNumber))
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $DATA lookup: accepted raw MFT record for " +
-                    $"fileRef={fileReferenceNumber}, segment={segmentNumber}.");
-                record = relaxedRecord;
-            }
+            // The USN file reference contains both the MFT segment and sequence
+            // number for the deletion that was observed. If the current MFT
+            // record has a different sequence number, it represents a different
+            // generation of that MFT segment and must not be used for the delete
+            // snapshot. Reusing a same-name record here can capture unrelated
+            // $DATA clusters and produce a full-size but corrupted/zero-filled
+            // snapshot.
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $DATA lookup: exact MFT record validation failed; " +
+                $"refusing relaxed sequence fallback for fileRef={fileReferenceNumber}, " +
+                $"segment={segmentNumber}, expectedSequence={sequenceNumber}.");
         }
 
         if (record is null)
