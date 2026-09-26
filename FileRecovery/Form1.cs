@@ -1968,9 +1968,6 @@ public partial class Form1 : Form
                                     $"path={candidate.FullPath}, fileRef={candidate.FileReferenceNumber}, " +
                                     $"size={historicalLogFileSize:N0} bytes, " +
                                     $"evidence={logFileEvidence}");
-
-                                System.Diagnostics.Debug.WriteLine(
-                                    $"NTFS candidate size enrichment: $LogFile evidence: {logFileEvidence}");
                             }
                             else
                             {
