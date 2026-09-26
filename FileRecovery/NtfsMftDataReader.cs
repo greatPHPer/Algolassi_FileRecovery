@@ -1067,6 +1067,68 @@ public sealed class NtfsMftDataReader
             record);
     }
 
+    public bool TryReadDataStreamForDeletedReference(
+        string rootPath,
+        ulong fileReferenceNumber,
+        ulong expectedParentFileReferenceNumber,
+        string expectedFileName,
+        string? expectedFullPath,
+        out NtfsDataStreamInfo stream)
+    {
+        stream = NotFound("The deleted file's NTFS $DATA stream could not be read.");
+
+        if (string.IsNullOrWhiteSpace(rootPath) ||
+            fileReferenceNumber == 0 ||
+            expectedParentFileReferenceNumber == 0 ||
+            string.IsNullOrWhiteSpace(expectedFileName))
+        {
+            return false;
+        }
+
+        var root = GetNtfsVolumeRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return false;
+        }
+
+        try
+        {
+            WindowsPrivilege.EnableSeBackupPrivilege();
+
+            var volumeInfo = new NtfsVolumeInspector().Inspect(root);
+            using var volumeHandle = CreateVolumeHandle(
+                volumeInfo.RootPath,
+                overlapped: false);
+
+            stream = ReadDefaultDataStream(
+                volumeInfo,
+                volumeHandle,
+                fileReferenceNumber,
+                expectedFileName,
+                expectedParentFileReferenceNumber,
+                expectedFullPath);
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS recovery-time $DATA lookup: fileRef={fileReferenceNumber}, " +
+                $"path={expectedFullPath}, found={stream.Found}, resident={stream.IsResident}, " +
+                $"size={stream.FileSizeBytes:N0}, extents={stream.Extents.Count:N0}, " +
+                $"evidence={stream.Evidence}");
+
+            return stream.Found;
+        }
+        catch (Exception ex)
+        {
+            stream = NotFound(
+                $"Recovery-time NTFS $DATA lookup failed: {ex.Message}");
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS recovery-time $DATA lookup failed: " +
+                $"{ex.GetType().Name}: {ex.Message}");
+
+            return false;
+        }
+    }
+
     public NtfsDataStreamInfo ReadDefaultDataStream(
         NtfsVolumeInfo volumeInfo,
         SafeFileHandle volumeHandle,
