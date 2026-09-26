@@ -1812,14 +1812,17 @@ public partial class Form1 : Form
                     candidate.ParentFileReferenceNumber != 0)
                 {
                     var directMftReader = new NtfsMftDataReader();
+                    var directDataStream = new NtfsDataStreamInfo();
 
-                    if (directMftReader.TryReadDataStreamForDeletedReference(
+                    var directDataFound = directMftReader.TryReadDataStreamForDeletedReference(
                         candidate.FullPath,
                         candidate.FileReferenceNumber,
                         candidate.ParentFileReferenceNumber,
                         candidate.Name,
                         candidate.FullPath,
-                        out var directDataStream) &&
+                        out directDataStream);
+
+                    if (directDataFound &&
                         directDataStream.Found)
                     {
                         if (candidate.FileSizeBytes > 0 &&
@@ -1859,6 +1862,16 @@ public partial class Form1 : Form
                                 destinationDirectory));
                             continue;
                         }
+                    }
+
+                    if (!directDataFound)
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"NTFS recovery-time $DATA unavailable: " +
+                            $"path={candidate.FullPath}, fileRef={candidate.FileReferenceNumber}, " +
+                            $"parentRef={candidate.ParentFileReferenceNumber}, " +
+                            $"candidateSize={candidate.FileSizeBytes:N0}, " +
+                            $"reason={directDataStream.Evidence}");
                     }
                 }
 
@@ -2051,9 +2064,10 @@ public partial class Form1 : Form
                 // live/deleted text such as an old source-file copy.
                 // Require a distinctive user-supplied marker before whole-volume text
                 // recovery is attempted.
-                if (Path.GetExtension(candidate.Name).Equals(
-                    ".txt",
-                    StringComparison.OrdinalIgnoreCase))
+                if (candidate.FileSizeBytes <= 0 &&
+                    Path.GetExtension(candidate.Name).Equals(
+                        ".txt",
+                        StringComparison.OrdinalIgnoreCase))
                 {
                     var markerKey = NormalizePath(candidate.FullPath);
                     string? forensicMarker = null;
@@ -2132,9 +2146,8 @@ public partial class Form1 : Form
                         StringComparison.OrdinalIgnoreCase))
                 {
                     failures.Add(
-                        $"{candidate.Name}: automatic free-space carving is disabled for plain-text files " +
-                        "because a known size alone cannot prove file identity. Provide a distinctive " +
-                        "marker or recover the file through retained NTFS $DATA evidence.");
+                        $"{candidate.Name}: no retained NTFS $DATA evidence was available and the original " +
+                        "text-file size is unknown. Provide a distinctive marker for forensic recovery.");
                     continue;
                 }
 
