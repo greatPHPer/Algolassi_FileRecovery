@@ -22,8 +22,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         _history = new DeletionHistoryStore();
         _settings = RecoverySettings.Load();
-        _monitor = new DeletionMonitor();
         _usnMonitor = new UsnJournalMonitor(_settings);
+        _monitor = new DeletionMonitor(_usnMonitor);
         _recycleBinMonitor = new RecycleBinMonitor();
 
         _notificationsMenuItem = new ToolStripMenuItem("Notifications")
