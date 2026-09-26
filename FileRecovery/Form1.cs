@@ -1985,14 +1985,15 @@ public partial class Form1 : Form
                     }
                 }
 
-                // For an unknown-size .txt candidate, offer a marker-driven
-                // whole-volume forensic scan before the broad free-space heuristic.
-                // The marker is deliberately required so allocated live-file bytes are
-                // never accepted merely because they happen to look printable.
-                if (candidate.FileSizeBytes <= 0 &&
-                    Path.GetExtension(candidate.Name).Equals(
-                        ".txt",
-                        StringComparison.OrdinalIgnoreCase))
+                // Plain text has no intrinsic file boundary, so it must never be
+                // automatically accepted from arbitrary free clusters merely because the
+                // candidate size is known. A known size alone can still match unrelated
+                // live/deleted text such as an old source-file copy.
+                // Require a distinctive user-supplied marker before whole-volume text
+                // recovery is attempted.
+                if (Path.GetExtension(candidate.Name).Equals(
+                    ".txt",
+                    StringComparison.OrdinalIgnoreCase))
                 {
                     var markerKey = NormalizePath(candidate.FullPath);
                     string? forensicMarker = null;
@@ -2064,20 +2065,16 @@ public partial class Form1 : Form
                     }
                 }
 
-                // Structural carving is safe for formats with intrinsic boundaries.
-                // Plain text is different: without the original size or a user-supplied
-                // marker, there is no reliable end boundary and automatically accepting the
-                // first printable region can return unrelated data.
+                // Plain-text recovery is handled only by the marker-driven path above.
+                // Never fall through to generic free-space carving for .txt candidates.
                 if (Path.GetExtension(candidate.Name).Equals(
                         ".txt",
-                        StringComparison.OrdinalIgnoreCase) &&
-                    candidate.FileSizeBytes <= 0)
+                        StringComparison.OrdinalIgnoreCase))
                 {
                     failures.Add(
-                        $"{candidate.Name}: the original text-file size could not be established. " +
-                        "Without a marker, automatic full free-space carving cannot safely " +
-                        "identify the deleted text. Provide a distinctive marker or restore " +
-                        "the known original size evidence before retrying.");
+                        $"{candidate.Name}: automatic free-space carving is disabled for plain-text files " +
+                        "because a known size alone cannot prove file identity. Provide a distinctive " +
+                        "marker or recover the file through retained NTFS $DATA evidence.");
                     continue;
                 }
 
