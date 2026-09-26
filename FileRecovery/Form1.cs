@@ -1397,11 +1397,10 @@ public partial class Form1 : Form
                 .Select(record => (record.FullPath, record.DeletedAtUtc))
                 .ToList();
 
-            var historicalMatches = await Task.Run(
-                    () => _usnMonitor.ResolveHistoricalDeletionsFromJournal(
-                        targets,
-                        CancellationToken.None))
-                .ConfigureAwait(true);
+            var historicalMatches =
+                _usnMonitor.ResolveHistoricalDeletionsFromJournal(
+                    targets,
+                    CancellationToken.None);
 
             var matchesByPath = historicalMatches
                 .GroupBy(
