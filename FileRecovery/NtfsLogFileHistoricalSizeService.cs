@@ -123,7 +123,7 @@ public sealed class NtfsLogFileHistoricalSizeService
                 $"extents={logStream.Extents.Count:N0}, " +
                 $"target={expectedFileName}.");
 
-            foreach (var extent in logStream.DataExtents.OrderBy(
+            foreach (var extent in logStream.Extents.OrderBy(
                          x => x.VirtualClusterNumber))
             {
                 if (extent.VirtualClusterNumber != expectedVcn)
