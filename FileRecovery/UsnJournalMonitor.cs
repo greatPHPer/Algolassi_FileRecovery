@@ -1422,10 +1422,13 @@ public sealed class UsnJournalMonitor : IDisposable
             journal.NextUsn - recentUsnWindow);
 
         var normalizedTarget = NormalizePath(fullPath);
+        var targetFileName = Path.GetFileName(normalizedTarget);
 
         System.Diagnostics.Debug.WriteLine(
             $"NTFS live deletion snapshot: journal tail start={lowUsn}, " +
             $"high={journal.NextUsn}, target={normalizedTarget}.");
+
+        var fallbackMatches = new List<(UsnRecord Record, string? Directory, double DeltaMinutes, bool IsFileDelete)>();
 
         var nextUsn = lowUsn;
         const int maxBatches = 64;
@@ -1457,7 +1460,7 @@ public sealed class UsnJournalMonitor : IDisposable
                     (record.FileAttributes & FileAttributeDirectory) != 0 ||
                     !string.Equals(
                         record.FileName,
-                        Path.GetFileName(normalizedTarget),
+                        targetFileName,
                         StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
@@ -1477,55 +1480,107 @@ public sealed class UsnJournalMonitor : IDisposable
                     volumeHandle,
                     record.ParentFileReferenceNumber);
 
-                if (string.IsNullOrWhiteSpace(directory))
+                if (!string.IsNullOrWhiteSpace(directory))
                 {
-                    continue;
+                    var candidatePath = NormalizePath(
+                        Path.Combine(directory, record.FileName));
+
+                    if (!string.Equals(
+                            candidatePath,
+                            normalizedTarget,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    fileReferenceNumber = record.FileReferenceNumber;
+                    parentFileReferenceNumber = record.ParentFileReferenceNumber;
+
+                    _recentDeletedRecords.Enqueue(
+                        new RecentDeletedRecord(
+                            fileReferenceNumber,
+                            parentFileReferenceNumber,
+                            record.FileName,
+                            directory,
+                            record.TimestampUtc));
+
+                    while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+                           _recentDeletedRecords.TryDequeue(out _))
+                    {
+                    }
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS live deletion snapshot: matched USN tail record " +
+                        $"path={candidatePath}, fileRef={fileReferenceNumber}, " +
+                        $"parentRef={parentFileReferenceNumber}, " +
+                        $"reason=0x{record.Reason:X8}, " +
+                        $"source={(isFileDelete ? "FileDelete" : "RenameOldName")}, " +
+                        $"usnTime={record.TimestampUtc:O}, " +
+                        $"deltaMinutes={timestampDeltaMinutes:0.###}.");
+
+                    return true;
                 }
 
-                var candidatePath = NormalizePath(
-                    Path.Combine(directory, record.FileName));
-
-                if (!string.Equals(
-                        candidatePath,
-                        normalizedTarget,
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                fileReferenceNumber = record.FileReferenceNumber;
-                parentFileReferenceNumber = record.ParentFileReferenceNumber;
-
-                _recentDeletedRecords.Enqueue(
-                    new RecentDeletedRecord(
-                        fileReferenceNumber,
-                        parentFileReferenceNumber,
-                        record.FileName,
-                        directory,
-                        record.TimestampUtc));
-
-                while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
-                       _recentDeletedRecords.TryDequeue(out _))
-                {
-                }
+                // When the parent MFT record cannot be opened, retain a
+                // filename/timestamp candidate. This is particularly important
+                // for the RENAME_OLD_NAME record generated when Explorer moves
+                // a file into the Recycle Bin. Do not accept it immediately:
+                // only a single unambiguous candidate may be used as fallback.
+                fallbackMatches.Add(
+                    (record, null, timestampDeltaMinutes, isFileDelete));
 
                 System.Diagnostics.Debug.WriteLine(
-                    $"NTFS live deletion snapshot: matched USN tail record " +
-                    $"path={candidatePath}, fileRef={fileReferenceNumber}, " +
-                    $"parentRef={parentFileReferenceNumber}, " +
+                    $"NTFS live deletion snapshot: parent path unavailable for " +
+                    $"same-name USN candidate, fileRef={record.FileReferenceNumber}, " +
+                    $"parentRef={record.ParentFileReferenceNumber}, " +
                     $"reason=0x{record.Reason:X8}, " +
                     $"source={(isFileDelete ? "FileDelete" : "RenameOldName")}, " +
                     $"usnTime={record.TimestampUtc:O}, " +
                     $"deltaMinutes={timestampDeltaMinutes:0.###}.");
-
-                return true;
             }
 
             nextUsn = returnedNextUsn;
         }
 
+        if (fallbackMatches.Count == 1)
+        {
+            var match = fallbackMatches[0].Record;
+            fileReferenceNumber = match.FileReferenceNumber;
+            parentFileReferenceNumber = match.ParentFileReferenceNumber;
+
+            _recentDeletedRecords.Enqueue(
+                new RecentDeletedRecord(
+                    fileReferenceNumber,
+                    parentFileReferenceNumber,
+                    match.FileName,
+                    null,
+                    match.TimestampUtc));
+
+            while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+                   _recentDeletedRecords.TryDequeue(out _))
+            {
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: accepted unique same-name USN fallback " +
+                $"fileRef={fileReferenceNumber}, parentRef={parentFileReferenceNumber}, " +
+                $"reason=0x{match.Reason:X8}, " +
+                $"source={(fallbackMatches[0].IsFileDelete ? "FileDelete" : "RenameOldName")}, " +
+                $"usnTime={match.TimestampUtc:O}, " +
+                $"deltaMinutes={fallbackMatches[0].DeltaMinutes:0.###}.");
+
+            return true;
+        }
+
+        if (fallbackMatches.Count > 1)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: rejected ambiguous same-name USN fallback " +
+                $"candidates={fallbackMatches.Count}, target={normalizedTarget}.");
+        }
+
         System.Diagnostics.Debug.WriteLine(
-            $"NTFS live deletion snapshot: journal tail search found no matching delete " +
+            $"NTFS live deletion snapshot: journal tail search found no uniquely matching delete " +
             $"for path={normalizedTarget}, start={lowUsn}, high={journal.NextUsn}.");
 
         return false;
