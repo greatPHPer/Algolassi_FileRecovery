@@ -1720,124 +1720,160 @@ public sealed class NtfsMftDataReader
 
             if (attribute.FormCode == NonResidentForm)
             {
-                if (attribute.Length < 64)
-                {
-                    throw new InvalidDataException("The nonresident $ATTRIBUTE_LIST attribute is incomplete.");
-                }
-
-                var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(
-                    record.AsSpan(attribute.Offset + 16, 8));
-                var mappingPairsOffset = BinaryPrimitives.ReadUInt16LittleEndian(
-                    record.AsSpan(attribute.Offset + 32, 2));
-                var fileSize = BinaryPrimitives.ReadInt64LittleEndian(
-                    record.AsSpan(attribute.Offset + 48, 8));
-                var validDataLength = BinaryPrimitives.ReadInt64LittleEndian(
-                    record.AsSpan(attribute.Offset + 56, 8));
-
-                if (lowestVcn != 0 ||
-                    mappingPairsOffset >= attribute.Length ||
-                    fileSize <= 0 ||
-                    fileSize > MaxAttributeListBytes ||
-                    validDataLength <= 0 ||
-                    validDataLength > fileSize)
-                {
-                    throw new InvalidDataException(
-                        "The nonresident $ATTRIBUTE_LIST geometry is outside the supported safe range.");
-                }
-
-                IReadOnlyList<NtfsDataExtent> extents;
                 try
                 {
-                    extents = NtfsMappingPairsParser.Parse(
-                        record.AsSpan(
-                            attribute.Offset + mappingPairsOffset,
-                            attribute.Length - mappingPairsOffset),
-                        lowestVcn);
+                    if (attribute.Length < 64)
+                    {
+                        throw new InvalidDataException(
+                            "The nonresident $ATTRIBUTE_LIST attribute is incomplete.");
+                    }
+
+                    var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(
+                        record.AsSpan(attribute.Offset + 16, 8));
+                    var mappingPairsOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                        record.AsSpan(attribute.Offset + 32, 2));
+                    var fileSize = BinaryPrimitives.ReadInt64LittleEndian(
+                        record.AsSpan(attribute.Offset + 48, 8));
+                    var validDataLength = BinaryPrimitives.ReadInt64LittleEndian(
+                        record.AsSpan(attribute.Offset + 56, 8));
+
+                    if (lowestVcn != 0 ||
+                        mappingPairsOffset >= attribute.Length ||
+                        fileSize <= 0 ||
+                        fileSize > MaxAttributeListBytes ||
+                        validDataLength <= 0 ||
+                        validDataLength > fileSize)
+                    {
+                        throw new InvalidDataException(
+                            "The nonresident $ATTRIBUTE_LIST geometry is outside the supported safe range.");
+                    }
+
+                    IReadOnlyList<NtfsDataExtent> extents;
+                    try
+                    {
+                        extents = NtfsMappingPairsParser.Parse(
+                            record.AsSpan(
+                                attribute.Offset + mappingPairsOffset,
+                                attribute.Length - mappingPairsOffset),
+                            lowestVcn);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new InvalidDataException(
+                            "The nonresident $ATTRIBUTE_LIST mapping pairs could not be parsed.",
+                            ex);
+                    }
+
+                    var data = new byte[checked((int)validDataLength)];
+                    var expectedVcn = 0L;
+                    var remaining = data.LongLength;
+                    var destinationOffset = 0;
+
+                    foreach (var extent in extents)
+                    {
+                        if (extent.VirtualClusterNumber != expectedVcn)
+                        {
+                            throw new InvalidDataException(
+                                "The nonresident $ATTRIBUTE_LIST contains a VCN gap or overlap.");
+                        }
+
+                        var extentBytes = checked(
+                            extent.ClusterCount * volumeInfo.BytesPerCluster);
+                        var bytesToRead = Math.Min(extentBytes, remaining);
+
+                        if (bytesToRead <= 0)
+                        {
+                            break;
+                        }
+
+                        if (!extent.IsSparse)
+                        {
+                            ReadRawClusters(
+                                volumeHandle,
+                                extent.LogicalClusterNumber,
+                                bytesToRead,
+                                volumeInfo.BytesPerCluster,
+                                data,
+                                destinationOffset);
+                        }
+
+                        destinationOffset = checked(
+                            destinationOffset + (int)bytesToRead);
+                        remaining -= bytesToRead;
+                        expectedVcn = checked(
+                            expectedVcn + extent.ClusterCount);
+
+                        if (remaining == 0)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (remaining != 0)
+                    {
+                        throw new InvalidDataException(
+                            "The nonresident $ATTRIBUTE_LIST data runs do not cover its valid data length.");
+                    }
+
+                    return new AttributeListDescriptor
+                    {
+                        Found = true,
+                        IsResident = false,
+                        ResidentData = data
+                    };
                 }
                 catch (Exception ex)
                 {
-                    throw new InvalidDataException(
-                        "The nonresident $ATTRIBUTE_LIST mapping pairs could not be parsed.",
-                        ex);
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS $ATTRIBUTE_LIST read skipped: {ex.GetType().Name}: {ex.Message}");
+
+                    return new AttributeListDescriptor
+                    {
+                        Found = true,
+                        IsResident = false,
+                        ResidentData = null
+                    };
                 }
+            }
 
-                var data = new byte[checked((int)validDataLength)];
-                var expectedVcn = 0L;
-                var remaining = data.LongLength;
-                var destinationOffset = 0;
+            try
+            {
+                var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(attribute.Offset + 16, 4));
+                var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(attribute.Offset + 20, 2));
 
-                foreach (var extent in extents)
-                {
-                    if (extent.VirtualClusterNumber != expectedVcn)
-                    {
-                        throw new InvalidDataException(
-                            "The nonresident $ATTRIBUTE_LIST contains a VCN gap or overlap.");
-                    }
-
-                    var extentBytes = checked(extent.ClusterCount * volumeInfo.BytesPerCluster);
-                    var bytesToRead = Math.Min(extentBytes, remaining);
-
-                    if (bytesToRead <= 0)
-                    {
-                        break;
-                    }
-
-                    if (!extent.IsSparse)
-                    {
-                        ReadRawClusters(
-                            volumeHandle,
-                            extent.LogicalClusterNumber,
-                            bytesToRead,
-                            volumeInfo.BytesPerCluster,
-                            data,
-                            destinationOffset);
-                    }
-
-                    destinationOffset = checked(destinationOffset + (int)bytesToRead);
-                    remaining -= bytesToRead;
-                    expectedVcn = checked(expectedVcn + extent.ClusterCount);
-
-                    if (remaining == 0)
-                    {
-                        break;
-                    }
-                }
-
-                if (remaining != 0)
+                if (valueOffset + valueLength > attribute.Length)
                 {
                     throw new InvalidDataException(
-                        "The nonresident $ATTRIBUTE_LIST data runs do not cover its valid data length.");
+                        "The resident $ATTRIBUTE_LIST value is outside its attribute record.");
                 }
+
+                var residentData = new byte[checked((int)valueLength)];
+                record.AsSpan(
+                    attribute.Offset + valueOffset,
+                    checked((int)valueLength)).CopyTo(residentData);
 
                 return new AttributeListDescriptor
                 {
                     Found = true,
-                    IsResident = false,
-                    ResidentData = data
+                    IsResident = true,
+                    ResidentData = residentData
                 };
             }
-
-            var valueLength = BinaryPrimitives.ReadUInt32LittleEndian(
-                record.AsSpan(attribute.Offset + 16, 4));
-            var valueOffset = BinaryPrimitives.ReadUInt16LittleEndian(
-                record.AsSpan(attribute.Offset + 20, 2));
-
-            if (valueOffset + valueLength > attribute.Length)
+            catch (Exception ex)
             {
-                throw new InvalidDataException("The resident $ATTRIBUTE_LIST value is outside its attribute record.");
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS resident $ATTRIBUTE_LIST read skipped: " +
+                    $"{ex.GetType().Name}: {ex.Message}");
+
+                return new AttributeListDescriptor
+                {
+                    Found = true,
+                    IsResident = true,
+                    ResidentData = null
+                };
             }
-
-            var residentData = new byte[checked((int)valueLength)];
-            record.AsSpan(
-                attribute.Offset + valueOffset,
-                checked((int)valueLength)).CopyTo(residentData);
-
-            return new AttributeListDescriptor
-            {
-                Found = true,
-                IsResident = true,
-                ResidentData = residentData
-            };
         }
 
         return new AttributeListDescriptor();
@@ -2092,7 +2128,7 @@ public sealed class NtfsMftDataReader
             {
                 throw new Win32Exception(
                     Marshal.GetLastWin32Error(),
-                    "Could not seek to a nonresident $ATTRIBUTE_LIST data extent.");
+                    "Could not seek to a nonresident NTFS data extent.");
             }
 
             if (!ReadFile(
@@ -2105,7 +2141,7 @@ public sealed class NtfsMftDataReader
             {
                 throw new Win32Exception(
                     Marshal.GetLastWin32Error(),
-                    "Could not read a nonresident $ATTRIBUTE_LIST data extent.");
+                    "Could not read a nonresident NTFS data extent.");
             }
 
             Buffer.BlockCopy(buffer, 0, destination, targetOffset, chunk);
