@@ -903,7 +903,11 @@ public sealed class UsnJournalMonitor : IDisposable
             return false;
         }
 
-        if (!TryResolveRecentDeletedFileBounded(
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS live deletion snapshot: starting path={deletion.FullPath}, " +
+            $"historyTime={deletion.DeletedAtUtc:O}.");
+
+        if (!TryResolveFreshDeletedFileFromJournalTail(
                 deletion.FullPath,
                 deletion.DeletedAtUtc,
                 out var fileReferenceNumber,
@@ -1358,6 +1362,78 @@ public sealed class UsnJournalMonitor : IDisposable
             .ToList();
     }
 
+    private bool TryResolveFreshDeletedFileFromJournalTail(
+        string fullPath,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        if (TryResolveCachedRecentDeletedFile(
+                fullPath,
+                deletedAtUtc,
+                out fileReferenceNumber,
+                out parentFileReferenceNumber))
+        {
+            return true;
+        }
+
+        if (!IsAdministrator())
+        {
+            return false;
+        }
+
+        var root = Path.GetPathRoot(fullPath);
+        if (string.IsNullOrWhiteSpace(root) ||
+            !string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        using var volumeHandle = CreateFile(
+            $@"\\.\{volumeKey[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (volumeHandle.IsInvalid ||
+            !TryQueryJournal(volumeHandle, out var journal, out _))
+        {
+            return false;
+        }
+
+        // The live-deletion path must not start from the background monitor cursor:
+        // that cursor can be tens of minutes behind while it drains historical USN
+        // records. Search the newest USN/MFT window first.
+        const long recentUsnWindow = 10_000_000;
+        var lowUsn = Math.Max(
+            journal.FirstUsn,
+            journal.NextUsn - recentUsnWindow);
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS live deletion snapshot: tail lookup start={lowUsn}, " +
+            $"high={journal.NextUsn}, target={NormalizePath(fullPath)}.");
+
+        return TryResolveRecentUsnEnumData(
+            volumeHandle,
+            volumeKey,
+            lowUsn,
+            journal.NextUsn,
+            NormalizePath(fullPath),
+            deletedAtUtc,
+            out fileReferenceNumber,
+            out parentFileReferenceNumber);
+    }
+
     public bool TryResolveRecentDeletedFileBounded(
         string fullPath,
         DateTime deletedAtUtc,
@@ -1614,13 +1690,28 @@ public sealed class UsnJournalMonitor : IDisposable
         ulong recordParentFileReferenceNumber,
         uint reason,
         uint fileAttributes,
+        DateTime timestampUtc,
         string fileName,
         string normalizedTarget,
+        DateTime deletedAtUtc,
         out ulong fileReferenceNumber,
         out ulong parentFileReferenceNumber)
     {
         fileReferenceNumber = 0;
         parentFileReferenceNumber = 0;
+
+        if ((reason & UsnReasonFileDelete) == 0 ||
+            (fileAttributes & FileAttributeDirectory) != 0 ||
+            string.IsNullOrWhiteSpace(fileName))
+        {
+            return false;
+        }
+
+        if (deletedAtUtc != default &&
+            Math.Abs((timestampUtc - deletedAtUtc).TotalMinutes) > 5)
+        {
+            return false;
+        }
 
         // FSCTL_ENUM_USN_DATA is an MFT enumeration. Its returned USN record
         // does not carry the change-journal Reason/TimeStamp fields, so this
@@ -1827,6 +1918,16 @@ public sealed class UsnJournalMonitor : IDisposable
                             targetNameMatches++;
                         }
 
+                        DateTime timestampUtc;
+                        try
+                        {
+                            timestampUtc = DateTime.FromFileTimeUtc(timestampFileTime);
+                        }
+                        catch
+                        {
+                            timestampUtc = DateTime.MinValue;
+                        }
+
                         if (TryMatchEnumeratedRecord(
                                 volumeHandle,
                                 volumeKey,
@@ -1834,8 +1935,10 @@ public sealed class UsnJournalMonitor : IDisposable
                                 recordParentFileReferenceNumber,
                                 reason,
                                 fileAttributes,
+                                timestampUtc,
                                 name,
                                 normalizedTarget,
+                                deletedAtUtc,
                                 out fileReferenceNumber,
                                 out parentFileReferenceNumber))
                         {
