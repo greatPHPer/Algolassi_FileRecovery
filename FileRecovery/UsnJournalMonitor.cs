@@ -39,6 +39,8 @@ public sealed class UsnJournalMonitor : IDisposable
     private readonly ConcurrentDictionary<string, DateTime> _accessDeniedUntilUtc =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<RecentDeletedRecord> _recentDeletedRecords = new();
+    private const long DeleteSnapshotMaxBytes = 16L * 1024L * 1024L;
+    private readonly NtfsDeletionSnapshotStore _snapshotStore = new();
 
     private const int RecentDeletedRecordLimit = 512;
 
@@ -579,6 +581,14 @@ public sealed class UsnJournalMonitor : IDisposable
                     RecoveryStrength = "Weak"
                 };
 
+                CaptureNtfsDeletionSnapshot(
+                    deletion,
+                    volumeKey,
+                    record.FileReferenceNumber,
+                    record.ParentFileReferenceNumber,
+                    record.FileName,
+                    directory);
+
                 DeletionDetected?.Invoke(this, new DeletionDetectedEventArgs(deletion, historical: true));
             }
 
@@ -601,6 +611,101 @@ public sealed class UsnJournalMonitor : IDisposable
             System.Diagnostics.Debug.WriteLine(
                 $"USN monitor yielding {volumeKey} after {batchesRead} read batch(es); " +
                 $"cursor={nextUsn}, journalNext={journal.NextUsn}.");
+        }
+    }
+
+    private void CaptureNtfsDeletionSnapshot(
+        DeletionRecord deletion,
+        string volumeKey,
+        ulong fileReferenceNumber,
+        ulong parentFileReferenceNumber,
+        string fileName,
+        string directoryPath)
+    {
+        try
+        {
+            var expectedFullPath =
+                string.IsNullOrWhiteSpace(directoryPath) ||
+                directoryPath.Equals(
+                    "(Parent directory unavailable)",
+                    StringComparison.OrdinalIgnoreCase)
+                    ? null
+                    : NormalizePath(Path.Combine(directoryPath, fileName));
+
+            var root = volumeKey + Path.DirectorySeparatorChar;
+            var reader = new NtfsMftDataReader();
+
+            if (!reader.TryCaptureDeletedData(
+                    root,
+                    fileReferenceNumber,
+                    parentFileReferenceNumber,
+                    fileName,
+                    expectedFullPath,
+                    DeleteSnapshotMaxBytes,
+                    out var stream,
+                    out var capturedData))
+            {
+                return;
+            }
+
+            deletion.FileSizeBytes =
+                stream.FileSizeBytes >= 0
+                    ? stream.FileSizeBytes
+                    : deletion.FileSizeBytes;
+
+            var snapshot = new NtfsDeletionDataSnapshot
+            {
+                DataCaptured = false,
+                IsResident = stream.IsResident,
+                FileSizeBytes = stream.FileSizeBytes,
+                ValidDataLengthBytes = stream.ValidDataLengthBytes,
+                CapturedByteCount = capturedData.LongLength,
+                DataExtents = stream.Extents
+                    .Select(extent => new NtfsDataExtent
+                    {
+                        VirtualClusterNumber = extent.VirtualClusterNumber,
+                        ClusterCount = extent.ClusterCount,
+                        LogicalClusterNumber = extent.LogicalClusterNumber
+                    })
+                    .ToList(),
+                CapturedAtUtc = DateTime.UtcNow,
+                Evidence = capturedData.LongLength == stream.FileSizeBytes
+                    ? "NTFS $DATA was captured immediately when the USN deletion was observed."
+                    : $"NTFS $DATA metadata was captured at deletion time, but content capture was limited to {DeleteSnapshotMaxBytes:N0} bytes."
+            };
+
+            if (capturedData.LongLength == stream.FileSizeBytes &&
+                _snapshotStore.TrySave(
+                    deletion.Id,
+                    capturedData,
+                    out var dataFileName,
+                    out var sha256))
+            {
+                snapshot.DataCaptured = true;
+                snapshot.DataFileName = dataFileName;
+                snapshot.Sha256 = sha256;
+                deletion.RecoveryStrength = "Strong";
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS deletion snapshot saved: path={deletion.FullPath}, " +
+                    $"fileRef={fileReferenceNumber}, size={capturedData.LongLength:N0}, " +
+                    $"resident={stream.IsResident}, dataFile={dataFileName}.");
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS deletion snapshot metadata only: path={deletion.FullPath}, " +
+                    $"fileRef={fileReferenceNumber}, size={stream.FileSizeBytes:N0}, " +
+                    $"capturedBytes={capturedData.LongLength:N0}.");
+            }
+
+            deletion.NtfsDataSnapshot = snapshot;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS deletion snapshot failed: path={deletion.FullPath}, " +
+                $"fileRef={fileReferenceNumber}, error={ex.GetType().Name}: {ex.Message}");
         }
     }
 
