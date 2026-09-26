@@ -127,33 +127,29 @@ public sealed class TrayApplicationContext : ApplicationContext
             {
                 try
                 {
-                    for (var attempt = 0; attempt < 5; attempt++)
+                    // A large historical USN backlog can delay the background
+                    // cursor long enough for a fresh MFT sequence to be reused.
+                    // Inspect the recent journal tail immediately and try to
+                    // capture the NTFS $DATA snapshot while the deletion is fresh.
+                    for (var attempt = 0; attempt < 6; attempt++)
                     {
-                        if (_usnMonitor.TryResolveRecentDeletedFile(
-                                e.Record.FullPath,
-                                e.Record.DeletedAtUtc,
-                                out var fileReferenceNumber,
-                                out var parentFileReferenceNumber))
+                        if (_usnMonitor.TryCaptureRecentDeletionSnapshot(e.Record))
                         {
-                            e.Record.FileReferenceNumber = fileReferenceNumber;
-                            e.Record.ParentFileReferenceNumber = parentFileReferenceNumber;
-
-                            // Upsert merges this enrichment into the existing
-                            // watcher-created history row.
                             await Task.Run(() => _history.Upsert(e.Record));
                             return;
                         }
 
-                        if (attempt < 4)
+                        if (attempt < 5)
                         {
-                            await Task.Delay(250);
+                            await Task.Delay(150);
                         }
                     }
                 }
                 catch
                 {
-                    // USN enrichment is best-effort; the original deletion
-                    // history row must remain available.
+                    // Live NTFS snapshotting is best-effort; the original
+                    // deletion history row remains available if the journal/MFT
+                    // race cannot be won.
                 }
             });
         }
