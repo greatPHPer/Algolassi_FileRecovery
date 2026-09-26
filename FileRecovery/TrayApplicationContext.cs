@@ -123,6 +123,10 @@ public sealed class TrayApplicationContext : ApplicationContext
             !e.Record.FileReferenceNumber.HasValue &&
             !string.IsNullOrWhiteSpace(e.Record.FullPath))
         {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS immediate live path triggered: path={e.Record.FullPath}, " +
+                $"historyTime={e.Record.DeletedAtUtc:O}.");
+
             _ = Task.Run(async () =>
             {
                 try
@@ -135,9 +139,17 @@ public sealed class TrayApplicationContext : ApplicationContext
                     {
                         if (_usnMonitor.TryCaptureRecentDeletionSnapshot(e.Record))
                         {
+                            System.Diagnostics.Debug.WriteLine(
+                                $"NTFS immediate live path snapshot succeeded: " +
+                                $"path={e.Record.FullPath}, attempt={attempt + 1}.");
+
                             await Task.Run(() => _history.Upsert(e.Record));
                             return;
                         }
+
+                        System.Diagnostics.Debug.WriteLine(
+                            $"NTFS immediate live path snapshot attempt failed: " +
+                            $"path={e.Record.FullPath}, attempt={attempt + 1}.");
 
                         if (attempt < 5)
                         {
