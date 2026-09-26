@@ -1936,6 +1936,65 @@ public partial class Form1 : Form
                 // paths instead. This keeps a successful result tied to the deleted
                 // candidate rather than accepting a coincidental text-like slack prefix.
 
+                // If the live and historical MFT views are already reused, inspect
+                // the NTFS transaction journal before asking the user for a content marker.
+                // $LogFile is finite and may have wrapped, so failure here is expected for
+                // older or high-activity deletions.
+                if (candidate.FileSizeBytes <= 0 &&
+                    candidate.FileReferenceNumber != 0 &&
+                    candidate.ParentFileReferenceNumber != 0)
+                {
+                    var sourceRoot = GetSourceVolumeRoot(candidate.FullPath);
+
+                    if (!string.IsNullOrWhiteSpace(sourceRoot))
+                    {
+                        try
+                        {
+                            var logFileSizeReader = new NtfsLogFileHistoricalSizeService();
+
+                            if (logFileSizeReader.TryRecoverFileSize(
+                                sourceRoot,
+                                candidate.Name,
+                                candidate.ParentFileReferenceNumber,
+                                new DriveInfo(sourceRoot).TotalSize,
+                                out var historicalLogFileSize,
+                                out var logFileEvidence) &&
+                                historicalLogFileSize > 0)
+                            {
+                                candidate.FileSizeBytes = historicalLogFileSize;
+
+                                System.Diagnostics.Debug.WriteLine(
+                                    $"NTFS candidate size enrichment: match=$LogFile, " +
+                                    $"path={candidate.FullPath}, fileRef={candidate.FileReferenceNumber}, " +
+                                    $"size={historicalLogFileSize:N0} bytes, " +
+                                    $"evidence={logFileEvidence}");
+
+                                candidate.Strength = RecoveryStrength.Medium;
+
+                                candidate.DataEvidence = string.Join(
+                                    " ",
+                                    new[]
+                                    {
+                                        candidate.DataEvidence,
+                                        logFileEvidence
+                                    }.Where(text => !string.IsNullOrWhiteSpace(text)));
+                            }
+                            else
+                            {
+                                System.Diagnostics.Debug.WriteLine(
+                                    $"NTFS candidate $LogFile size lookup: no match for " +
+                                    $"{candidate.FullPath}. {logFileEvidence}");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine(
+                                $"NTFS candidate $LogFile size lookup failed: " +
+                                $"{ex.GetType().Name}: {ex.Message}");
+                        }
+                    }
+                }
+
                 // For an unknown-size .txt candidate, offer a marker-driven
                 // whole-volume forensic scan before the broad free-space heuristic.
                 // The marker is deliberately required so allocated live-file bytes are
