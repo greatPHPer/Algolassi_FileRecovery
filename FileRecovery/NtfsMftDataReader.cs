@@ -909,18 +909,25 @@ public sealed class NtfsMftDataReader
             var remainingBudget = Math.Min(
                 Math.Max(0, logFileStream.FileSizeBytes),
                 maxDiagnosticBytes);
+
+            const int diagnosticChunkSize = 4 * 1024 * 1024;
+            const int correlationWindowBytes = 64 * 1024;
+
             var expectedNameBytes = Encoding.Unicode.GetBytes(expectedFileName);
             var expectedReferenceBytes = new byte[sizeof(ulong)];
+            var expectedParentBytes = new byte[sizeof(ulong)];
 
             BinaryPrimitives.WriteUInt64LittleEndian(
                 expectedReferenceBytes,
                 fileReferenceNumber);
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                expectedParentBytes,
+                expectedParentFileReferenceNumber);
 
             long scannedBytes = 0;
-            var nameMatches = 0;
-            var nearbyReferenceMatches = 0;
-            var rawReferenceMatches = 0;
-            var reportedCandidates = 0;
+            var filenameOffsets = new List<long>();
+            var referenceOffsets = new List<long>();
+            var parentOffsets = new List<long>();
             var logicalFileOffset = 0L;
 
             foreach (var extent in logFileStream.Extents)
@@ -937,7 +944,6 @@ public sealed class NtfsMftDataReader
                         checked(extent.ClusterCount * (long)volumeInfo.BytesPerCluster),
                         remainingBudget));
 
-                const int diagnosticChunkSize = 4 * 1024 * 1024;
                 long extentOffset = 0;
                 while (extentOffset < extentBytes &&
                        remainingBudget > 0)
@@ -952,8 +958,9 @@ public sealed class NtfsMftDataReader
 
                     ReadRawClusters(
                         volumeHandle,
-                        checked(extent.LogicalClusterNumber +
-                                extentOffset / volumeInfo.BytesPerCluster),
+                        checked(
+                            extent.LogicalClusterNumber +
+                            extentOffset / volumeInfo.BytesPerCluster),
                         chunkBytes,
                         volumeInfo.BytesPerCluster,
                         chunk,
@@ -962,69 +969,23 @@ public sealed class NtfsMftDataReader
                     scannedBytes = checked(scannedBytes + chunkBytes);
                     remainingBudget -= chunkBytes;
 
-                    for (var offset = 0;
-                         offset + expectedNameBytes.Length <= chunk.Length;
-                         offset++)
-                    {
-                        if (!chunk.AsSpan(
-                                offset,
-                                expectedNameBytes.Length)
-                            .SequenceEqual(expectedNameBytes))
-                        {
-                            continue;
-                        }
+                    CollectPatternOffsets(
+                        chunk,
+                        expectedNameBytes,
+                        checked(logicalFileOffset + extentOffset),
+                        filenameOffsets);
 
-                        nameMatches++;
-                        if (reportedCandidates >= 10)
-                        {
-                            continue;
-                        }
+                    CollectPatternOffsets(
+                        chunk,
+                        expectedReferenceBytes,
+                        checked(logicalFileOffset + extentOffset),
+                        referenceOffsets);
 
-                        var absoluteOffset = checked(
-                            logicalFileOffset + extentOffset + offset);
-
-                        var windowStart = Math.Max(0, offset - 512);
-                        var windowEnd = Math.Min(
-                            chunk.Length,
-                            offset + expectedNameBytes.Length + 512);
-
-                        var window = chunk.AsSpan(
-                            windowStart,
-                            windowEnd - windowStart);
-
-                        var referenceInWindow = window.IndexOf(
-                            expectedReferenceBytes) >= 0;
-
-                        var fileInWindow = window.IndexOf(
-                            "FILE"u8) >= 0;
-
-                        var rcrdInWindow = window.IndexOf(
-                            "RCRD"u8) >= 0;
-
-                        var opcodeSummary = CountHistoricalLogOperations(window);
-
-                        System.Diagnostics.Trace.WriteLine(
-                            $"NTFS $LogFile diagnostic: filename match #{nameMatches}, " +
-                            $"logicalOffset={absoluteOffset:N0}, " +
-                            $"fileRefInWindow={referenceInWindow}, " +
-                            $"FILE={fileInWindow}, RCRD={rcrdInWindow}, " +
-                            $"ops={opcodeSummary}.");
-
-                        reportedCandidates++;
-                    }
-
-                    for (var offset = 0;
-                         offset + expectedReferenceBytes.Length <= chunk.Length;
-                         offset++)
-                    {
-                        if (chunk.AsSpan(
-                                offset,
-                                expectedReferenceBytes.Length)
-                            .SequenceEqual(expectedReferenceBytes))
-                        {
-                            rawReferenceMatches++;
-                        }
-                    }
+                    CollectPatternOffsets(
+                        chunk,
+                        expectedParentBytes,
+                        checked(logicalFileOffset + extentOffset),
+                        parentOffsets);
 
                     extentOffset += chunkBytes;
                 }
@@ -1033,18 +994,113 @@ public sealed class NtfsMftDataReader
                     logicalFileOffset + extentBytes);
             }
 
+            foreach (var filenameOffset in filenameOffsets)
+            {
+                var nearestReferenceDistance = FindNearestOffsetDistance(
+                    filenameOffset,
+                    referenceOffsets);
+
+                var nearestParentDistance = FindNearestOffsetDistance(
+                    filenameOffset,
+                    parentOffsets);
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile filename occurrence: " +
+                    $"offset={filenameOffset:N0}, " +
+                    $"nearestFileRefDistance={nearestReferenceDistance:N0}, " +
+                    $"nearestParentRefDistance={nearestParentDistance:N0}.");
+            }
+
+            foreach (var referenceOffset in referenceOffsets)
+            {
+                var nearestFilenameDistance = FindNearestOffsetDistance(
+                    referenceOffset,
+                    filenameOffsets);
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile fileRef occurrence: " +
+                    $"offset={referenceOffset:N0}, " +
+                    $"nearestFilenameDistance={nearestFilenameDistance:N0}.");
+            }
+
+            var correlatedCount = 0;
+            foreach (var filenameOffset in filenameOffsets)
+            {
+                var fileRefDistance = FindNearestOffsetDistance(
+                    filenameOffset,
+                    referenceOffsets);
+
+                if (fileRefDistance <= correlationWindowBytes)
+                {
+                    correlatedCount++;
+                }
+            }
+
             System.Diagnostics.Trace.WriteLine(
-                $"NTFS $LogFile diagnostic summary: fileRef={fileReferenceNumber}, " +
-                $"name={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
-                $"logFileSize={logFileStream.FileSizeBytes:N0}, scanned={scannedBytes:N0}, " +
-                    $"filenameMatches={nameMatches}, nearbyReferenceMatches={nearbyReferenceMatches}, " +
-                $"rawReferenceMatches={rawReferenceMatches}.");
+                $"NTFS $LogFile diagnostic summary: " +
+                $"fileRef={fileReferenceNumber}, name={expectedFileName}, " +
+                $"parentRef={expectedParentFileReferenceNumber}, " +
+                $"logFileSize={logFileStream.FileSizeBytes:N0}, " +
+                $"scanned={scannedBytes:N0}, " +
+                $"filenameMatches={filenameOffsets.Count}, " +
+                $"rawReferenceMatches={referenceOffsets.Count}, " +
+                $"parentReferenceMatches={parentOffsets.Count}, " +
+                $"filenameToFileRefWithin64KiB={correlatedCount}.");
         }
         catch (Exception ex)
         {
             System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile diagnostic failed: {ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    private static void CollectPatternOffsets(
+        ReadOnlySpan<byte> buffer,
+        ReadOnlySpan<byte> pattern,
+        long absoluteBaseOffset,
+        List<long> offsets)
+    {
+        if (pattern.Length == 0 ||
+            buffer.Length < pattern.Length)
+        {
+            return;
+        }
+
+        for (var offset = 0;
+             offset + pattern.Length <= buffer.Length;
+             offset++)
+        {
+            if (buffer.Slice(
+                    offset,
+                    pattern.Length)
+                .SequenceEqual(pattern))
+            {
+                offsets.Add(
+                    checked(absoluteBaseOffset + offset));
+            }
+        }
+    }
+
+    private static long FindNearestOffsetDistance(
+        long value,
+        IReadOnlyList<long> offsets)
+    {
+        if (offsets.Count == 0)
+        {
+            return long.MaxValue;
+        }
+
+        var nearest = long.MaxValue;
+        foreach (var offset in offsets)
+        {
+            var distance = Math.Abs(offset - value);
+            if (distance < nearest)
+            {
+                nearest = distance;
+            }
+        }
+
+        return nearest;
     }
 
     private static string CountHistoricalLogOperations(ReadOnlySpan<byte> window)
