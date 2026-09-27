@@ -2221,7 +2221,7 @@ public sealed class NtfsMftDataReader
         var bytesRead = ReadMappedFileBytes(
             volumeHandle,
             volumeInfo.BytesPerCluster,
-            _mftExtents,
+            mftExtents,
             logicalByteOffset,
             record);
 
