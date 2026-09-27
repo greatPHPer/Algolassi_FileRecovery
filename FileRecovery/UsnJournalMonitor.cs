@@ -555,6 +555,11 @@ public sealed class UsnJournalMonitor : IDisposable
                     ? record.FileName
                     : Path.Combine(cachedDirectory, record.FileName);
 
+                if (InternalPathPolicy.IsIgnoredPath(initialPath))
+                {
+                    continue;
+                }
+
                 var deletion = new DeletionRecord
                 {
                     FileReferenceNumber = record.FileReferenceNumber,
@@ -590,6 +595,11 @@ public sealed class UsnJournalMonitor : IDisposable
 
                 deletion.DirectoryPath = directory;
                 deletion.FullPath = NormalizePath(Path.Combine(directory, record.FileName));
+
+                if (InternalPathPolicy.IsIgnoredPath(deletion.FullPath))
+                {
+                    continue;
+                }
 
                 _recentDeletedRecords.Enqueue(
                     new RecentDeletedRecord(
@@ -890,6 +900,11 @@ public sealed class UsnJournalMonitor : IDisposable
         if (deletion is null ||
             string.IsNullOrWhiteSpace(deletion.FullPath) ||
             string.IsNullOrWhiteSpace(deletion.FileName))
+        {
+            return false;
+        }
+
+        if (InternalPathPolicy.IsIgnoredPath(deletion.FullPath))
         {
             return false;
         }
