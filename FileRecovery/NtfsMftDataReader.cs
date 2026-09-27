@@ -1375,6 +1375,32 @@ public sealed class NtfsMftDataReader
             sequenceNumber,
             expectedBaseFileReference: fileReferenceNumber);
 
+        if (record is not null)
+        {
+            var actualSequence = BinaryPrimitives.ReadUInt16LittleEndian(
+                record.AsSpan(16, 2));
+            var actualFlags = BinaryPrimitives.ReadUInt16LittleEndian(
+                record.AsSpan(22, 2));
+            var actualBaseReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                record.AsSpan(32, 8));
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS exact MFT record read: fileRef={fileReferenceNumber}, " +
+                $"segment={segmentNumber}, expectedSequence={sequenceNumber}, " +
+                $"actualSequence={actualSequence}, flags=0x{actualFlags:X4}, " +
+                $"baseRef={actualBaseReference}, expectedBaseRef={fileReferenceNumber}, " +
+                $"expectedName={expectedFileName ?? "(none)"}, " +
+                $"expectedParent={expectedParentFileReferenceNumber?.ToString() ?? "(none)"}.");
+        }
+        else
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS exact MFT record read FAILED: fileRef={fileReferenceNumber}, " +
+                $"segment={segmentNumber}, expectedSequence={sequenceNumber}, " +
+                $"expectedName={expectedFileName ?? "(none)"}, " +
+                $"expectedParent={expectedParentFileReferenceNumber?.ToString() ?? "(none)"}.");
+        }
+
         if (record is null &&
             !string.IsNullOrWhiteSpace(expectedFileName) &&
             expectedParentFileReferenceNumber.HasValue)
@@ -1415,7 +1441,7 @@ public sealed class NtfsMftDataReader
                         expectedFullPath,
                         expectedSequenceNumber: sequenceNumber))
                 {
-                    System.Diagnostics.Debug.WriteLine(
+                    System.Diagnostics.Trace.WriteLine(
                         $"NTFS $DATA lookup: accepted delete-transition MFT record " +
                         $"for fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
                         $"expectedSequence={sequenceNumber}, actualSequence={actualSequence}.");
@@ -1423,20 +1449,26 @@ public sealed class NtfsMftDataReader
                 }
                 else
                 {
-                    System.Diagnostics.Debug.WriteLine(
+                    System.Diagnostics.Trace.WriteLine(
                         $"NTFS $DATA lookup: rejected relaxed MFT record for " +
                         $"fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
-                        $"expectedSequence={sequenceNumber}, actualSequence={actualSequence}.");
+                        $"expectedSequence={sequenceNumber}, actualSequence={actualSequence}, " +
+                        $"expectedName={expectedFileName}, expectedParent={expectedParentFileReferenceNumber}.");
                 }
             }
         }
 
         if (record is null)
         {
-            System.Diagnostics.Debug.WriteLine(
+            System.Diagnostics.Trace.WriteLine(
                 $"NTFS $DATA lookup: could not read the exact MFT record for fileRef={fileReferenceNumber}.");
             return NotFound("NTFS could not read and validate the exact deleted MFT record for this file reference.");
         }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $DATA extraction starting: fileRef={fileReferenceNumber}, " +
+            $"segment={segmentNumber}, expectedName={expectedFileName ?? "(none)"}, " +
+            $"expectedParent={expectedParentFileReferenceNumber?.ToString() ?? "(none)"}.");
 
         return ReadDefaultDataStreamFromMftRecord(
             volumeInfo,
@@ -1489,9 +1521,11 @@ public sealed class NtfsMftDataReader
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
         var dataAttributes = FindUnnamedDataAttributes(record, volumeInfo);
 
-        System.Diagnostics.Debug.WriteLine(
-            $"NTFS $DATA lookup: MFT record flags=0x{flags:X4}, " +
-            $"unnamedDataAttributes={dataAttributes.Count}.");
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $DATA extraction: MFT record flags=0x{flags:X4}, " +
+            $"unnamedDataAttributes={dataAttributes.Count}, " +
+            $"expectedName={expectedFileName ?? "(none)"}, " +
+            $"expectedParent={expectedParentFileReferenceNumber?.ToString() ?? "(none)"}.");
 
         foreach (var dataAttribute in dataAttributes)
         {
