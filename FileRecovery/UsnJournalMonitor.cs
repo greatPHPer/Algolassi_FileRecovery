@@ -42,6 +42,9 @@ public sealed class UsnJournalMonitor : IDisposable
     private readonly ConcurrentQueue<RecentDeletedRecord> _recentDeletedRecords = new();
     private const long DeleteSnapshotMaxBytes = 16L * 1024L * 1024L;
     private readonly NtfsDeletionSnapshotStore _snapshotStore = new();
+    // Reuse the parsed $MFT extent map across deletion snapshots. Re-reading
+    // MFT record 0 for every event widens the race window on busy volumes.
+    private readonly NtfsMftDataReader _snapshotMftReader = new();
 
     private const int RecentDeletedRecordLimit = 512;
 
@@ -661,9 +664,7 @@ public sealed class UsnJournalMonitor : IDisposable
                     : NormalizePath(Path.Combine(directoryPath, fileName));
 
             var root = volumeKey + Path.DirectorySeparatorChar;
-            var reader = new NtfsMftDataReader();
-
-            if (!reader.TryCaptureDeletedData(
+            if (!_snapshotMftReader.TryCaptureDeletedData(
                     root,
                     fileReferenceNumber,
                     parentFileReferenceNumber,
@@ -1387,14 +1388,14 @@ public sealed class UsnJournalMonitor : IDisposable
         fileReferenceNumber = 0;
         parentFileReferenceNumber = 0;
 
-        if (TryResolveCachedRecentDeletedFile(
-                fullPath,
-                deletedAtUtc,
-                out fileReferenceNumber,
-                out parentFileReferenceNumber))
-        {
-            return true;
-        }
+        // Prefer a fresh journal-tail match over the in-memory cache. The cache is
+        // useful as a fallback, but on a busy volume its MFT reference can already
+        // be stale by the time a live snapshot is attempted.
+        var hasCachedFallback = TryResolveCachedRecentDeletedFile(
+            fullPath,
+            deletedAtUtc,
+            out var cachedFileReferenceNumber,
+            out var cachedParentFileReferenceNumber);
 
         if (!IsAdministrator())
         {
@@ -1597,6 +1598,21 @@ public sealed class UsnJournalMonitor : IDisposable
         System.Diagnostics.Debug.WriteLine(
             $"NTFS live deletion snapshot: journal tail search found no uniquely matching delete " +
             $"for path={normalizedTarget}, start={lowUsn}, high={journal.NextUsn}.");
+
+        if (hasCachedFallback &&
+            cachedFileReferenceNumber != 0 &&
+            cachedParentFileReferenceNumber != 0)
+        {
+            fileReferenceNumber = cachedFileReferenceNumber;
+            parentFileReferenceNumber = cachedParentFileReferenceNumber;
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: falling back to cached USN record " +
+                $"path={normalizedTarget}, fileRef={fileReferenceNumber}, " +
+                $"parentRef={parentFileReferenceNumber}.");
+
+            return true;
+        }
 
         return false;
     }
