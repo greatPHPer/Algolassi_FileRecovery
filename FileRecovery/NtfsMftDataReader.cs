@@ -893,190 +893,290 @@ public sealed class NtfsMftDataReader
             return null;
         }
 
-        var slackStart = FindAttributeSlackStart(record);
-        if (slackStart < 0 ||
-            slackStart >= record.Length)
-        {
-            return null;
-        }
-
         var expectedNameBytes = Encoding.Unicode.GetBytes(expectedFileName);
         if (expectedNameBytes.Length == 0)
         {
             return null;
         }
 
-        var historicalFileNameOffset = FindHistoricalFileNameValue(
-            record,
-            slackStart,
-            expectedNameBytes,
-            expectedParentFileReferenceNumber,
-            out var historicalFileSize);
+        // The MFT segment has been reused. Current attributes may occupy only part
+        // of the 1 KiB record, while stale bytes from the deleted generation can
+        // remain elsewhere in the same record. Build ranges for current attributes
+        // and search only outside those ranges.
+        var currentAttributes = EnumerateAttributes(record)
+            .Select(x => (Start: x.Offset, End: x.Offset + x.Length))
+            .ToArray();
 
-        if (historicalFileNameOffset < 0 ||
-            historicalFileSize <= 0)
+        bool IsInsideCurrentAttribute(int offset, int length)
         {
-            return null;
+            var end = offset + length;
+            return currentAttributes.Any(range =>
+                offset < range.End &&
+                end > range.Start);
         }
 
-        DateTime modificationTimeUtc;
-        try
+        var candidates = new List<(int ValueOffset, long FileSize, DateTime ModifiedAtUtc)>();
+
+        for (var nameByteOffset = 0;
+             nameByteOffset + expectedNameBytes.Length <= record.Length;
+             nameByteOffset++)
         {
-            modificationTimeUtc = DateTime.FromFileTimeUtc(
-                BinaryPrimitives.ReadInt64LittleEndian(
-                    record.AsSpan(
-                        historicalFileNameOffset + 16,
-                        sizeof(long))));
-        }
-        catch
-        {
-            return null;
-        }
-
-        var timestampDeltaMinutes =
-            Math.Abs((modificationTimeUtc - expectedDeletedAtUtc).TotalMinutes);
-
-        if (timestampDeltaMinutes > 5)
-        {
-            System.Diagnostics.Trace.WriteLine(
-                $"NTFS historical MFT slack: FILE_NAME timestamp rejected, " +
-                $"name={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
-                $"modifiedAt={modificationTimeUtc:O}, deleteAt={expectedDeletedAtUtc:O}, " +
-                $"deltaMinutes={timestampDeltaMinutes:0.###}.");
-            return null;
-        }
-
-        const int maxRelatedSlackDistance = 1024;
-        DataAttributeDescriptor? bestDescriptor = null;
-        var bestDistance = int.MaxValue;
-
-        for (var attributeOffset = slackStart;
-             attributeOffset + 64 <= record.Length;
-             attributeOffset++)
-        {
-            var type = BinaryPrimitives.ReadUInt32LittleEndian(
-                record.AsSpan(attributeOffset, 4));
-
-            if (type != NtfsAttributeData)
+            if (!record.AsSpan(
+                    nameByteOffset,
+                    expectedNameBytes.Length)
+                .SequenceEqual(expectedNameBytes))
             {
                 continue;
             }
 
-            var attributeLength = BinaryPrimitives.ReadUInt32LittleEndian(
-                record.AsSpan(attributeOffset + 4, 4));
+            var valueOffset = nameByteOffset - 66;
+            const int minimumFileNameValueLength = 66;
 
-            if (attributeLength < 64 ||
-                attributeOffset + attributeLength > record.Length)
+            if (valueOffset < 0 ||
+                valueOffset + minimumFileNameValueLength + expectedNameBytes.Length > record.Length ||
+                IsInsideCurrentAttribute(
+                    valueOffset,
+                    minimumFileNameValueLength + expectedNameBytes.Length))
             {
                 continue;
             }
 
-            var formCode = record[attributeOffset + 8];
-            var nameLength = record[attributeOffset + 9];
+            var storedNameLength = record[valueOffset + 64];
+            var nameNamespace = record[valueOffset + 65];
 
-            if (formCode != NonResidentForm ||
-                nameLength != 0)
+            if (storedNameLength != expectedNameBytes.Length / 2 ||
+                nameNamespace > 3 ||
+                valueOffset + 66 + storedNameLength * 2 > record.Length)
             {
                 continue;
             }
 
-            var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(
-                record.AsSpan(attributeOffset + 16, sizeof(long)));
+            var parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                record.AsSpan(valueOffset, sizeof(ulong)));
 
-            if (lowestVcn != 0)
-            {
-                continue;
-            }
-
-            var mappingPairsOffset = BinaryPrimitives.ReadUInt16LittleEndian(
-                record.AsSpan(attributeOffset + 32, sizeof(ushort)));
-
-            if (mappingPairsOffset < 64 ||
-                mappingPairsOffset >= attributeLength)
+            if (parentReference != expectedParentFileReferenceNumber)
             {
                 continue;
             }
 
             var allocatedSize = BinaryPrimitives.ReadInt64LittleEndian(
-                record.AsSpan(attributeOffset + 40, sizeof(long)));
-            var fileSize = BinaryPrimitives.ReadInt64LittleEndian(
-                record.AsSpan(attributeOffset + 48, sizeof(long)));
-            var validDataLength = BinaryPrimitives.ReadInt64LittleEndian(
-                record.AsSpan(attributeOffset + 56, sizeof(long)));
+                record.AsSpan(valueOffset + 40, sizeof(long)));
 
-            if (fileSize != historicalFileSize ||
-                allocatedSize < fileSize ||
-                validDataLength < 0 ||
-                validDataLength > fileSize)
+            var realSize = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(valueOffset + 48, sizeof(long)));
+
+            if (realSize <= 0 ||
+                allocatedSize < realSize ||
+                realSize > MaxAttributeListBytes)
             {
                 continue;
             }
 
-            var distance = Math.Abs(attributeOffset - historicalFileNameOffset);
-            if (distance > maxRelatedSlackDistance ||
-                distance >= bestDistance)
-            {
-                continue;
-            }
-
-            IReadOnlyList<NtfsDataExtent> extents;
+            DateTime modifiedAtUtc;
             try
             {
-                extents = NtfsMappingPairsParser.Parse(
-                    record.AsSpan(
-                        attributeOffset + mappingPairsOffset,
-                        checked((int)attributeLength - mappingPairsOffset)),
-                    lowestVcn);
+                modifiedAtUtc = DateTime.FromFileTimeUtc(
+                    BinaryPrimitives.ReadInt64LittleEndian(
+                        record.AsSpan(valueOffset + 16, sizeof(long))));
             }
             catch
             {
                 continue;
             }
 
-            if (extents.Count == 0 ||
-                extents[0].VirtualClusterNumber != 0)
+            var timestampDeltaMinutes =
+                Math.Abs((modifiedAtUtc - expectedDeletedAtUtc).TotalMinutes);
+
+            if (timestampDeltaMinutes > 5)
             {
                 continue;
             }
 
-            long coveredClusters = 0;
-            var expectedVcn = 0L;
-            var validExtentLayout = true;
+            candidates.Add((valueOffset, realSize, modifiedAtUtc));
+        }
 
-            foreach (var extent in extents)
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS historical MFT slack search: " +
+            $"name={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
+            $"rawNameCandidates={candidates.Count}, currentAttributeCount={currentAttributes.Length}.");
+
+        if (candidates.Count == 0)
+        {
+            return null;
+        }
+
+        const int maxRelatedSlackDistance = 1024;
+        DataAttributeDescriptor? bestDescriptor = null;
+        var bestDistance = int.MaxValue;
+        int bestNameOffset = -1;
+        DateTime bestModifiedAtUtc = DateTime.MinValue;
+
+        foreach (var candidate in candidates.OrderBy(x => Math.Abs(x.ValueOffset)))
+        {
+            for (var attributeOffset = 0;
+                 attributeOffset + 64 <= record.Length;
+                 attributeOffset++)
             {
-                if (extent.VirtualClusterNumber != expectedVcn ||
-                    extent.ClusterCount <= 0)
+                const int minimumNonResidentAttributeLength = 64;
+
+                if (IsInsideCurrentAttribute(
+                    attributeOffset,
+                    minimumNonResidentAttributeLength))
                 {
-                    validExtentLayout = false;
-                    break;
+                    continue;
                 }
 
-                coveredClusters = checked(coveredClusters + extent.ClusterCount);
-                expectedVcn = checked(expectedVcn + extent.ClusterCount);
-            }
+                var type = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(attributeOffset, 4));
 
-            if (!validExtentLayout ||
-                checked(coveredClusters * (long)volumeInfo.BytesPerCluster) < fileSize)
-            {
-                continue;
-            }
+                if (type != NtfsAttributeData)
+                {
+                    continue;
+                }
 
-            bestDescriptor = new DataAttributeDescriptor
-            {
-                LowestVcn = lowestVcn,
-                IsResident = false,
-                FileSizeBytes = fileSize,
-                ValidDataLengthBytes = validDataLength,
-                Extents = extents
-            };
-            bestDistance = distance;
+                var attributeLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(attributeOffset + 4, 4));
+
+                if (attributeLength < 64 ||
+                    attributeOffset + attributeLength > record.Length ||
+                    IsInsideCurrentAttribute(
+                        attributeOffset,
+                        checked((int)attributeLength)))
+                {
+                    continue;
+                }
+
+                var formCode = record[attributeOffset + 8];
+                var nameLength = record[attributeOffset + 9];
+
+                if (formCode != NonResidentForm ||
+                    nameLength != 0)
+                {
+                    continue;
+                }
+
+                var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(attributeOffset + 16, sizeof(long)));
+
+                if (lowestVcn != 0)
+                {
+                    continue;
+                }
+
+                var mappingPairsOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(attributeOffset + 32, sizeof(ushort)));
+
+                if (mappingPairsOffset < 64 ||
+                    mappingPairsOffset >= attributeLength)
+                {
+                    continue;
+                }
+
+                var allocatedSize = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(attributeOffset + 40, sizeof(long)));
+
+                var fileSize = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(attributeOffset + 48, sizeof(long)));
+
+                var validDataLength = BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(attributeOffset + 56, sizeof(long)));
+
+                if (fileSize != candidate.FileSize ||
+                    allocatedSize < fileSize ||
+                    validDataLength < 0 ||
+                    validDataLength > fileSize)
+                {
+                    continue;
+                }
+
+                var distance = Math.Abs(
+                    attributeOffset - candidate.ValueOffset);
+
+                if (distance > maxRelatedSlackDistance ||
+                    distance >= bestDistance)
+                {
+                    continue;
+                }
+
+                IReadOnlyList<NtfsDataExtent> extents;
+                try
+                {
+                    extents = NtfsMappingPairsParser.Parse(
+                        record.AsSpan(
+                            attributeOffset + mappingPairsOffset,
+                            checked((int)attributeLength - mappingPairsOffset)),
+                        lowestVcn);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (extents.Count == 0 ||
+                    extents[0].VirtualClusterNumber != 0)
+                {
+                    continue;
+                }
+
+                long coveredClusters = 0;
+                var expectedVcn = 0L;
+                var validExtentLayout = true;
+
+                foreach (var extent in extents)
+                {
+                    if (extent.VirtualClusterNumber != expectedVcn ||
+                        extent.ClusterCount <= 0 ||
+                        extent.LogicalClusterNumber < 0)
+                    {
+                        validExtentLayout = false;
+                        break;
+                    }
+
+                    coveredClusters = checked(
+                        coveredClusters + extent.ClusterCount);
+                    expectedVcn = checked(
+                        expectedVcn + extent.ClusterCount);
+                }
+
+                if (!validExtentLayout ||
+                    checked(
+                        coveredClusters *
+                        (long)volumeInfo.BytesPerCluster) < fileSize)
+                {
+                    continue;
+                }
+
+                bestDescriptor = new DataAttributeDescriptor
+                {
+                    LowestVcn = lowestVcn,
+                    IsResident = false,
+                    FileSizeBytes = fileSize,
+                    ValidDataLengthBytes = validDataLength,
+                    Extents = extents
+                };
+                bestDistance = distance;
+                bestNameOffset = candidate.ValueOffset;
+                bestModifiedAtUtc = candidate.ModifiedAtUtc;
+            }
         }
 
         if (bestDescriptor is null)
         {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical MFT slack search: filename evidence found, " +
+                $"but no correlated nonresident $DATA mapping pairs matched " +
+                $"size={candidates[0].FileSize:N0}.");
             return null;
         }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS historical MFT slack evidence: " +
+            $"name={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
+            $"modifiedAt={bestModifiedAtUtc:O}, deleteAt={expectedDeletedAtUtc:O}, " +
+            $"fileSize={bestDescriptor.FileSizeBytes:N0}, " +
+            $"nameOffset={bestNameOffset}, " +
+            $"dataAttributeDistance={bestDistance}, " +
+            $"extents={bestDescriptor.Extents.Count:N0}.");
 
         return new NtfsDataStreamInfo
         {
@@ -1086,8 +1186,9 @@ public sealed class NtfsMftDataReader
             ValidDataLengthBytes = bestDescriptor.ValidDataLengthBytes,
             Extents = bestDescriptor.Extents,
             Evidence =
-                $"The deleted file's historical $FILE_NAME and nonresident $DATA mapping pairs were retained in MFT slack; " +
-                $"filename/parent/timestamp matched the USN deletion record."
+                $"The deleted file's historical $FILE_NAME and nonresident $DATA mapping pairs " +
+                $"were retained outside the current MFT attributes; filename, parent, timestamp, " +
+                $"and file size all matched the USN deletion evidence."
         };
     }
 
