@@ -1405,15 +1405,20 @@ public sealed class NtfsMftDataReader
             !string.IsNullOrWhiteSpace(expectedFileName) &&
             expectedParentFileReferenceNumber.HasValue)
         {
-            // NTFS increments the MFT record sequence when the record is freed by
-            // deletion. The USN record can therefore carry sequence N while the
-            // just-deleted FILE record is already showing sequence N+1.
-            // Retry the exact segment without strict sequence/base checks, but only
-            // accept the record when:
-            //   1. the sequence advanced by exactly one (with circular wrap), and
-            //   2. the retained $FILE_NAME still identifies the expected file.
-            // This avoids the old false-acceptance case where an arbitrarily reused
-            // MFT generation happened to contain the same name/path.
+            // NTFS can advance the MFT record sequence more than once after a
+            // deletion has been journaled, especially when the segment is touched by
+            // subsequent metadata operations before recovery runs. Retry the exact
+            // segment without strict sequence/base checks, but accept it only when:
+            //   1. the sequence advanced forward by a small bounded amount,
+            //   2. the record is still a non-directory deleted FILE record,
+            //   3. the retained $FILE_NAME identifies the expected filename/parent, and
+            //   4. the retained FILE_NAME timestamp is close to the original USN delete.
+            //
+            // This is deliberately stronger than accepting an arbitrary sequence change
+            // because an unrelated reused MFT generation could otherwise be mistaken for
+            // the deleted file.
+            const ushort maxDeleteSequenceAdvance = 8;
+
             var relaxedRecord = ReadMftRecordByExtentMap(
                 rawMftVolumeHandle,
                 volumeInfo,
@@ -1426,25 +1431,29 @@ public sealed class NtfsMftDataReader
                 var actualSequence = BinaryPrimitives.ReadUInt16LittleEndian(
                     relaxedRecord.AsSpan(16, 2));
 
-                var expectedNextSequence =
-                    sequenceNumber == ushort.MaxValue
-                        ? (ushort)1
-                        : (ushort)(sequenceNumber + 1);
+                var sequenceAdvance = CalculateForwardSequenceAdvance(
+                    sequenceNumber,
+                    actualSequence);
 
-                if (sequenceNumber != 0 &&
-                    actualSequence == expectedNextSequence &&
+                var fileNameMatch = sequenceNumber != 0 &&
+                    sequenceAdvance > 0 &&
+                    sequenceAdvance <= maxDeleteSequenceAdvance &&
                     HasMatchingFileNameEntry(
                         rawMftVolumeHandle,
                         relaxedRecord,
                         expectedFileName,
                         expectedParentFileReferenceNumber.Value,
                         expectedFullPath,
-                        expectedSequenceNumber: sequenceNumber))
+                        expectedSequenceNumber: sequenceNumber,
+                        expectedDeletedAtUtc: expectedDeletedAtUtc);
+
+                if (fileNameMatch)
                 {
                     System.Diagnostics.Trace.WriteLine(
-                        $"NTFS $DATA lookup: accepted delete-transition MFT record " +
+                        $"NTFS $DATA lookup: accepted bounded delete-transition MFT record " +
                         $"for fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
-                        $"expectedSequence={sequenceNumber}, actualSequence={actualSequence}.");
+                        $"expectedSequence={sequenceNumber}, actualSequence={actualSequence}, " +
+                        $"sequenceAdvance={sequenceAdvance}, maxAdvance={maxDeleteSequenceAdvance}.");
                     record = relaxedRecord;
                 }
                 else
@@ -1453,7 +1462,9 @@ public sealed class NtfsMftDataReader
                         $"NTFS $DATA lookup: rejected relaxed MFT record for " +
                         $"fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
                         $"expectedSequence={sequenceNumber}, actualSequence={actualSequence}, " +
-                        $"expectedName={expectedFileName}, expectedParent={expectedParentFileReferenceNumber}.");
+                        $"sequenceAdvance={sequenceAdvance}, maxAdvance={maxDeleteSequenceAdvance}, " +
+                        $"expectedName={expectedFileName}, expectedParent={expectedParentFileReferenceNumber}, " +
+                        $"deletedAt={expectedDeletedAtUtc:O}.");
                 }
             }
         }
@@ -2561,7 +2572,8 @@ public sealed class NtfsMftDataReader
         string expectedFileName,
         ulong expectedParentFileReferenceNumber,
         string? expectedFullPath,
-        ushort expectedSequenceNumber = 0)
+        ushort expectedSequenceNumber = 0,
+        DateTime expectedDeletedAtUtc = default)
     {
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(
             record.AsSpan(22, 2));
@@ -2636,7 +2648,47 @@ public sealed class NtfsMftDataReader
 
             if (parentReference == expectedParentFileReferenceNumber)
             {
-                return true;
+                if (expectedDeletedAtUtc == default)
+                {
+                    return true;
+                }
+
+                var modificationTimeFileTime =
+                    BinaryPrimitives.ReadInt64LittleEndian(
+                        record.AsSpan(valueStart + 16, sizeof(long)));
+
+                DateTime modificationTimeUtc;
+                try
+                {
+                    modificationTimeUtc =
+                        DateTime.FromFileTimeUtc(modificationTimeFileTime);
+                }
+                catch
+                {
+                    modificationTimeUtc = DateTime.MinValue;
+                }
+
+                var timestampDeltaMinutes =
+                    modificationTimeUtc == DateTime.MinValue
+                        ? double.MaxValue
+                        : Math.Abs(
+                            (modificationTimeUtc - expectedDeletedAtUtc).TotalMinutes);
+
+                if (timestampDeltaMinutes <= 5)
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS FILE_NAME match: name={name}, parentRef={parentReference}, " +
+                        $"modifiedAt={modificationTimeUtc:O}, " +
+                        $"deleteAt={expectedDeletedAtUtc:O}, " +
+                        $"deltaMinutes={timestampDeltaMinutes:0.###}.");
+                    return true;
+                }
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS FILE_NAME rejected by timestamp: name={name}, " +
+                    $"parentRef={parentReference}, modifiedAt={modificationTimeUtc:O}, " +
+                    $"deleteAt={expectedDeletedAtUtc:O}, " +
+                    $"deltaMinutes={timestampDeltaMinutes:0.###}.");
             }
 
             // The USN parent reference can become stale after the parent
@@ -2677,6 +2729,21 @@ public sealed class NtfsMftDataReader
         }
 
         return false;
+    }
+
+    private static ushort CalculateForwardSequenceAdvance(
+        ushort expectedSequence,
+        ushort actualSequence)
+    {
+        if (expectedSequence == 0 ||
+            actualSequence == 0)
+        {
+            return 0;
+        }
+
+        return actualSequence >= expectedSequence
+            ? (ushort)(actualSequence - expectedSequence)
+            : (ushort)(ushort.MaxValue - expectedSequence + actualSequence + 1);
     }
 
     private static string? GetNtfsVolumeRoot(string path)
