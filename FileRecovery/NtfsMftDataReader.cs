@@ -1308,7 +1308,8 @@ public sealed class NtfsMftDataReader
         ulong fileReferenceNumber,
         string? expectedFileName = null,
         ulong? expectedParentFileReferenceNumber = null,
-        string? expectedFullPath = null)
+        string? expectedFullPath = null,
+        DateTime expectedDeletedAtUtc = default)
     {
         var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
         var sequenceNumber = (ushort)(fileReferenceNumber >> 48);
