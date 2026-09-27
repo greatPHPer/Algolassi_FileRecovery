@@ -204,143 +204,26 @@ public sealed class UsnJournalMonitor : IDisposable
                 "Historical deleted-file scanning currently supports NTFS volumes only.");
         }
 
-        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
-        using var volumeHandle = CreateFile(
-            $@"\\.\{volumeKey[..2]}",
-            GenericRead,
-            FileShareRead | FileShareWrite | FileShareDelete,
-            IntPtr.Zero,
-            OpenExisting,
-            FileFlagBackupSemantics,
-            IntPtr.Zero);
+        // Use the existing MFT enumerator instead of replaying the entire USN
+        // journal. FSCTL_ENUM_USN_DATA walks current MFT records and ScanInternal
+        // already filters deleted FILE records by directory/path. This also avoids
+        // inventing an arbitrary StartUsn and avoids accumulating the full historical
+        // USN journal in memory.
+        var scanner = new MftCandidateScanner();
+        var candidates = scanner.ScanDeletedDirectory(
+            root,
+            fullDirectory,
+            includeSubdirectories,
+            cancellationToken);
 
-        if (volumeHandle.IsInvalid)
-        {
-            throw new Win32Exception(
-                Marshal.GetLastWin32Error(),
-                $"Could not open NTFS volume {root}.");
-        }
-
-        if (!TryQueryJournal(volumeHandle, out var journal, out var queryError))
-        {
-            if (queryError == ErrorJournalNotActive ||
-                queryError == ErrorFileNotFound)
-            {
-                return [];
-            }
-
-            throw new Win32Exception(
-                queryError,
-                $"Could not query the NTFS USN journal for {root}.");
-        }
-
-        var normalizedDirectory = NormalizePath(fullDirectory)
-            .TrimEnd(Path.DirectorySeparatorChar);
-
-        var parentPathCache = new Dictionary<ulong, string?>();
-        var latestDeletes = new Dictionary<ulong, UsnRecord>();
-        var results = new List<UsnDeletedFileRecord>();
-
-        // Do not manufacture a USN by subtracting an arbitrary byte/count window
-        // from journal.NextUsn. FSCTL_READ_USN_JOURNAL requires a nonzero StartUsn
-        // to identify an actual journal-record position; an arbitrary value can fail
-        // with ERROR_INVALID_PARAMETER (87).
-        //
-        // The background monitor already persists a valid cursor returned by
-        // FSCTL_READ_USN_JOURNAL. Reuse that cursor when it belongs to the current
-        // journal instance. This keeps the on-demand scan bounded to records the
-        // monitor has not yet consumed while avoiding an invalid seek or an
-        // unbounded replay of the entire journal.
-        var nextUsn = journal.NextUsn;
-        var startSource = "journal tail (no persisted cursor)";
-
-        if (_settings.UsnCursors.TryGetValue(volumeKey, out var persistedCursor) &&
-            persistedCursor.JournalId == journal.JournalId &&
-            persistedCursor.NextUsn >= journal.FirstUsn &&
-            persistedCursor.NextUsn <= journal.NextUsn)
-        {
-            nextUsn = persistedCursor.NextUsn;
-            startSource = "persisted monitor cursor";
-        }
-
-        System.Diagnostics.Debug.WriteLine(
-            $"Historical directory USN scan: volume={volumeKey}, " +
-            $"journalRange={nextUsn:N0}..{journal.NextUsn:N0}, " +
-            $"startSource={startSource}.");
-
-        while (!cancellationToken.IsCancellationRequested &&
-               nextUsn < journal.NextUsn)
-        {
-            var records = ReadRecords(
-                volumeHandle,
-                journal.JournalId,
-                nextUsn,
-                out var returnedNextUsn);
-
-            if (returnedNextUsn <= nextUsn)
-            {
-                break;
-            }
-
-            foreach (var record in records)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                if ((record.Reason & UsnReasonFileDelete) == 0 ||
-                    (record.FileAttributes & FileAttributeDirectory) != 0 ||
-                    string.IsNullOrWhiteSpace(record.FileName))
-                {
-                    continue;
-                }
-
-                // NTFS can reuse an MFT file-reference number after a record is
-                // deleted. The journal is read in chronological order, so the
-                // latest delete event for a given file reference is the one that
-                // can still match the record's current MFT sequence number.
-                latestDeletes[record.FileReferenceNumber] = record;
-            }
-
-            nextUsn = returnedNextUsn;
-        }
-
-        foreach (var record in latestDeletes.Values)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (!parentPathCache.TryGetValue(
-                    record.ParentFileReferenceNumber,
-                    out var directoryPath))
-            {
-                directoryPath = ResolveParentDirectory(
-                    volumeHandle,
-                    record.ParentFileReferenceNumber);
-
-                parentPathCache[record.ParentFileReferenceNumber] = directoryPath;
-            }
-
-            if (!MatchesDirectory(
-                    directoryPath,
-                    normalizedDirectory,
-                    includeSubdirectories))
-            {
-                continue;
-            }
-
-            var fullPath = string.IsNullOrWhiteSpace(directoryPath)
-                ? record.FileName
-                : Path.Combine(directoryPath, record.FileName);
-
-            results.Add(new UsnDeletedFileRecord(
-                NormalizePath(fullPath),
-                record.FileReferenceNumber,
-                record.ParentFileReferenceNumber,
-                record.FileName,
-                directoryPath ?? string.Empty,
-                record.TimestampUtc));
-        }
-
-        return results
-            .OrderByDescending(record => record.DeletedAtUtc)
+        return candidates
+            .Select(candidate => new UsnDeletedFileRecord(
+                NormalizePath(candidate.FullPath),
+                candidate.FileReferenceNumber,
+                candidate.ParentFileReferenceNumber,
+                candidate.Name,
+                candidate.DirectoryPath ?? string.Empty,
+                candidate.LastUsnTimestampUtc))
             .ToList();
     }
 
