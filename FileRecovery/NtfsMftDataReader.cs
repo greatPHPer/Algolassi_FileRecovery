@@ -1211,16 +1211,89 @@ public sealed class NtfsMftDataReader
                             offset >= pageStart + clientDataStart &&
                             offset + referenceBytes.Length <= pageStart + clientDataEnd);
 
+                    var redoOperation =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            pageBuffer.AsSpan(clientDataStart, 2));
+
+                    var undoOperation =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            pageBuffer.AsSpan(clientDataStart + 2, 2));
+
+                    // UpdateMappingPairs carries historical VCN-to-LCN mapping
+                    // information for a nonresident attribute. When a target
+                    // filename/reference is found on the same log page, inspect
+                    // these records even when the target reference is not itself
+                    // present in the mapping-pairs client data. Diagnostic only:
+                    // this does not relax MFT sequence validation or enable carving.
+                    if (redoOperation == 0x09 &&
+                        clientDataLength >= 32)
+                    {
+                        var mappingTargetAttribute =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 12, 2));
+
+                        var mappingLcnsToFollow =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 14, 2));
+
+                        var mappingRecordTargetOffset =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 16, 2));
+
+                        var mappingAttributeTargetOffset =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 18, 2));
+
+                        var mappingClusterBlockOffset =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 20, 2));
+
+                        var mappingTargetVcn =
+                            BinaryPrimitives.ReadInt64LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 24, 8));
+
+                        var mappingRedoOffset =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 4, 2));
+
+                        var mappingRedoLength =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 6, 2));
+
+                        var mappingRedoStart =
+                            checked(clientDataStart + mappingRedoOffset);
+
+                        var mappingRedoEnd = Math.Min(
+                            clientDataEnd,
+                            checked(mappingRedoStart + mappingRedoLength));
+
+                        var mappingRedoBytes = mappingRedoStart < mappingRedoEnd
+                            ? Convert.ToHexString(
+                                pageBuffer.AsSpan(
+                                    mappingRedoStart,
+                                    Math.Min(64, mappingRedoEnd - mappingRedoStart)))
+                            : string.Empty;
+
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS $LogFile MAPPING PAIRS: " +
+                            $"interestingPage={pageNumber:N0}, " +
+                            $"recordOffset={recordOffset}, " +
+                            $"LSN=0x{thisLsn:X16}, " +
+                            $"containsTargetReference={containsReference}, " +
+                            $"containsTargetFilename={containsFilename}, " +
+                            $"targetAttribute={mappingTargetAttribute}, " +
+                            $"lcnsToFollow={mappingLcnsToFollow}, " +
+                            $"recordTargetOffset={mappingRecordTargetOffset}, " +
+                            $"attributeTargetOffset={mappingAttributeTargetOffset}, " +
+                            $"clusterBlockOffset={mappingClusterBlockOffset}, " +
+                            $"targetVcn={mappingTargetVcn}, " +
+                            $"redoOffset={mappingRedoOffset}, " +
+                            $"redoLength={mappingRedoLength}, " +
+                            $"redoHex={mappingRedoBytes}.");
+                    }
+
                     if (containsFilename || containsReference)
                     {
-                        var redoOperation =
-                            BinaryPrimitives.ReadUInt16LittleEndian(
-                                pageBuffer.AsSpan(clientDataStart, 2));
-
-                        var undoOperation =
-                            BinaryPrimitives.ReadUInt16LittleEndian(
-                                pageBuffer.AsSpan(clientDataStart + 2, 2));
-
                         var redoOffset =
                             BinaryPrimitives.ReadUInt16LittleEndian(
                                 pageBuffer.AsSpan(clientDataStart + 4, 2));
