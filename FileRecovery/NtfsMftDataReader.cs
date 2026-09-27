@@ -1323,17 +1323,37 @@ public sealed class NtfsMftDataReader
         var relativeMftOffset = checked(
             (long)segmentNumber * volumeInfo.BytesPerFileRecordSegment);
 
-        if (relativeMftOffset < 0 ||
-            relativeMftOffset + volumeInfo.BytesPerFileRecordSegment > volumeInfo.MftValidDataLength)
+        if (relativeMftOffset < 0)
         {
-            return NotFound("The deleted file's MFT segment is outside the current valid MFT range.");
+            return NotFound("The deleted file's MFT segment offset is invalid.");
         }
 
-        System.Diagnostics.Debug.WriteLine(
+        var recordEndOffset = checked(
+            relativeMftOffset + volumeInfo.BytesPerFileRecordSegment);
+
+        var outsideCurrentValidLength =
+            recordEndOffset > volumeInfo.MftValidDataLength;
+
+        System.Diagnostics.Trace.WriteLine(
             $"NTFS $DATA lookup: fileRef={fileReferenceNumber}, " +
             $"segment={segmentNumber}, sequence={sequenceNumber}, " +
             $"recordSize={volumeInfo.BytesPerFileRecordSegment}, " +
-            $"mftValidLength={volumeInfo.MftValidDataLength}.");
+            $"mftValidLength={volumeInfo.MftValidDataLength}, " +
+            $"recordOffset={relativeMftOffset}, " +
+            $"outsideCurrentValidLength={outsideCurrentValidLength}.");
+
+        // A retained USN deletion can refer to a record just beyond the current
+        // MFT valid-data length after the MFT has contracted. Do not discard an
+        // exact historical file reference here. ReadMftRecordByExtentMap()
+        // validates the physical/mapped extent availability and the exact
+        // sequence/base reference before the record is accepted.
+        if (outsideCurrentValidLength)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $DATA lookup: attempting extent-map read beyond current " +
+                $"MFT valid length for historical fileRef={fileReferenceNumber}, " +
+                $"segment={segmentNumber}.");
+        }
 
         // FSCTL_GET_NTFS_FILE_RECORD ignores the sequence-number portion of the
         // file reference and only returns an in-use record at or below the requested
