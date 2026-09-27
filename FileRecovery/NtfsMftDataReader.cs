@@ -919,6 +919,7 @@ public sealed class NtfsMftDataReader
             long scannedBytes = 0;
             var nameMatches = 0;
             var nearbyReferenceMatches = 0;
+            var rawReferenceMatches = 0;
             var reportedCandidates = 0;
             var logicalFileOffset = 0L;
 
@@ -936,12 +937,13 @@ public sealed class NtfsMftDataReader
                         checked(extent.ClusterCount * (long)volumeInfo.BytesPerCluster),
                         remainingBudget));
 
+                const int diagnosticChunkSize = 4 * 1024 * 1024;
                 long extentOffset = 0;
                 while (extentOffset < extentBytes &&
                        remainingBudget > 0)
                 {
                     var chunkBytes = Math.Min(
-                        buffer.LongLength,
+                        diagnosticChunkSize,
                         Math.Min(
                             extentBytes - extentOffset,
                             remainingBudget));
@@ -1020,7 +1022,7 @@ public sealed class NtfsMftDataReader
                                 expectedReferenceBytes.Length)
                             .SequenceEqual(expectedReferenceBytes))
                         {
-                            referenceMatches++;
+                            rawReferenceMatches++;
                         }
                     }
 
@@ -1035,8 +1037,8 @@ public sealed class NtfsMftDataReader
                 $"NTFS $LogFile diagnostic summary: fileRef={fileReferenceNumber}, " +
                 $"name={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
                 $"logFileSize={logFileStream.FileSizeBytes:N0}, scanned={scannedBytes:N0}, " +
-                $"filenameMatches={nameMatches}, nearbyReferenceMatches={nearbyReferenceMatches}, " +
-            $"rawReferenceMatches={referenceMatches}.");
+                    $"filenameMatches={nameMatches}, nearbyReferenceMatches={nearbyReferenceMatches}, " +
+                $"rawReferenceMatches={rawReferenceMatches}.");
         }
         catch (Exception ex)
         {
