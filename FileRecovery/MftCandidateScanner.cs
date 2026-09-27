@@ -71,7 +71,9 @@ public sealed class MftCandidateScanner
         CancellationToken cancellationToken = default,
         long maxBytesToScan = 512L * 1024L * 1024L,
         IProgress<long>? progress = null,
-        IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, DateTime DeletedAtUtc)>? targetReferences = null)
+        IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, DateTime DeletedAtUtc)>? targetReferences = null,
+        string? targetDirectory = null,
+        bool includeSubdirectories = false)
     {
         ArgumentNullException.ThrowIfNull(targetPaths);
 
@@ -87,7 +89,12 @@ public sealed class MftCandidateScanner
             .Select(NormalizePath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        if (normalizedTargets.Count == 0)
+        var normalizedTargetDirectory = string.IsNullOrWhiteSpace(targetDirectory)
+            ? null
+            : NormalizePath(Path.GetFullPath(targetDirectory));
+
+        if (normalizedTargets.Count == 0 &&
+            normalizedTargetDirectory is null)
         {
             return [];
         }
@@ -299,7 +306,25 @@ public sealed class MftCandidateScanner
                     string? matchingTarget = null;
                     string? matchingEvidence = null;
 
-                    if (sameNameTargets is not null)
+                    if (normalizedTargetDirectory is not null)
+                    {
+                        currentDirectoryPath = NtfsParentPathResolver.Resolve(
+                            volumeHandle,
+                            entry.ParentFileReferenceNumber) ?? string.Empty;
+
+                        if (IsDirectoryMatch(
+                                currentDirectoryPath,
+                                normalizedTargetDirectory,
+                                includeSubdirectories))
+                        {
+                            directoryPath = currentDirectoryPath;
+                            matchingTarget = NormalizePath(
+                                Path.Combine(directoryPath, entry.Name));
+                            matchingEvidence =
+                                "Retained deleted MFT record matched the requested directory.";
+                        }
+                    }
+                    else if (sameNameTargets is not null)
                     {
                         targetNameMatchCount++;
 
@@ -561,6 +586,30 @@ public sealed class MftCandidateScanner
             includeSubdirectories: includeSubdirectories,
             cancellationToken: cancellationToken,
             maxPages: maxPages);
+    }
+
+    public IReadOnlyList<RecoveryCandidate> ScanDeletedDirectoryFromRawMft(
+        string rootPath,
+        string targetDirectory,
+        bool includeSubdirectories,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(targetDirectory))
+        {
+            throw new ArgumentException(
+                "A target directory is required.",
+                nameof(targetDirectory));
+        }
+
+        return ScanRawMftForPathsAsync(
+                rootPath,
+                [],
+                cancellationToken,
+                maxBytesToScan: long.MaxValue,
+                targetDirectory: targetDirectory,
+                includeSubdirectories: includeSubdirectories)
+            .GetAwaiter()
+            .GetResult();
     }
 
     public IReadOnlyList<RecoveryCandidate> ScanForFileReferences(
