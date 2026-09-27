@@ -240,7 +240,22 @@ public sealed class UsnJournalMonitor : IDisposable
         var parentPathCache = new Dictionary<ulong, string?>();
         var latestDeletes = new Dictionary<ulong, UsnRecord>();
         var results = new List<UsnDeletedFileRecord>();
-        var nextUsn = journal.FirstUsn;
+
+        // A directory scan is intended to surface recent deletions for recovery,
+        // not reconstruct the entire lifetime of a large NTFS USN journal. Starting
+        // at FirstUsn can enumerate millions of historical records and consume very
+        // large amounts of memory while delaying the actual deleted-file scan.
+        // Restrict this on-demand scan to the same bounded recent-journal window used
+        // by recovery-time journal lookups elsewhere in this monitor.
+        const long recentUsnWindow = 10_000_000;
+        var nextUsn = Math.Max(
+            journal.FirstUsn,
+            journal.NextUsn - recentUsnWindow);
+
+        System.Diagnostics.Debug.WriteLine(
+            $"Historical directory USN scan: volume={volumeKey}, " +
+            $"journalRange={nextUsn:N0}..{journal.NextUsn:N0}, " +
+            $"window={recentUsnWindow:N0} USN.");
 
         while (!cancellationToken.IsCancellationRequested &&
                nextUsn < journal.NextUsn)
