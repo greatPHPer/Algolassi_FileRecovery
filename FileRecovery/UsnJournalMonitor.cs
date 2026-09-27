@@ -204,13 +204,11 @@ public sealed class UsnJournalMonitor : IDisposable
                 "Historical deleted-file scanning currently supports NTFS volumes only.");
         }
 
-        // Use the existing MFT enumerator instead of replaying the entire USN
-        // journal. FSCTL_ENUM_USN_DATA walks current MFT records and ScanInternal
-        // already filters deleted FILE records by directory/path. This also avoids
-        // inventing an arbitrary StartUsn and avoids accumulating the full historical
-        // USN journal in memory.
+        // Use the extent-aware raw logical $MFT reader for directory discovery.
+        // This avoids FSCTL_ENUM_USN_DATA, which is failing on this volume, and
+        // can discover deletions that predate the current AlgoLassi session.
         var scanner = new MftCandidateScanner();
-        var candidates = scanner.ScanDeletedDirectory(
+        var candidates = scanner.ScanDeletedDirectoryFromRawMft(
             root,
             fullDirectory,
             includeSubdirectories,
