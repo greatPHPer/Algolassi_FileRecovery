@@ -1106,7 +1106,7 @@ public sealed class NtfsMftDataReader
 
             foreach (var interestingOffset in interestingOffsets)
             {
-                var pageNumber = filenameOffset / logPageSize;
+                var pageNumber = interestingOffset / logPageSize;
                 var pageStart = checked(pageNumber * logPageSize);
                 var pageBuffer = new byte[logPageSize];
 
@@ -1121,7 +1121,7 @@ public sealed class NtfsMftDataReader
                 {
                     System.Diagnostics.Trace.WriteLine(
                         $"NTFS $LogFile parser: could not read page for " +
-                        $"filenameOffset={filenameOffset:N0}, page={pageNumber:N0}, " +
+                        $"interestingOffset={interestingOffset:N0}, page={pageNumber:N0}, " +
                         $"read={bytesRead:N0}/{pageBuffer.Length:N0}.");
                     continue;
                 }
@@ -1326,7 +1326,7 @@ public sealed class NtfsMftDataReader
                             $"matchBy={(containsFilename ? "filename" : "")}" +
                             $"{(containsFilename && containsReference ? "+" : "")}" +
                             $"{(containsReference ? "fileReference" : "")}, " +
-                            $"filenameOffset={filenameOffset:N0}, " +
+                            $"interestingOffset={interestingOffset:N0}, " +
                             $"page={pageNumber:N0}, " +
                             $"recordOffset={recordOffset}, " +
                             $"LSN=0x{thisLsn:X16}, " +
