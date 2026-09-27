@@ -1018,6 +1018,7 @@ public sealed class NtfsMftDataReader
                 $"targetSegment={fileReferenceNumber & 0x0000FFFFFFFFFFFFUL}.");
 
             var filenameOffsets = new List<long>();
+            var referenceOffsets = new List<long>();
             var scannedBytes = 0L;
             var remainingBudget = Math.Min(
                 Math.Max(0, logFileStream.FileSizeBytes),
@@ -1065,13 +1066,20 @@ public sealed class NtfsMftDataReader
                         chunk,
                         0);
 
+                    var absoluteChunkOffset =
+                        checked(scannedBytes + extentOffset);
+
                     CollectPatternOffsets(
                         chunk,
                         nameBytes,
-                        checked(
-                            scannedBytes +
-                            extentOffset),
+                        absoluteChunkOffset,
                         filenameOffsets);
+
+                    CollectPatternOffsets(
+                        chunk,
+                        referenceBytes,
+                        absoluteChunkOffset,
+                        referenceOffsets);
 
                     extentOffset += chunkLength;
                     remainingBudget -= chunkLength;
@@ -1083,12 +1091,20 @@ public sealed class NtfsMftDataReader
 
             System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile parser: filenameOccurrences={filenameOffsets.Count}, " +
+                $"fileReferenceOccurrences={referenceOffsets.Count}, " +
                 $"scanned={scannedBytes:N0}.");
 
             var parsedRecords = 0;
             var matchingRecords = 0;
+            var referenceMatchingRecords = 0;
 
-            foreach (var filenameOffset in filenameOffsets)
+            var interestingOffsets = filenameOffsets
+                .Concat(referenceOffsets)
+                .Distinct()
+                .OrderBy(offset => offset)
+                .ToArray();
+
+            foreach (var interestingOffset in interestingOffsets)
             {
                 var pageNumber = filenameOffset / logPageSize;
                 var pageStart = checked(pageNumber * logPageSize);
@@ -1144,8 +1160,13 @@ public sealed class NtfsMftDataReader
                     nextRecordOffset = checked((ushort)pageBuffer.Length);
                 }
 
+                var pageRelativeInterestingOffset =
+                    checked((int)(interestingOffset - pageStart));
+
                 var pageRelativeFilenameOffset =
-                    checked((int)(filenameOffset - pageStart));
+                    filenameOffsets.Contains(interestingOffset)
+                        ? pageRelativeInterestingOffset
+                        : -1;
 
                 var recordOffset = logPageDataOffset;
 
@@ -1185,7 +1206,12 @@ public sealed class NtfsMftDataReader
                         pageRelativeFilenameOffset >= clientDataStart &&
                         pageRelativeFilenameOffset + nameBytes.Length <= clientDataEnd;
 
-                    if (containsFilename)
+                    var containsReference =
+                        referenceOffsets.Any(offset =>
+                            offset >= pageStart + clientDataStart &&
+                            offset + referenceBytes.Length <= pageStart + clientDataEnd);
+
+                    if (containsFilename || containsReference)
                     {
                         var redoOperation =
                             BinaryPrimitives.ReadUInt16LittleEndian(
@@ -1284,10 +1310,22 @@ public sealed class NtfsMftDataReader
                             : $"openAttributeIndex={targetAttribute}";
 
                         parsedRecords++;
-                        matchingRecords++;
+
+                        if (containsFilename)
+                        {
+                            matchingRecords++;
+                        }
+
+                        if (containsReference && !containsFilename)
+                        {
+                            referenceMatchingRecords++;
+                        }
 
                         System.Diagnostics.Trace.WriteLine(
                             $"NTFS $LogFile TARGET RECORD: " +
+                            $"matchBy={(containsFilename ? "filename" : "")}" +
+                            $"{(containsFilename && containsReference ? "+" : "")}" +
+                            $"{(containsReference ? "fileReference" : "")}, " +
                             $"filenameOffset={filenameOffset:N0}, " +
                             $"page={pageNumber:N0}, " +
                             $"recordOffset={recordOffset}, " +
@@ -1308,6 +1346,31 @@ public sealed class NtfsMftDataReader
                             $"expectedTargetMftVcn={expectedTargetMftVcn}, " +
                             $"targetMftOffset={targetMftOffset}, " +
                             $"targetVcnMatches={targetVcnMatches}.");
+
+                        if (containsReference && !containsFilename)
+                        {
+                            var referenceMatchOffset =
+                                referenceOffsets
+                                    .Where(offset =>
+                                        offset >= pageStart + clientDataStart &&
+                                        offset + referenceBytes.Length <= pageStart + clientDataEnd)
+                                    .Select(offset =>
+                                        checked((int)(offset - (pageStart + clientDataStart))))
+                                    .FirstOrDefault(-1);
+
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS $LogFile REFERENCE MATCH: " +
+                                $"referenceOffsetInClientData={referenceMatchOffset}, " +
+                                $"fileRef={fileReferenceNumber}, " +
+                                $"targetSegment={targetSegment}, " +
+                                $"redo={operationName(redoOperation)}, " +
+                                $"undo={operationName(undoOperation)}, " +
+                                $"targetAttribute={targetAttribute}, " +
+                                $"targetVcn={targetVcn}, " +
+                                $"recordTargetOffset={recordTargetOffset}, " +
+                                $"attributeTargetOffset={attributeTargetOffset}, " +
+                                $"clusterBlockOffset={clusterBlockOffset}.");
+                        }
 
                         if (redoOffset >= recordHeaderLength &&
                             redoOffset + redoLength <= clientDataLength)
@@ -1351,7 +1414,9 @@ public sealed class NtfsMftDataReader
                 $"name={expectedFileName}, " +
                 $"parentRef={expectedParentFileReferenceNumber}, " +
                 $"filenameOccurrences={filenameOffsets.Count}, " +
+                $"fileReferenceOccurrences={referenceOffsets.Count}, " +
                 $"recordsContainingFilename={matchingRecords}, " +
+                $"recordsContainingReference={referenceMatchingRecords}, " +
                 $"recordsParsed={parsedRecords}.");
         }
         catch (Exception ex)
