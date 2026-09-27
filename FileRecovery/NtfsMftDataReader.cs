@@ -918,7 +918,7 @@ public sealed class NtfsMftDataReader
 
             long scannedBytes = 0;
             var nameMatches = 0;
-            var referenceMatches = 0;
+            var nearbyReferenceMatches = 0;
             var reportedCandidates = 0;
             var logicalFileOffset = 0L;
 
@@ -935,10 +935,6 @@ public sealed class NtfsMftDataReader
                     Math.Min(
                         checked(extent.ClusterCount * (long)volumeInfo.BytesPerCluster),
                         remainingBudget));
-
-                var buffer = new byte[checked((int)Math.Min(
-                    extentBytes,
-                    4L * 1024 * 1024))];
 
                 long extentOffset = 0;
                 while (extentOffset < extentBytes &&
@@ -1012,11 +1008,6 @@ public sealed class NtfsMftDataReader
                             $"FILE={fileInWindow}, RCRD={rcrdInWindow}, " +
                             $"ops={opcodeSummary}.");
 
-                        if (referenceInWindow)
-                        {
-                            referenceMatches++;
-                        }
-
                         reportedCandidates++;
                     }
 
@@ -1044,7 +1035,8 @@ public sealed class NtfsMftDataReader
                 $"NTFS $LogFile diagnostic summary: fileRef={fileReferenceNumber}, " +
                 $"name={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
                 $"logFileSize={logFileStream.FileSizeBytes:N0}, scanned={scannedBytes:N0}, " +
-                $"filenameMatches={nameMatches}, nearbyReferenceMatches={referenceMatches}.");
+                $"filenameMatches={nameMatches}, nearbyReferenceMatches={nearbyReferenceMatches}, " +
+            $"rawReferenceMatches={referenceMatches}.");
         }
         catch (Exception ex)
         {
