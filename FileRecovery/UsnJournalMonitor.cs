@@ -204,25 +204,177 @@ public sealed class UsnJournalMonitor : IDisposable
                 "Historical deleted-file scanning currently supports NTFS volumes only.");
         }
 
-        // Use the extent-aware raw logical $MFT reader for directory discovery.
-        // This avoids FSCTL_ENUM_USN_DATA, which is failing on this volume, and
-        // can discover deletions that predate the current AlgoLassi session.
-        var scanner = new MftCandidateScanner();
-        var candidates = scanner.ScanDeletedDirectoryFromRawMft(
+        // Use the historical USN journal directly for directory discovery.
+        // FSCTL_ENUM_USN_DATA is failing on this volume, while READ_USN_JOURNAL
+        // can stream the retained delete records from FirstUsn to NextUsn.
+        // This also preserves deletions whose MFT record has already fallen
+        // outside the current MFT valid-data length.
+        return ScanDeletedDirectoryFromUsnJournal(
             root,
             fullDirectory,
             includeSubdirectories,
             cancellationToken);
+    }
 
-        return candidates
-            .Select(candidate => new UsnDeletedFileRecord(
-                NormalizePath(candidate.FullPath),
-                candidate.FileReferenceNumber,
-                candidate.ParentFileReferenceNumber,
-                candidate.Name,
-                candidate.DirectoryPath ?? string.Empty,
-                candidate.LastUsnTimestampUtc))
-            .ToList();
+    private IReadOnlyList<UsnDeletedFileRecord> ScanDeletedDirectoryFromUsnJournal(
+        string root,
+        string targetDirectory,
+        bool includeSubdirectories,
+        CancellationToken cancellationToken)
+    {
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+
+        using var volumeHandle = CreateFile(
+            $@"\\.\\{volumeKey[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (volumeHandle.IsInvalid)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        if (!TryQueryJournal(volumeHandle, out var journal, out var queryError))
+        {
+            throw new Win32Exception(
+                queryError,
+                $"Could not query the USN journal for {volumeKey}.");
+        }
+
+        var normalizedDirectory = NormalizePath(targetDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar);
+
+        var cache = _parentPathCaches.GetOrAdd(
+            volumeKey,
+            _ => new ConcurrentDictionary<ulong, string>());
+
+        var results = new List<UsnDeletedFileRecord>();
+        var seenReferences = new HashSet<ulong>();
+        var nextUsn = journal.FirstUsn;
+        var batchesRead = 0L;
+        var deleteRecordsSeen = 0L;
+        var parentResolutions = 0L;
+        var directoryMatches = 0L;
+
+        System.Diagnostics.Trace.WriteLine(
+            $"USN historical directory scan started: volume={volumeKey}, " +
+            $"targetDirectory={normalizedDirectory}, " +
+            $"includeSubdirectories={includeSubdirectories}, " +
+            $"firstUsn={journal.FirstUsn}, nextUsn={journal.NextUsn}, " +
+            $"journalId={journal.JournalId}.");
+
+        while (nextUsn < journal.NextUsn)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var records = ReadRecords(
+                volumeHandle,
+                journal.JournalId,
+                nextUsn,
+                out var returnedNextUsn,
+                UsnReasonFileDelete);
+
+            batchesRead++;
+
+            if (returnedNextUsn <= nextUsn)
+            {
+                break;
+            }
+
+            foreach (var record in records)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                    (record.FileAttributes & FileAttributeDirectory) != 0 ||
+                    string.IsNullOrWhiteSpace(record.FileName))
+                {
+                    continue;
+                }
+
+                deleteRecordsSeen++;
+
+                var directory = cache.TryGetValue(
+                    record.ParentFileReferenceNumber,
+                    out var knownDirectory)
+                    ? knownDirectory
+                    : null;
+
+                if (string.IsNullOrWhiteSpace(directory))
+                {
+                    directory = ResolveParentDirectory(
+                        volumeHandle,
+                        record.ParentFileReferenceNumber);
+
+                    parentResolutions++;
+
+                    if (!string.IsNullOrWhiteSpace(directory))
+                    {
+                        cache[record.ParentFileReferenceNumber] = directory;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(directory) ||
+                    !MatchesDirectory(
+                        directory,
+                        normalizedDirectory,
+                        includeSubdirectories))
+                {
+                    continue;
+                }
+
+                if (!seenReferences.Add(record.FileReferenceNumber))
+                {
+                    continue;
+                }
+
+                directoryMatches++;
+
+                var fullPath = NormalizePath(
+                    Path.Combine(directory, record.FileName));
+
+                results.Add(
+                    new UsnDeletedFileRecord(
+                        fullPath,
+                        record.FileReferenceNumber,
+                        record.ParentFileReferenceNumber,
+                        record.FileName,
+                        directory,
+                        record.TimestampUtc));
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"USN historical directory MATCH #{directoryMatches}: " +
+                    $"path={fullPath}, fileRef={record.FileReferenceNumber}, " +
+                    $"parentRef={record.ParentFileReferenceNumber}, " +
+                    $"deleteTime={record.TimestampUtc:O}.");
+            }
+
+            nextUsn = returnedNextUsn;
+
+            if (batchesRead == 1 || batchesRead % 16 == 0)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"USN historical directory scan progress: batches={batchesRead:N0}, " +
+                    $"nextUsn={nextUsn}, journalNext={journal.NextUsn}, " +
+                    $"deleteRecords={deleteRecordsSeen:N0}, " +
+                    $"parentResolutions={parentResolutions:N0}, " +
+                    $"directoryMatches={directoryMatches:N0}.");
+            }
+        }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"USN historical directory scan summary: batches={batchesRead:N0}, " +
+            $"deleteRecords={deleteRecordsSeen:N0}, " +
+            $"parentResolutions={parentResolutions:N0}, " +
+            $"directoryMatches={directoryMatches:N0}, " +
+            $"results={results.Count:N0}, nextUsn={nextUsn}, " +
+            $"journalNext={journal.NextUsn}.");
+
+        return results;
     }
 
     private static bool MatchesDirectory(
