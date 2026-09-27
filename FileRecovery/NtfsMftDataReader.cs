@@ -448,7 +448,6 @@ public sealed class NtfsMftDataReader
                 record.AsSpan(
                     valueOffset + fileNameFlagsOffset,
                     sizeof(uint)));
-
             if (realSize < 0 ||
                 allocatedSize < 0 ||
                 realSize > allocatedSize ||
@@ -897,8 +896,7 @@ public sealed class NtfsMftDataReader
             if (!logFileStream.Found ||
                 logFileStream.IsResident ||
                 logFileStream.Extents.Count == 0)
-            {
-                System.Diagnostics.Trace.WriteLine(
+            {                System.Diagnostics.Trace.WriteLine(
                     $"NTFS $LogFile parser: $LogFile mapping pairs unavailable. " +
                     $"found={logFileStream.Found}, resident={logFileStream.IsResident}, " +
                     $"extents={logFileStream.Extents.Count:N0}, evidence={logFileStream.Evidence}.");
@@ -1097,6 +1095,7 @@ public sealed class NtfsMftDataReader
             var parsedRecords = 0;
             var matchingRecords = 0;
             var referenceMatchingRecords = 0;
+            var targetAttributeIndexes = new HashSet<ushort>();
 
             var interestingOffsets = filenameOffsets
                 .Concat(referenceOffsets)
@@ -1317,6 +1316,11 @@ public sealed class NtfsMftDataReader
                             BinaryPrimitives.ReadUInt16LittleEndian(
                                 pageBuffer.AsSpan(clientDataStart + 12, 2));
 
+                        if (targetAttribute != 0)
+                        {
+                            targetAttributeIndexes.Add(targetAttribute);
+                        }
+
                         var lcnsToFollow =
                             BinaryPrimitives.ReadUInt16LittleEndian(
                                 pageBuffer.AsSpan(clientDataStart + 14, 2));
@@ -1347,8 +1351,7 @@ public sealed class NtfsMftDataReader
                                 0x06 => "DeleteAttribute",
                                 0x07 => "UpdateResidentValue",
                                 0x08 => "UpdateNonresidentValue",
-                                0x09 => "UpdateMappingPairs",
-                                0x0C => "AddIndexEntryRoot",
+                                0x09 => "UpdateMappingPairs",                                0x0C => "AddIndexEntryRoot",
                                 0x0D => "DeleteIndexEntryRoot",
                                 0x0E => "AddIndexEntryAllocation",
                                 0x0F => "DeleteIndexEntryAllocation",
@@ -1481,6 +1484,16 @@ public sealed class NtfsMftDataReader
                 }
             }
 
+            TraceGlobalMappingPairRecords(
+                volumeInfo,
+                volumeHandle,
+                logFileStream,
+                logPageSize,
+                logPageDataOffset,
+                recordHeaderLength,
+                targetAttributeIndexes,
+                maxDiagnosticBytes);
+
             System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile parser summary: " +
                 $"fileRef={fileReferenceNumber}, " +
@@ -1496,6 +1509,335 @@ public sealed class NtfsMftDataReader
         {
             System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile parser failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static void TraceGlobalMappingPairRecords(
+        NtfsVolumeInfo volumeInfo,
+        SafeFileHandle volumeHandle,
+        NtfsDataStreamInfo logFileStream,
+        int logPageSize,
+        int logPageDataOffset,
+        int recordHeaderLength,
+        IReadOnlySet<ushort> targetAttributeIndexes,
+        long maxDiagnosticBytes)
+    {
+        if (targetAttributeIndexes.Count == 0 ||
+            logPageSize <= 0 ||
+            logPageDataOffset < recordHeaderLength)
+        {
+            return;
+        }
+
+        try
+        {
+            var scanLength = Math.Min(
+                Math.Max(0, logFileStream.FileSizeBytes),
+                maxDiagnosticBytes);
+
+            const int scanChunkSize = 4 * 1024 * 1024;
+            const int maximumLoggedMatches = 200;
+
+            var mappingMatches = 0;
+            var stoppedAtMatchLimit = false;
+
+            for (long chunkOffset = 0;
+                 chunkOffset < scanLength &&
+                 !stoppedAtMatchLimit;)
+            {
+                var requestedChunkLength = checked((int)Math.Min(
+                    scanChunkSize,
+                    scanLength - chunkOffset));
+
+                requestedChunkLength -=
+                    requestedChunkLength % logPageSize;
+
+                if (requestedChunkLength <= 0)
+                {
+                    break;
+                }
+
+                var chunk = new byte[requestedChunkLength];
+
+                var bytesRead = ReadMappedFileBytes(
+                    volumeHandle,
+                    volumeInfo.BytesPerCluster,
+                    logFileStream.Extents,
+                    chunkOffset,
+                    chunk);
+
+                if (bytesRead < logPageSize)
+                {
+                    break;
+                }
+
+                var pageCount = bytesRead / logPageSize;
+
+                for (var pageIndex = 0;
+                     pageIndex < pageCount;
+                     pageIndex++)
+                {
+                    var pageFileOffset = checked(
+                        chunkOffset +
+                        pageIndex * (long)logPageSize);
+
+                    var pageBuffer = chunk.AsSpan(
+                            checked(pageIndex * logPageSize),
+                            logPageSize)
+                        .ToArray();
+
+                    try
+                    {
+                        ApplyUpdateSequenceFixups(
+                            pageBuffer,
+                            checked((int)volumeInfo.BytesPerSector));
+                    }
+                    catch
+                    {
+                        // Preserve the raw page if the fixup cannot be applied.
+                    }
+
+                    if (pageBuffer[0] != (byte)'R' ||
+                        pageBuffer[1] != (byte)'C' ||
+                        pageBuffer[2] != (byte)'R' ||
+                        pageBuffer[3] != (byte)'D')
+                    {
+                        continue;
+                    }
+
+                    var nextRecordOffset =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            pageBuffer.AsSpan(24, 2));
+
+                    if (nextRecordOffset <= logPageDataOffset ||
+                        nextRecordOffset > pageBuffer.Length)
+                    {
+                        nextRecordOffset = checked(
+                            (ushort)pageBuffer.Length);
+                    }
+
+                    for (var recordOffset = logPageDataOffset;
+                         recordOffset + recordHeaderLength <= nextRecordOffset;)
+                    {
+                        var clientDataLength =
+                            BinaryPrimitives.ReadUInt32LittleEndian(
+                                pageBuffer.AsSpan(recordOffset + 24, 4));
+
+                        if (clientDataLength < 8 ||
+                            clientDataLength >
+                            (uint)(nextRecordOffset -
+                                   recordOffset -
+                                   recordHeaderLength))
+                        {
+                            break;
+                        }
+
+                        var alignedRecordLength = Align8(
+                            recordHeaderLength +
+                            checked((int)clientDataLength));
+
+                        if (alignedRecordLength <= 0 ||
+                            recordOffset + alignedRecordLength >
+                            nextRecordOffset)
+                        {
+                            break;
+                        }
+
+                        var clientDataStart =
+                            checked(recordOffset + recordHeaderLength);
+
+                        var clientDataEnd =
+                            checked(
+                                clientDataStart +
+                                (int)clientDataLength);
+
+                        var redoOperation =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(
+                                    clientDataStart,
+                                    2));
+
+                        if (redoOperation == 0x09 &&
+                            clientDataLength >= 32)
+                        {
+                            var targetAttribute =
+                                BinaryPrimitives.ReadUInt16LittleEndian(
+                                    pageBuffer.AsSpan(
+                                        clientDataStart + 12,
+                                        2));
+
+                            if (targetAttributeIndexes.Contains(
+                                    targetAttribute))
+                            {
+                                var lcnsToFollow =
+                                    BinaryPrimitives.ReadUInt16LittleEndian(
+                                        pageBuffer.AsSpan(
+                                            clientDataStart + 14,
+                                            2));
+
+                                var recordTargetOffset =
+                                    BinaryPrimitives.ReadUInt16LittleEndian(
+                                        pageBuffer.AsSpan(
+                                            clientDataStart + 16,
+                                            2));
+
+                                var attributeTargetOffset =
+                                    BinaryPrimitives.ReadUInt16LittleEndian(
+                                        pageBuffer.AsSpan(
+                                            clientDataStart + 18,
+                                            2));
+
+                                var clusterBlockOffset =
+                                    BinaryPrimitives.ReadUInt16LittleEndian(
+                                        pageBuffer.AsSpan(
+                                            clientDataStart + 20,
+                                            2));
+
+                                var targetVcn =
+                                    BinaryPrimitives.ReadInt64LittleEndian(
+                                        pageBuffer.AsSpan(
+                                            clientDataStart + 24,
+                                            8));
+
+                                var redoOffset =
+                                    BinaryPrimitives.ReadUInt16LittleEndian(
+                                        pageBuffer.AsSpan(
+                                            clientDataStart + 4,
+                                            2));
+
+                                var redoLength =
+                                    BinaryPrimitives.ReadUInt16LittleEndian(
+                                        pageBuffer.AsSpan(
+                                            clientDataStart + 6,
+                                            2));
+
+                                var redoStart = checked(
+                                    clientDataStart + redoOffset);
+
+                                var redoEnd = Math.Min(
+                                    clientDataEnd,
+                                    checked(
+                                        redoStart + redoLength));
+
+                                var redoBytes =
+                                    redoStart < redoEnd
+                                        ? pageBuffer.AsSpan(
+                                            redoStart,
+                                            redoEnd - redoStart)
+                                        : ReadOnlySpan<byte>.Empty;
+
+                                var redoHex =
+                                    redoBytes.Length > 0
+                                        ? Convert.ToHexString(
+                                            redoBytes[..Math.Min(
+                                                64,
+                                                redoBytes.Length)])
+                                        : string.Empty;
+
+                                var decodedRuns = "(decode failed)";
+
+                                if (redoBytes.Length > 0)
+                                {
+                                    try
+                                    {
+                                        var extents =
+                                            NtfsMappingPairsParser.Parse(
+                                                redoBytes,
+                                                targetVcn);
+
+                                        decodedRuns = string.Join(
+                                            "; ",
+                                            extents
+                                                .Take(32)
+                                                .Select(extent =>
+                                                    $"VCN={extent.VirtualClusterNumber}+" +
+                                                    $"{extent.ClusterCount}" +
+                                                    $" -> LCN={extent.LogicalClusterNumber}"));
+
+                                        if (extents.Count > 32)
+                                        {
+                                            decodedRuns += "; ...";
+                                        }
+                                    }
+                                    catch (Exception decodeEx)
+                                    {
+                                        decodedRuns =
+                                            $"decode-error={decodeEx.GetType().Name}: " +
+                                            decodeEx.Message;
+                                    }
+                                }
+
+                                var lsn =
+                                    BinaryPrimitives.ReadUInt64LittleEndian(
+                                        pageBuffer.AsSpan(
+                                            recordOffset,
+                                            8));
+
+                                var pageNumber =
+                                    pageFileOffset / logPageSize;
+
+                                System.Diagnostics.Trace.WriteLine(
+                                    $"NTFS $LogFile GLOBAL MAPPING PAIRS: " +
+                                    $"page={pageNumber:N0}, " +
+                                    $"recordOffset={recordOffset}, " +
+                                    $"fileOffset={pageFileOffset + recordOffset:N0}, " +
+                                    $"LSN=0x{lsn:X16}, " +
+                                    $"targetAttribute={targetAttribute}, " +
+                                    $"lcnsToFollow={lcnsToFollow}, " +
+                                    $"recordTargetOffset={recordTargetOffset}, " +
+                                    $"attributeTargetOffset={attributeTargetOffset}, " +
+                                    $"clusterBlockOffset={clusterBlockOffset}, " +
+                                    $"targetVcn={targetVcn}, " +
+                                    $"redoOffset={redoOffset}, " +
+                                    $"redoLength={redoLength}, " +
+                                    $"redoHex={redoHex}, " +
+                                    $"decoded={decodedRuns}.");
+
+                                mappingMatches++;
+
+                                if (mappingMatches >= maximumLoggedMatches)
+                                {
+                                    stoppedAtMatchLimit = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        recordOffset = checked(
+                            recordOffset + alignedRecordLength);
+                    }
+
+                    if (stoppedAtMatchLimit)
+                    {
+                        break;
+                    }
+                }
+
+                if (bytesRead < requestedChunkLength)
+                {
+                    break;
+                }
+
+                chunkOffset = checked(
+                    chunkOffset + bytesRead);
+            }
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile global mapping summary: " +
+                $"targetAttributes={string.Join(
+                    ",",
+                    targetAttributeIndexes.OrderBy(x => x))}, " +
+                $"mappingMatches={mappingMatches}, " +
+                $"scanBytes={Math.Min(
+                    Math.Max(0, logFileStream.FileSizeBytes),
+                    maxDiagnosticBytes):N0}, " +
+                $"stoppedAtMatchLimit={stoppedAtMatchLimit}.");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile global mapping scan failed: " +
+                $"{ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -1797,8 +2139,7 @@ public sealed class NtfsMftDataReader
                 }
 
                 IReadOnlyList<NtfsDataExtent> extents;
-                try
-                {
+                try                {
                     extents = NtfsMappingPairsParser.Parse(
                         record.AsSpan(
                             attributeOffset + mappingPairsOffset,
@@ -2247,8 +2588,7 @@ public sealed class NtfsMftDataReader
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS deletion snapshot capture failed: {ex.GetType().Name}: {ex.Message}");
             return false;
-        }
-    }
+        }    }
 
     public bool TryReadDataStreamForDeletedReference(
         string rootPath,
@@ -2697,8 +3037,7 @@ public sealed class NtfsMftDataReader
         long volumeSizeBytes,
         string? expectedFileName,
         ulong? expectedParentFileReferenceNumber)
-    {
-        const uint NtfsFileNameAttribute = 0x30;
+    {        const uint NtfsFileNameAttribute = 0x30;
         const int ParentReferenceOffset = 0;
         const int AllocatedSizeOffset = 40;
         const int RealSizeOffset = 48;
@@ -3147,8 +3486,7 @@ public sealed class NtfsMftDataReader
         {
             System.Diagnostics.Debug.WriteLine(
                 "NTFS $DATA lookup: BuildDataStream received zero unnamed $DATA descriptors.");
-            return NotFound("No unnamed $DATA attribute was retained in the base or extension MFT records.");
-        }
+            return NotFound("No unnamed $DATA attribute was retained in the base or extension MFT records.");        }
 
         if (descriptors.Any(x => x.IsResident))
         {
@@ -3598,7 +3936,6 @@ public sealed class NtfsMftDataReader
         {
             return null;
         }
-
         ApplyUpdateSequenceFixups(
             record,
             checked((int)volumeInfo.BytesPerSector));
@@ -4047,7 +4384,6 @@ public sealed class NtfsMftDataReader
                 if (!started)
                 {
                     var error = Marshal.GetLastWin32Error();
-
                     if (error != ErrorIoPending)
                     {
                         throw new Win32Exception(
