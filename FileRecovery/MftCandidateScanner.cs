@@ -93,6 +93,13 @@ public sealed class MftCandidateScanner
             ? null
             : NormalizePath(Path.GetFullPath(targetDirectory));
 
+        System.Diagnostics.Trace.WriteLine(
+            $"Raw MFT directory scan started: root={rootPath}, " +
+            $"targetDirectory={normalizedTargetDirectory ?? "(none)"}, " +
+            $"includeSubdirectories={includeSubdirectories}, " +
+            $"targetPaths={normalizedTargets.Count:N0}, " +
+            $"maxBytesToScan={maxBytesToScan:N0}.");
+
         if (normalizedTargets.Count == 0 &&
             normalizedTargetDirectory is null)
         {
@@ -167,6 +174,15 @@ public sealed class MftCandidateScanner
         var historicalSegmentSeenCount = 0L;
         var historicalDeletedSegmentSeenCount = 0L;
         var historicalInUseSegmentSeenCount = 0L;
+        var parentResolutionAttemptCount = 0L;
+        var parentResolutionSuccessCount = 0L;
+        var directoryMatchCount = 0L;
+        var parentResolutionSampleCount = 0;
+
+        System.Diagnostics.Trace.WriteLine(
+            $"Raw MFT directory scan volume metadata: root={fullRoot}, " +
+            $"mftValidLength={volumeInfo.MftValidDataLength:N0}, " +
+            $"recordSize={recordSize:N0}, bytesPerSector={volumeInfo.BytesPerSector:N0}.");
 
         if (recordSize <= 0 ||
             volumeInfo.MftValidDataLength <= 0)
@@ -228,6 +244,9 @@ public sealed class MftCandidateScanner
 
             if (bytesRead <= 0)
             {
+                System.Diagnostics.Trace.WriteLine(
+                    $"Raw MFT directory scan stopped: ReadMftLogicalBytes returned {bytesRead} " +
+                    $"at logicalOffset={readOffset:N0}, scanned={scanned:N0}.");
                 break;
             }
 
@@ -308,20 +327,46 @@ public sealed class MftCandidateScanner
 
                     if (normalizedTargetDirectory is not null)
                     {
+                        parentResolutionAttemptCount++;
+
                         currentDirectoryPath = NtfsParentPathResolver.Resolve(
                             volumeHandle,
                             entry.ParentFileReferenceNumber) ?? string.Empty;
+
+                        if (!string.IsNullOrWhiteSpace(currentDirectoryPath))
+                        {
+                            parentResolutionSuccessCount++;
+                        }
+
+                        if (parentResolutionSampleCount < 20)
+                        {
+                            parentResolutionSampleCount++;
+
+                            System.Diagnostics.Trace.WriteLine(
+                                $"Raw MFT parent sample #{parentResolutionSampleCount}: " +
+                                $"fileRef={fileReferenceNumber}, " +
+                                $"parentRef={entry.ParentFileReferenceNumber}, " +
+                                $"name={entry.Name}, " +
+                                $"resolvedDirectory={currentDirectoryPath ?? "(null)"}, " +
+                                $"targetDirectory={normalizedTargetDirectory}.");
+                        }
 
                         if (IsDirectoryMatch(
                                 currentDirectoryPath,
                                 normalizedTargetDirectory,
                                 includeSubdirectories))
                         {
+                            directoryMatchCount++;
                             directoryPath = currentDirectoryPath;
                             matchingTarget = NormalizePath(
                                 Path.Combine(directoryPath, entry.Name));
                             matchingEvidence =
                                 "Retained deleted MFT record matched the requested directory.";
+
+                            System.Diagnostics.Trace.WriteLine(
+                                $"Raw MFT directory MATCH #{directoryMatchCount}: " +
+                                $"path={matchingTarget}, parent={directoryPath}, " +
+                                $"fileRef={fileReferenceNumber}, parentRef={entry.ParentFileReferenceNumber}.");
                         }
                     }
                     else if (sameNameTargets is not null)
@@ -460,6 +505,16 @@ public sealed class MftCandidateScanner
             scanned += usableBytes;
             progress?.Report(scanned);
 
+            const long progressInterval = 256L * 1024L * 1024L;
+            if (scanned == usableBytes ||
+                scanned % progressInterval < usableBytes)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"Raw MFT directory scan progress: scanned={scanned:N0} / {bytesToScan:N0} bytes, " +
+                    $"deletedRecords={deletedRecordCount:N0}, parentResolutions={parentResolutionSuccessCount:N0}/{parentResolutionAttemptCount:N0}, " +
+                    $"directoryMatches={directoryMatchCount:N0}, results={results.Count:N0}.");
+            }
+
             if (bytesRead < requestBytes)
             {
                 break;
@@ -468,11 +523,12 @@ public sealed class MftCandidateScanner
 
         progress?.Report(scanned);
 
-        System.Diagnostics.Debug.WriteLine(
-            $"Raw MFT fallback: scanned={scanned:N0} bytes, " +
+        System.Diagnostics.Trace.WriteLine(
+            $"Raw MFT fallback summary: scanned={scanned:N0} bytes, " +
             $"recordSize={recordSize:N0}, FILE signatures={fileSignatureCount:N0}, " +
             $"deletedRecords={deletedRecordCount:N0}, FILE_NAME entries={fileNameEntryCount:N0}, " +
-            $"targetNameMatches={targetNameMatchCount:N0}, staleSegmentMatches={staleSegmentMatchCount:N0}, " +
+            $"targetNameMatches={targetNameMatchCount:N0}, parentResolutions={parentResolutionSuccessCount:N0}/{parentResolutionAttemptCount:N0}, " +
+            $"directoryMatches={directoryMatchCount:N0}, staleSegmentMatches={staleSegmentMatchCount:N0}, " +
             $"staleTimestampMatches={staleTimestampMatchCount:N0}, " +
             $"historicalSegmentsSeen={historicalSegmentSeenCount:N0}, " +
             $"historicalDeletedSegmentsSeen={historicalDeletedSegmentSeenCount:N0}, " +
