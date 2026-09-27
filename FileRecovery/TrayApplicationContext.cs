@@ -108,13 +108,42 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
+        var livePathNeedsSnapshot =
+            !e.Historical &&
+            !e.Record.FileReferenceNumber.HasValue &&
+            !string.IsNullOrWhiteSpace(e.Record.FullPath);
+
+        // Give a fresh FileSystemWatcher deletion the earliest possible opportunity
+        // to capture its NTFS $DATA snapshot. Previously this work was scheduled only
+        // after the history write, which could let a busy NTFS volume reuse the MFT
+        // record before the snapshot reader reached it.
+        if (livePathNeedsSnapshot)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS immediate live path triggered: path={e.Record.FullPath}, " +
+                $"historyTime={e.Record.DeletedAtUtc:O}.");
+
+            try
+            {
+                if (_usnMonitor.TryCaptureRecentDeletionSnapshot(e.Record))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS immediate live path snapshot succeeded: " +
+                        $"path={e.Record.FullPath}, attempt=immediate.");
+                }
+            }
+            catch
+            {
+                // The retry loop below provides the best-effort fallback.
+            }
+        }
+
         bool wasExisting;
 
         try
         {
             // Persist the deletion immediately so FileSystemWatcher/USN lookup
             // latency can never prevent the deleted-file result from appearing.
-            // NTFS identifiers are enriched separately below.
             wasExisting = await Task.Run(() => _history.Upsert(e.Record));
         }
         catch
@@ -124,22 +153,15 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        if (!e.Historical &&
-            !e.Record.FileReferenceNumber.HasValue &&
-            !string.IsNullOrWhiteSpace(e.Record.FullPath))
+        if (livePathNeedsSnapshot && e.Record.NtfsDataSnapshot is null)
         {
-            System.Diagnostics.Debug.WriteLine(
-                $"NTFS immediate live path triggered: path={e.Record.FullPath}, " +
-                $"historyTime={e.Record.DeletedAtUtc:O}.");
-
             _ = Task.Run(async () =>
             {
                 try
                 {
                     // A large historical USN backlog can delay the background
                     // cursor long enough for a fresh MFT sequence to be reused.
-                    // Inspect the recent journal tail immediately and try to
-                    // capture the NTFS $DATA snapshot while the deletion is fresh.
+                    // Retry while the deletion is still recent.
                     for (var attempt = 0; attempt < 6; attempt++)
                     {
                         if (_usnMonitor.TryCaptureRecentDeletionSnapshot(e.Record))
