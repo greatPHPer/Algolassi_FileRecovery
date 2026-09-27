@@ -880,6 +880,228 @@ public sealed class NtfsMftDataReader
         }
     }
 
+    private static void TraceHistoricalLogFileEvidence(
+        NtfsVolumeInfo volumeInfo,
+        SafeFileHandle volumeHandle,
+        ulong fileReferenceNumber,
+        string expectedFileName,
+        ulong expectedParentFileReferenceNumber)
+    {
+        try
+        {
+            var logFileStream = new NtfsMftDataReader().ReadDefaultDataStream(
+                volumeInfo,
+                volumeHandle,
+                2);
+
+            if (!logFileStream.Found ||
+                logFileStream.IsResident ||
+                logFileStream.Extents.Count == 0)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile diagnostic: could not obtain $LogFile mapping pairs. " +
+                    $"found={logFileStream.Found}, resident={logFileStream.IsResident}, " +
+                    $"extents={logFileStream.Extents.Count:N0}, evidence={logFileStream.Evidence}.");
+                return;
+            }
+
+            const long maxDiagnosticBytes = 128L * 1024 * 1024;
+            var remainingBudget = Math.Min(
+                Math.Max(0, logFileStream.FileSizeBytes),
+                maxDiagnosticBytes);
+            var expectedNameBytes = Encoding.Unicode.GetBytes(expectedFileName);
+            var expectedReferenceBytes = new byte[sizeof(ulong)];
+
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                expectedReferenceBytes,
+                fileReferenceNumber);
+
+            long scannedBytes = 0;
+            var nameMatches = 0;
+            var referenceMatches = 0;
+            var reportedCandidates = 0;
+            var logicalFileOffset = 0L;
+
+            foreach (var extent in logFileStream.Extents)
+            {
+                if (remainingBudget <= 0 ||
+                    extent.LogicalClusterNumber < 0 ||
+                    extent.ClusterCount <= 0)
+                {
+                    continue;
+                }
+
+                var extentBytes = checked(
+                    Math.Min(
+                        checked(extent.ClusterCount * (long)volumeInfo.BytesPerCluster),
+                        remainingBudget));
+
+                var buffer = new byte[checked((int)Math.Min(
+                    extentBytes,
+                    4L * 1024 * 1024))];
+
+                long extentOffset = 0;
+                while (extentOffset < extentBytes &&
+                       remainingBudget > 0)
+                {
+                    var chunkBytes = Math.Min(
+                        buffer.LongLength,
+                        Math.Min(
+                            extentBytes - extentOffset,
+                            remainingBudget));
+
+                    var chunk = new byte[checked((int)chunkBytes)];
+
+                    ReadRawClusters(
+                        volumeHandle,
+                        checked(extent.LogicalClusterNumber +
+                                extentOffset / volumeInfo.BytesPerCluster),
+                        chunkBytes,
+                        volumeInfo.BytesPerCluster,
+                        chunk,
+                        0);
+
+                    scannedBytes = checked(scannedBytes + chunkBytes);
+                    remainingBudget -= chunkBytes;
+
+                    for (var offset = 0;
+                         offset + expectedNameBytes.Length <= chunk.Length;
+                         offset++)
+                    {
+                        if (!chunk.AsSpan(
+                                offset,
+                                expectedNameBytes.Length)
+                            .SequenceEqual(expectedNameBytes))
+                        {
+                            continue;
+                        }
+
+                        nameMatches++;
+                        if (reportedCandidates >= 10)
+                        {
+                            continue;
+                        }
+
+                        var absoluteOffset = checked(
+                            logicalFileOffset + extentOffset + offset);
+
+                        var windowStart = Math.Max(0, offset - 512);
+                        var windowEnd = Math.Min(
+                            chunk.Length,
+                            offset + expectedNameBytes.Length + 512);
+
+                        var window = chunk.AsSpan(
+                            windowStart,
+                            windowEnd - windowStart);
+
+                        var referenceInWindow = window.IndexOf(
+                            expectedReferenceBytes) >= 0;
+
+                        var fileInWindow = window.IndexOf(
+                            "FILE"u8) >= 0;
+
+                        var rcrdInWindow = window.IndexOf(
+                            "RCRD"u8) >= 0;
+
+                        var opcodeSummary = CountHistoricalLogOperations(window);
+
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS $LogFile diagnostic: filename match #{nameMatches}, " +
+                            $"logicalOffset={absoluteOffset:N0}, " +
+                            $"fileRefInWindow={referenceInWindow}, " +
+                            $"FILE={fileInWindow}, RCRD={rcrdInWindow}, " +
+                            $"ops={opcodeSummary}.");
+
+                        if (referenceInWindow)
+                        {
+                            referenceMatches++;
+                        }
+
+                        reportedCandidates++;
+                    }
+
+                    for (var offset = 0;
+                         offset + expectedReferenceBytes.Length <= chunk.Length;
+                         offset++)
+                    {
+                        if (chunk.AsSpan(
+                                offset,
+                                expectedReferenceBytes.Length)
+                            .SequenceEqual(expectedReferenceBytes))
+                        {
+                            referenceMatches++;
+                        }
+                    }
+
+                    extentOffset += chunkBytes;
+                }
+
+                logicalFileOffset = checked(
+                    logicalFileOffset + extentBytes);
+            }
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile diagnostic summary: fileRef={fileReferenceNumber}, " +
+                $"name={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
+                $"logFileSize={logFileStream.FileSizeBytes:N0}, scanned={scannedBytes:N0}, " +
+                $"filenameMatches={nameMatches}, nearbyReferenceMatches={referenceMatches}.");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile diagnostic failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static string CountHistoricalLogOperations(ReadOnlySpan<byte> window)
+    {
+        var names = new[]
+        {
+            (Code: (ushort)0x0002, Name: "InitializeFileRecordSegment"),
+            (Code: (ushort)0x0003, Name: "DeallocateFileRecordSegment"),
+            (Code: (ushort)0x0005, Name: "CreateAttribute"),
+            (Code: (ushort)0x0006, Name: "DeleteAttribute"),
+            (Code: (ushort)0x0007, Name: "UpdateResidentValue"),
+            (Code: (ushort)0x0008, Name: "UpdateNonresidentValue"),
+            (Code: (ushort)0x0009, Name: "UpdateMappingPairs"),
+            (Code: (ushort)0x0013, Name: "UpdateFileNameRoot"),
+            (Code: (ushort)0x0014, Name: "UpdateFileNameAllocation")
+        };
+
+        var matches = new List<string>();
+
+        foreach (var operation in names)
+        {
+            var littleEndianCode = new byte[sizeof(ushort)];
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                littleEndianCode,
+                operation.Code);
+
+            var count = 0;
+            for (var offset = 0;
+                 offset + littleEndianCode.Length <= window.Length;
+                 offset++)
+            {
+                if (window.Slice(
+                        offset,
+                        littleEndianCode.Length)
+                    .SequenceEqual(littleEndianCode))
+                {
+                    count++;
+                }
+            }
+
+            if (count > 0)
+            {
+                matches.Add($"{operation.Name}={count}");
+            }
+        }
+
+        return matches.Count == 0
+            ? "(none)"
+            : string.Join(",", matches);
+    }
+
     private static NtfsDataStreamInfo? TryReadHistoricalNonResidentDataFromSlack(
         NtfsVolumeInfo volumeInfo,
         byte[] record,
@@ -1788,6 +2010,16 @@ public sealed class NtfsMftDataReader
                             $"extents={historicalSlackStream.Extents.Count:N0}.");
 
                         return historicalSlackStream;
+                    }
+
+                    if (fileReferenceNumber == 1125899908285351UL)
+                    {
+                        TraceHistoricalLogFileEvidence(
+                            volumeInfo,
+                            volumeHandle,
+                            fileReferenceNumber,
+                            expectedFileName,
+                            expectedParentFileReferenceNumber.Value);
                     }
 
                     System.Diagnostics.Trace.WriteLine(
