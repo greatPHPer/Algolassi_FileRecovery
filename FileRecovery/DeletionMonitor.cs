@@ -120,6 +120,12 @@ public sealed class DeletionMonitor : IDisposable
         var oldPath = NormalizePath(e.OldFullPath);
         var newPath = NormalizePath(e.FullPath);
 
+        if (InternalPathPolicy.IsIgnoredPath(oldPath) ||
+            InternalPathPolicy.IsIgnoredPath(newPath))
+        {
+            return;
+        }
+
         // A normal Delete performed through Windows Explorer commonly moves the
         // file into the volume's Recycle Bin rather than generating a direct
         // FileSystemWatcher Deleted event for the original path. Treat that
@@ -193,6 +199,12 @@ public sealed class DeletionMonitor : IDisposable
             : null;
 
         var fullPath = NormalizePath(e.FullPath);
+
+        if (InternalPathPolicy.IsIgnoredPath(fullPath))
+        {
+            return;
+        }
+
         var directory = Path.GetDirectoryName(fullPath) ?? string.Empty;
         var fileName = Path.GetFileName(fullPath);
 
