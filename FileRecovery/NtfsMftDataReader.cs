@@ -880,6 +880,217 @@ public sealed class NtfsMftDataReader
         }
     }
 
+    private static NtfsDataStreamInfo? TryReadHistoricalNonResidentDataFromSlack(
+        NtfsVolumeInfo volumeInfo,
+        byte[] record,
+        string expectedFileName,
+        ulong expectedParentFileReferenceNumber,
+        DateTime expectedDeletedAtUtc)
+    {
+        if (expectedDeletedAtUtc == default ||
+            string.IsNullOrWhiteSpace(expectedFileName))
+        {
+            return null;
+        }
+
+        var slackStart = FindAttributeSlackStart(record);
+        if (slackStart < 0 ||
+            slackStart >= record.Length)
+        {
+            return null;
+        }
+
+        var expectedNameBytes = Encoding.Unicode.GetBytes(expectedFileName);
+        if (expectedNameBytes.Length == 0)
+        {
+            return null;
+        }
+
+        var historicalFileNameOffset = FindHistoricalFileNameValue(
+            record,
+            slackStart,
+            expectedNameBytes,
+            expectedParentFileReferenceNumber,
+            out var historicalFileSize);
+
+        if (historicalFileNameOffset < 0 ||
+            historicalFileSize <= 0)
+        {
+            return null;
+        }
+
+        DateTime modificationTimeUtc;
+        try
+        {
+            modificationTimeUtc = DateTime.FromFileTimeUtc(
+                BinaryPrimitives.ReadInt64LittleEndian(
+                    record.AsSpan(
+                        historicalFileNameOffset + 16,
+                        sizeof(long))));
+        }
+        catch
+        {
+            return null;
+        }
+
+        var timestampDeltaMinutes =
+            Math.Abs((modificationTimeUtc - expectedDeletedAtUtc).TotalMinutes);
+
+        if (timestampDeltaMinutes > 5)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical MFT slack: FILE_NAME timestamp rejected, " +
+                $"name={expectedFileName}, parentRef={expectedParentFileReferenceNumber}, " +
+                $"modifiedAt={modificationTimeUtc:O}, deleteAt={expectedDeletedAtUtc:O}, " +
+                $"deltaMinutes={timestampDeltaMinutes:0.###}.");
+            return null;
+        }
+
+        const int maxRelatedSlackDistance = 1024;
+        DataAttributeDescriptor? bestDescriptor = null;
+        var bestDistance = int.MaxValue;
+
+        for (var attributeOffset = slackStart;
+             attributeOffset + 64 <= record.Length;
+             attributeOffset++)
+        {
+            var type = BinaryPrimitives.ReadUInt32LittleEndian(
+                record.AsSpan(attributeOffset, 4));
+
+            if (type != NtfsAttributeData)
+            {
+                continue;
+            }
+
+            var attributeLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                record.AsSpan(attributeOffset + 4, 4));
+
+            if (attributeLength < 64 ||
+                attributeOffset + attributeLength > record.Length)
+            {
+                continue;
+            }
+
+            var formCode = record[attributeOffset + 8];
+            var nameLength = record[attributeOffset + 9];
+
+            if (formCode != NonResidentForm ||
+                nameLength != 0)
+            {
+                continue;
+            }
+
+            var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(attributeOffset + 16, sizeof(long)));
+
+            if (lowestVcn != 0)
+            {
+                continue;
+            }
+
+            var mappingPairsOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                record.AsSpan(attributeOffset + 32, sizeof(ushort)));
+
+            if (mappingPairsOffset < 64 ||
+                mappingPairsOffset >= attributeLength)
+            {
+                continue;
+            }
+
+            var allocatedSize = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(attributeOffset + 40, sizeof(long)));
+            var fileSize = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(attributeOffset + 48, sizeof(long)));
+            var validDataLength = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(attributeOffset + 56, sizeof(long)));
+
+            if (fileSize != historicalFileSize ||
+                allocatedSize < fileSize ||
+                validDataLength < 0 ||
+                validDataLength > fileSize)
+            {
+                continue;
+            }
+
+            var distance = Math.Abs(attributeOffset - historicalFileNameOffset);
+            if (distance > maxRelatedSlackDistance ||
+                distance >= bestDistance)
+            {
+                continue;
+            }
+
+            IReadOnlyList<NtfsDataExtent> extents;
+            try
+            {
+                extents = NtfsMappingPairsParser.Parse(
+                    record.AsSpan(
+                        attributeOffset + mappingPairsOffset,
+                        checked((int)attributeLength - mappingPairsOffset)),
+                    lowestVcn);
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (extents.Count == 0 ||
+                extents[0].VirtualClusterNumber != 0)
+            {
+                continue;
+            }
+
+            long coveredClusters = 0;
+            var expectedVcn = 0L;
+            var validExtentLayout = true;
+
+            foreach (var extent in extents)
+            {
+                if (extent.VirtualClusterNumber != expectedVcn ||
+                    extent.ClusterCount <= 0)
+                {
+                    validExtentLayout = false;
+                    break;
+                }
+
+                coveredClusters = checked(coveredClusters + extent.ClusterCount);
+                expectedVcn = checked(expectedVcn + extent.ClusterCount);
+            }
+
+            if (!validExtentLayout ||
+                checked(coveredClusters * (long)volumeInfo.BytesPerCluster) < fileSize)
+            {
+                continue;
+            }
+
+            bestDescriptor = new DataAttributeDescriptor
+            {
+                LowestVcn = lowestVcn,
+                IsResident = false,
+                FileSizeBytes = fileSize,
+                ValidDataLengthBytes = validDataLength,
+                Extents = extents
+            };
+            bestDistance = distance;
+        }
+
+        if (bestDescriptor is null)
+        {
+            return null;
+        }
+
+        return new NtfsDataStreamInfo
+        {
+            Found = true,
+            IsResident = false,
+            FileSizeBytes = bestDescriptor.FileSizeBytes,
+            ValidDataLengthBytes = bestDescriptor.ValidDataLengthBytes,
+            Extents = bestDescriptor.Extents,
+            Evidence =
+                $"The deleted file's historical $FILE_NAME and nonresident $DATA mapping pairs were retained in MFT slack; " +
+                $"filename/parent/timestamp matched the USN deletion record."
+        };
+    }
+
     public bool TryReadHistoricalFileNameSize(
         string rootPath,
         ulong fileReferenceNumber,
@@ -1459,6 +1670,25 @@ public sealed class NtfsMftDataReader
                 }
                 else
                 {
+                    var historicalSlackStream = TryReadHistoricalNonResidentDataFromSlack(
+                        volumeInfo,
+                        relaxedRecord,
+                        expectedFileName,
+                        expectedParentFileReferenceNumber.Value,
+                        expectedDeletedAtUtc);
+
+                    if (historicalSlackStream is not null)
+                    {
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS $DATA lookup: accepted historical MFT-slack $DATA evidence " +
+                            $"for fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
+                            $"expectedSequence={sequenceNumber}, actualSequence={actualSequence}, " +
+                            $"fileSize={historicalSlackStream.FileSizeBytes:N0}, " +
+                            $"extents={historicalSlackStream.Extents.Count:N0}.");
+
+                        return historicalSlackStream;
+                    }
+
                     System.Diagnostics.Trace.WriteLine(
                         $"NTFS $DATA lookup: rejected relaxed MFT record for " +
                         $"fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
