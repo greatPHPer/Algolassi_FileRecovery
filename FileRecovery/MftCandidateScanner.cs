@@ -535,6 +535,34 @@ public sealed class MftCandidateScanner
         return results;
     }
 
+    public IReadOnlyList<RecoveryCandidate> ScanDeletedDirectory(
+        string rootPath,
+        string targetDirectory,
+        bool includeSubdirectories,
+        CancellationToken cancellationToken = default,
+        int maxPages = int.MaxValue)
+    {
+        if (string.IsNullOrWhiteSpace(targetDirectory))
+        {
+            throw new ArgumentException(
+                "A target directory is required.",
+                nameof(targetDirectory));
+        }
+
+        if (maxPages <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxPages));
+        }
+
+        return ScanInternal(
+            rootPath,
+            targetPaths: null,
+            targetDirectory: targetDirectory,
+            includeSubdirectories: includeSubdirectories,
+            cancellationToken: cancellationToken,
+            maxPages: maxPages);
+    }
+
     public IReadOnlyList<RecoveryCandidate> ScanForFileReferences(
         string rootPath,
         IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, DateTime DeletedAtUtc)> targets,
