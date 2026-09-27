@@ -241,21 +241,32 @@ public sealed class UsnJournalMonitor : IDisposable
         var latestDeletes = new Dictionary<ulong, UsnRecord>();
         var results = new List<UsnDeletedFileRecord>();
 
-        // A directory scan is intended to surface recent deletions for recovery,
-        // not reconstruct the entire lifetime of a large NTFS USN journal. Starting
-        // at FirstUsn can enumerate millions of historical records and consume very
-        // large amounts of memory while delaying the actual deleted-file scan.
-        // Restrict this on-demand scan to the same bounded recent-journal window used
-        // by recovery-time journal lookups elsewhere in this monitor.
-        const long recentUsnWindow = 10_000_000;
-        var nextUsn = Math.Max(
-            journal.FirstUsn,
-            journal.NextUsn - recentUsnWindow);
+        // Do not manufacture a USN by subtracting an arbitrary byte/count window
+        // from journal.NextUsn. FSCTL_READ_USN_JOURNAL requires a nonzero StartUsn
+        // to identify an actual journal-record position; an arbitrary value can fail
+        // with ERROR_INVALID_PARAMETER (87).
+        //
+        // The background monitor already persists a valid cursor returned by
+        // FSCTL_READ_USN_JOURNAL. Reuse that cursor when it belongs to the current
+        // journal instance. This keeps the on-demand scan bounded to records the
+        // monitor has not yet consumed while avoiding an invalid seek or an
+        // unbounded replay of the entire journal.
+        var nextUsn = journal.NextUsn;
+        var startSource = "journal tail (no persisted cursor)";
+
+        if (_settings.UsnCursors.TryGetValue(volumeKey, out var persistedCursor) &&
+            persistedCursor.JournalId == journal.JournalId &&
+            persistedCursor.NextUsn >= journal.FirstUsn &&
+            persistedCursor.NextUsn <= journal.NextUsn)
+        {
+            nextUsn = persistedCursor.NextUsn;
+            startSource = "persisted monitor cursor";
+        }
 
         System.Diagnostics.Debug.WriteLine(
             $"Historical directory USN scan: volume={volumeKey}, " +
             $"journalRange={nextUsn:N0}..{journal.NextUsn:N0}, " +
-            $"window={recentUsnWindow:N0} USN.");
+            $"startSource={startSource}.");
 
         while (!cancellationToken.IsCancellationRequested &&
                nextUsn < journal.NextUsn)
