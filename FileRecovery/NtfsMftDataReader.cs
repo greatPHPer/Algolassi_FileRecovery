@@ -25,6 +25,7 @@ public sealed class NtfsMftDataReader
     private const int RawReadBufferSize = 1024 * 1024;
 
     private IReadOnlyList<NtfsDataExtent>? _mftExtents;
+    private readonly object _mftExtentGate = new();
 
     public bool TryReadHistoricalResidentData(
         string rootPath,
@@ -2177,6 +2178,24 @@ public sealed class NtfsMftDataReader
         }
     }
 
+    private IReadOnlyList<NtfsDataExtent> GetOrReadMftExtents(
+        SafeFileHandle volumeHandle,
+        NtfsVolumeInfo volumeInfo)
+    {
+        var cached = _mftExtents;
+        if (cached is not null)
+        {
+            return cached;
+        }
+
+        lock (_mftExtentGate)
+        {
+            return _mftExtents ??= ReadMftDataExtents(
+                volumeHandle,
+                volumeInfo);
+        }
+    }
+
     private byte[]? ReadMftRecordByExtentMap(
         SafeFileHandle volumeHandle,
         NtfsVolumeInfo volumeInfo,
@@ -2184,11 +2203,11 @@ public sealed class NtfsMftDataReader
         ushort expectedSequenceNumber,
         ulong expectedBaseFileReference)
     {
-        _mftExtents ??= ReadMftDataExtents(
+        var mftExtents = GetOrReadMftExtents(
             volumeHandle,
             volumeInfo);
 
-        if (_mftExtents.Count == 0)
+        if (mftExtents.Count == 0)
         {
             System.Diagnostics.Debug.WriteLine(
                 "NTFS MFT extent map: no $MFT $DATA extents were found.");
@@ -2345,7 +2364,7 @@ public sealed class NtfsMftDataReader
             destination.Length,
             volumeInfo.MftValidDataLength - fileOffset);
 
-        _mftExtents ??= ReadMftDataExtents(
+        var mftExtents = GetOrReadMftExtents(
             volumeHandle,
             volumeInfo);
 
@@ -2354,7 +2373,7 @@ public sealed class NtfsMftDataReader
             return ReadMappedFileBytes(
                 volumeHandle,
                 volumeInfo.BytesPerCluster,
-                _mftExtents,
+                mftExtents,
                 fileOffset,
                 destination);
         }
@@ -2363,7 +2382,7 @@ public sealed class NtfsMftDataReader
         var bytesRead = ReadMappedFileBytes(
             volumeHandle,
             volumeInfo.BytesPerCluster,
-            _mftExtents,
+            mftExtents,
             fileOffset,
             temp);
 
