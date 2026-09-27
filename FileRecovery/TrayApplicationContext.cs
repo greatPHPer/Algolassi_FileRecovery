@@ -103,6 +103,11 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private async void OnDeletionDetected(object? sender, DeletionDetectedEventArgs e)
     {
+        if (InternalPathPolicy.IsIgnoredPath(e.Record.FullPath))
+        {
+            return;
+        }
+
         bool wasExisting;
 
         try
