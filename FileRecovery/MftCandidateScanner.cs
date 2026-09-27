@@ -746,7 +746,8 @@ public sealed class MftCandidateScanner
                 target.FileReferenceNumber,
                 name,
                 target.ParentFileReferenceNumber,
-                target.FullPath);
+                target.FullPath,
+                target.DeletedAtUtc);
 
             IReadOnlyList<NtfsExtentAllocation> allocations = [];
             string allocationEvidence = string.Empty;
