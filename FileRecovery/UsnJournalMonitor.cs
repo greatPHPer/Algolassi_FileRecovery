@@ -252,13 +252,21 @@ public sealed class UsnJournalMonitor : IDisposable
             volumeKey,
             _ => new ConcurrentDictionary<ulong, string>());
 
-        var results = new List<UsnDeletedFileRecord>();
-        var seenReferences = new HashSet<ulong>();
+        // A path can have many historical delete events because NTFS reuses an
+        // MFT segment and assigns a new sequence number each time the file is
+        // recreated. Keep only the newest historical deletion for each resolved
+        // full path so stale generations do not become separate MFT recovery
+        // targets later in the scan.
+        var latestResultByPath =
+            new Dictionary<string, UsnDeletedFileRecord>(
+                StringComparer.OrdinalIgnoreCase);
+
         var nextUsn = journal.FirstUsn;
         var batchesRead = 0L;
         var deleteRecordsSeen = 0L;
         var parentResolutions = 0L;
         var directoryMatches = 0L;
+        var duplicatePathCollapses = 0L;
 
         System.Diagnostics.Trace.WriteLine(
             $"USN historical directory scan started: volume={volumeKey}, " +
@@ -327,27 +335,38 @@ public sealed class UsnJournalMonitor : IDisposable
                     continue;
                 }
 
-                if (!seenReferences.Add(record.FileReferenceNumber))
-                {
-                    continue;
-                }
-
                 directoryMatches++;
 
                 var fullPath = NormalizePath(
                     Path.Combine(directory, record.FileName));
 
-                results.Add(
-                    new UsnDeletedFileRecord(
+                var candidate = new UsnDeletedFileRecord(
+                    fullPath,
+                    record.FileReferenceNumber,
+                    record.ParentFileReferenceNumber,
+                    record.FileName,
+                    directory,
+                    record.TimestampUtc);
+
+                if (latestResultByPath.TryGetValue(
                         fullPath,
-                        record.FileReferenceNumber,
-                        record.ParentFileReferenceNumber,
-                        record.FileName,
-                        directory,
-                        record.TimestampUtc));
+                        out var existing))
+                {
+                    // The journal is chronological, but compare timestamps explicitly
+                    // so this remains correct even if records arrive out of order.
+                    if (candidate.DeletedAtUtc <= existing.DeletedAtUtc)
+                    {
+                        duplicatePathCollapses++;
+                        continue;
+                    }
+
+                    duplicatePathCollapses++;
+                }
+
+                latestResultByPath[fullPath] = candidate;
 
                 System.Diagnostics.Trace.WriteLine(
-                    $"USN historical directory MATCH #{directoryMatches}: " +
+                    $"USN historical directory MATCH: " +
                     $"path={fullPath}, fileRef={record.FileReferenceNumber}, " +
                     $"parentRef={record.ParentFileReferenceNumber}, " +
                     $"deleteTime={record.TimestampUtc:O}.");
@@ -362,17 +381,24 @@ public sealed class UsnJournalMonitor : IDisposable
                     $"nextUsn={nextUsn}, journalNext={journal.NextUsn}, " +
                     $"deleteRecords={deleteRecordsSeen:N0}, " +
                     $"parentResolutions={parentResolutions:N0}, " +
-                    $"directoryMatches={directoryMatches:N0}.");
+                    $"directoryMatches={directoryMatches:N0}, " +
+                    $"uniquePaths={latestResultByPath.Count:N0}, " +
+                    $"duplicatePathCollapses={duplicatePathCollapses:N0}.");
             }
         }
+
+        var results = latestResultByPath.Values
+            .OrderByDescending(record => record.DeletedAtUtc)
+            .ToList();
 
         System.Diagnostics.Trace.WriteLine(
             $"USN historical directory scan summary: batches={batchesRead:N0}, " +
             $"deleteRecords={deleteRecordsSeen:N0}, " +
             $"parentResolutions={parentResolutions:N0}, " +
             $"directoryMatches={directoryMatches:N0}, " +
-            $"results={results.Count:N0}, nextUsn={nextUsn}, " +
-            $"journalNext={journal.NextUsn}.");
+            $"uniquePaths={results.Count:N0}, " +
+            $"duplicatePathCollapses={duplicatePathCollapses:N0}, " +
+            $"nextUsn={nextUsn}, journalNext={journal.NextUsn}.");
 
         return results;
     }
