@@ -1223,7 +1223,7 @@ public sealed class NtfsMftDataReader
                             BinaryPrimitives.ReadInt64LittleEndian(
                                 pageBuffer.AsSpan(clientDataStart + 24, 8));
 
-                        var operationName = operation =>
+                        Func<ushort, string> operationName = operation =>
                             operation switch
                             {
                                 0x02 => "InitializeFileRecordSegment",
