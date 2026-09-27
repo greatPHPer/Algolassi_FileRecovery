@@ -111,9 +111,17 @@ public sealed class RecycleBinMonitor : IDisposable
             }
 
             var directory = item.OriginalLocation;
+            var fullPath = Path.Combine(directory, item.Name);
+
+            if (InternalPathPolicy.IsIgnoredPath(directory) ||
+                InternalPathPolicy.IsIgnoredPath(fullPath))
+            {
+                continue;
+            }
+
             var record = new DeletionRecord
             {
-                FullPath = Path.Combine(directory, item.Name),
+                FullPath = fullPath,
                 FileName = item.Name,
                 DirectoryPath = directory,
                 DeletedAtUtc = ParseDeletedDateUtc(item.DeletedDate),
