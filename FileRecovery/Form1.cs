@@ -1113,6 +1113,8 @@ public partial class Form1 : Form
                         RecoveryCandidate = candidate
                     };
                 })
+                .OrderByDescending(row => row.RecoveryCandidate?.LastUsnTimestampUtc ?? DateTime.MinValue)
+                .ThenBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
             _suppressGridSelectionChanged = true;
