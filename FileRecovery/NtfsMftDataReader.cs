@@ -1211,6 +1211,17 @@ public sealed class NtfsMftDataReader
                             BinaryPrimitives.ReadUInt16LittleEndian(
                                 pageBuffer.AsSpan(clientDataStart + 10, 2));
 
+                        // NTFS_LOG_RECORD_HEADER fields after the redo/undo
+                        // descriptors. TargetAttribute index 0 is the MFT itself;
+                        // non-zero values identify an entry in the open-attribute table.
+                        var targetAttribute =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 12, 2));
+
+                        var lcnsToFollow =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 14, 2));
+
                         var recordTargetOffset =
                             BinaryPrimitives.ReadUInt16LittleEndian(
                                 pageBuffer.AsSpan(clientDataStart + 16, 2));
@@ -1218,6 +1229,10 @@ public sealed class NtfsMftDataReader
                         var attributeTargetOffset =
                             BinaryPrimitives.ReadUInt16LittleEndian(
                                 pageBuffer.AsSpan(clientDataStart + 18, 2));
+
+                        var clusterBlockOffset =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                pageBuffer.AsSpan(clientDataStart + 20, 2));
 
                         var targetVcn =
                             BinaryPrimitives.ReadInt64LittleEndian(
@@ -1245,13 +1260,28 @@ public sealed class NtfsMftDataReader
                                 _ => $"0x{operation:X4}"
                             };
 
-                        var targetOffsetMatches =
-                            targetVcn ==
+                        var targetSegment =
+                            fileReferenceNumber &
+                            0x0000FFFFFFFFFFFFUL;
+
+                        var targetMftOffset =
                             checked(
-                                (long)(
-                                    fileReferenceNumber &
-                                    0x0000FFFFFFFFFFFFUL) *
-                                (long)volumeInfo.BytesPerFileRecordSegment);
+                                (long)targetSegment *
+                                volumeInfo.BytesPerFileRecordSegment);
+
+                        var expectedTargetMftVcn =
+                            volumeInfo.BytesPerCluster > 0
+                                ? targetMftOffset / volumeInfo.BytesPerCluster
+                                : -1;
+
+                        var targetVcnMatches =
+                            targetAttribute == 0 &&
+                            expectedTargetMftVcn >= 0 &&
+                            targetVcn == expectedTargetMftVcn;
+
+                        var targetKind = targetAttribute == 0
+                            ? "MFT"
+                            : $"openAttributeIndex={targetAttribute}";
 
                         parsedRecords++;
                         matchingRecords++;
@@ -1269,14 +1299,15 @@ public sealed class NtfsMftDataReader
                             $"redoLength={redoLength}, " +
                             $"undoOffset={undoOffset}, " +
                             $"undoLength={undoLength}, " +
+                            $"targetAttribute={targetAttribute} ({targetKind}), " +
+                            $"lcnsToFollow={lcnsToFollow}, " +
                             $"recordTargetOffset={recordTargetOffset}, " +
                             $"attributeTargetOffset={attributeTargetOffset}, " +
+                            $"clusterBlockOffset={clusterBlockOffset}, " +
                             $"targetVcn={targetVcn}, " +
-                            $"targetMftOffset={checked((long)(
-                                fileReferenceNumber &
-                                0x0000FFFFFFFFFFFFUL) *
-                                (long)volumeInfo.BytesPerFileRecordSegment)}, " +
-                            $"targetVcnMatches={targetOffsetMatches}.");
+                            $"expectedTargetMftVcn={expectedTargetMftVcn}, " +
+                            $"targetMftOffset={targetMftOffset}, " +
+                            $"targetVcnMatches={targetVcnMatches}.");
 
                         if (redoOffset >= recordHeaderLength &&
                             redoOffset + redoLength <= clientDataLength)
