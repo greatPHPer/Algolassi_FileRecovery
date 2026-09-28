@@ -175,7 +175,8 @@ public sealed class UsnJournalMonitor : IDisposable
     public IReadOnlyList<UsnDeletedFileRecord> ScanDeletedDirectory(
         string targetDirectory,
         bool includeSubdirectories,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Action<UsnDeletedFileRecord>? onDeletedRecordFound = null)
     {
         WindowsPrivilege.EnableSeBackupPrivilege();
 
@@ -213,14 +214,16 @@ public sealed class UsnJournalMonitor : IDisposable
             root,
             fullDirectory,
             includeSubdirectories,
-            cancellationToken);
+            cancellationToken,
+            onDeletedRecordFound);
     }
 
     private IReadOnlyList<UsnDeletedFileRecord> ScanDeletedDirectoryFromUsnJournal(
         string root,
         string targetDirectory,
         bool includeSubdirectories,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<UsnDeletedFileRecord>? onDeletedRecordFound)
     {
         var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
 
@@ -347,6 +350,17 @@ public sealed class UsnJournalMonitor : IDisposable
                     record.FileName,
                     directory,
                     record.TimestampUtc);
+
+                try
+                {
+                    onDeletedRecordFound?.Invoke(candidate);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS historical deletion callback failed: " +
+                        $"path={candidate.FullPath}: {ex.GetType().Name}: {ex.Message}");
+                }
 
                 if (latestResultByPath.TryGetValue(
                         fullPath,
@@ -746,7 +760,8 @@ public sealed class UsnJournalMonitor : IDisposable
                     expectedFullPath,
                     DeleteSnapshotMaxBytes,
                     out var stream,
-                    out var capturedData))
+                    out var capturedData,
+                    expectedDeletedAtUtc: deletion.DeletedAtUtc)
             {
                 return;
             }
