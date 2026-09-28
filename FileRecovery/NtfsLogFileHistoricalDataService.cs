@@ -114,7 +114,9 @@ public sealed class NtfsLogFileHistoricalDataService
             var mappingCandidates =
                 FindTargetMappingCandidates(
                     records,
-                    fileReferenceNumber);
+                    fileReferenceNumber,
+                    volumeInfo.BytesPerCluster,
+                    volumeInfo.BytesPerFileRecordSegment);
 
             if (mappingCandidates.Count == 0)
             {
@@ -245,8 +247,14 @@ public sealed class NtfsLogFileHistoricalDataService
 
     private static List<MappingCandidate> FindTargetMappingCandidates(
         IReadOnlyList<ParsedLogRecord> records,
-        ulong targetFileReference)
+        ulong targetFileReference,
+        uint bytesPerCluster,
+        uint bytesPerFileRecordSegment)
     {
+        var targetSegment =
+            targetFileReference &
+            0x0000FFFFFFFFFFFFUL;
+
         var openAttributes =
             new Dictionary<ushort, OpenAttributeState>();
 
@@ -271,14 +279,8 @@ public sealed class NtfsLogFileHistoricalDataService
                 continue;
             }
 
-            if ((record.RedoOperation != UpdateMappingPairs &&
-                 record.UndoOperation != UpdateMappingPairs) ||
-                record.TargetVcn != 0 ||
-                !openAttributes.TryGetValue(
-                    record.TargetAttribute,
-                    out var openAttribute) ||
-                openAttribute.FileReference != targetFileReference ||
-                !string.IsNullOrWhiteSpace(openAttribute.AttributeName))
+            if (record.RedoOperation != UpdateMappingPairs &&
+                record.UndoOperation != UpdateMappingPairs)
             {
                 continue;
             }
@@ -293,20 +295,54 @@ public sealed class NtfsLogFileHistoricalDataService
                 continue;
             }
 
+            // UpdateMappingPairs can update the resident $MFT record containing
+            // the nonresident attribute's runlist. In that form, the target VCN
+            // and cluster-block offset identify the exact MFT segment being
+            // modified. This is the strongest identity link for a reused deleted
+            // file segment.
+            var targetSegmentForRecord =
+                CalculateTargetMftSegment(
+                    record,
+                    bytesPerCluster,
+                    bytesPerFileRecordSegment);
+
+            var exactMftTarget =
+                targetSegmentForRecord.HasValue &&
+                targetSegmentForRecord.Value == targetSegment;
+
+            var exactOpenAttributeTarget =
+                openAttributes.TryGetValue(
+                    record.TargetAttribute,
+                    out var openAttribute) &&
+                openAttribute.FileReference == targetFileReference &&
+                string.IsNullOrWhiteSpace(openAttribute.AttributeName);
+
+            if (!exactMftTarget &&
+                !exactOpenAttributeTarget)
+            {
+                continue;
+            }
+
             try
             {
-                var extents = NtfsMappingPairsParser.Parse(
-                    mappingBytes,
-                    startingVcn: 0);
+                var extents =
+                    NtfsMappingPairsParser.Parse(
+                        mappingBytes,
+                        startingVcn: 0);
 
-                if (extents.Count > 0)
+                if (extents.Count == 0)
                 {
-                    candidates.Add(
-                        new MappingCandidate(
-                            record.Lsn,
-                            record.TargetAttribute,
-                            extents));
+                    continue;
                 }
+
+                candidates.Add(
+                    new MappingCandidate(
+                        record.Lsn,
+                        record.TargetAttribute,
+                        exactMftTarget
+                            ? "MFT-segment"
+                            : "open-attribute",
+                        extents));
             }
             catch
             {
@@ -315,6 +351,38 @@ public sealed class NtfsLogFileHistoricalDataService
         }
 
         return candidates;
+    }
+
+    private static ulong? CalculateTargetMftSegment(
+        ParsedLogRecord record,
+        uint bytesPerCluster,
+        uint bytesPerFileRecordSegment)
+    {
+        if (record.TargetVcn < 0 ||
+            bytesPerCluster == 0 ||
+            bytesPerFileRecordSegment == 0)
+        {
+            return null;
+        }
+
+        var targetOffset =
+            checked(
+                record.TargetVcn *
+                (long)bytesPerCluster +
+                record.ClusterBlockOffset * 512L);
+
+        var recordSize =
+            record.TargetBlockSize > 0
+                ? checked(record.TargetBlockSize * 512L)
+                : bytesPerFileRecordSegment;
+
+        if (recordSize <= 0)
+        {
+            return null;
+        }
+
+        return checked(
+            (ulong)(targetOffset / recordSize));
     }
 
     private static bool TryBuildCompleteChain(
@@ -485,6 +553,14 @@ public sealed class NtfsLogFileHistoricalDataService
                         BinaryPrimitives.ReadInt64LittleEndian(
                             clientData.AsSpan(24, 8));
 
+                    var clusterBlockOffset =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientData.AsSpan(20, 2));
+
+                    var targetBlockSize =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientData.AsSpan(22, 2));
+
                     result.Add(
                         new ParsedLogRecord(
                             thisLsn,
@@ -493,6 +569,8 @@ public sealed class NtfsLogFileHistoricalDataService
                             undoOperation,
                             targetAttribute,
                             targetVcn,
+                            clusterBlockOffset,
+                            targetBlockSize,
                             ReadLogData(
                                 clientData,
                                 4,
@@ -1042,6 +1120,7 @@ public sealed class NtfsLogFileHistoricalDataService
     private sealed record MappingCandidate(
         ulong Lsn,
         ushort TargetAttribute,
+        string IdentitySource,
         IReadOnlyList<NtfsDataExtent> Extents);
 
     private sealed record ParsedLogRecord(
@@ -1051,6 +1130,8 @@ public sealed class NtfsLogFileHistoricalDataService
         ushort UndoOperation,
         ushort TargetAttribute,
         long TargetVcn,
+        ushort ClusterBlockOffset,
+        ushort TargetBlockSize,
         byte[] RedoData,
         byte[] UndoData);
 
