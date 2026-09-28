@@ -970,6 +970,70 @@ public sealed class UsnJournalMonitor : IDisposable
         return true;
     }
 
+    public bool TryCaptureHistoricalDeletionSnapshot(
+        UsnDeletedFileRecord record,
+        out DeletionRecord deletion)
+    {
+        deletion = new DeletionRecord
+        {
+            FileReferenceNumber = record.FileReferenceNumber,
+            ParentFileReferenceNumber = record.ParentFileReferenceNumber,
+            FullPath = NormalizePath(record.FullPath),
+            FileName = record.FileName,
+            DirectoryPath = record.DirectoryPath,
+            DeletedAtUtc = record.DeletedAtUtc,
+            RecoveryStrength = "Weak"
+        };
+
+        if (string.IsNullOrWhiteSpace(record.FullPath) ||
+            string.IsNullOrWhiteSpace(record.FileName) ||
+            !IsAdministrator())
+        {
+            return false;
+        }
+
+        var root = Path.GetPathRoot(record.FullPath);
+        if (string.IsNullOrWhiteSpace(root) ||
+            !string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+
+        // The historical USN record already gives us the exact file and parent
+        // references. Do not perform another name/path lookup here; use those
+        // references directly while the deleted MFT data is still retained.
+        CaptureNtfsDeletionSnapshot(
+            deletion,
+            volumeKey,
+            record.FileReferenceNumber,
+            record.ParentFileReferenceNumber,
+            record.FileName,
+            record.DirectoryPath);
+
+        if (deletion.NtfsDataSnapshot is not null)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS historical deletion snapshot: path={deletion.FullPath}, " +
+                $"fileRef={record.FileReferenceNumber}, " +
+                $"size={deletion.NtfsDataSnapshot.FileSizeBytes:N0}, " +
+                $"captured={deletion.NtfsDataSnapshot.IsComplete}, " +
+                $"snapshotFile={deletion.NtfsDataSnapshot.DataFileName ?? "(none)"}.");
+
+            if (deletion.NtfsDataSnapshot.IsComplete ||
+                deletion.NtfsDataSnapshot.FileSizeBytes > DeleteSnapshotMaxBytes)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public bool TryCaptureRecentDeletionSnapshot(DeletionRecord deletion)
     {
         if (deletion is null ||
