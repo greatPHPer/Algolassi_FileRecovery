@@ -2426,7 +2426,8 @@ public sealed class NtfsMftDataReader
         string? expectedFullPath,
         long maxCaptureBytes,
         out NtfsDataStreamInfo stream,
-        out byte[] capturedData)
+        out byte[] capturedData,
+        DateTime expectedDeletedAtUtc = default)
     {
         stream = NotFound("The deleted file's NTFS $DATA stream could not be read.");
         capturedData = [];
@@ -2461,7 +2462,8 @@ public sealed class NtfsMftDataReader
                 fileReferenceNumber,
                 expectedFileName,
                 expectedParentFileReferenceNumber,
-                expectedFullPath);
+                expectedFullPath,
+                expectedDeletedAtUtc);
 
             if (!stream.Found)
             {
