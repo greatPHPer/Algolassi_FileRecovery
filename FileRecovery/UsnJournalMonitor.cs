@@ -1046,7 +1046,119 @@ public sealed class UsnJournalMonitor : IDisposable
             }
         }
 
+        // Once the deleted MFT segment has been reused, the exact $DATA stream may
+        // no longer be available from the MFT. For plain text, use the exact USN
+        // file reference as the identity anchor and follow that file reference into
+        // NTFS $LogFile open-attribute and UpdateMappingPairs records. This is not
+        // size-only carving: the historical cluster chain must belong to this exact
+        // deleted file reference before any bytes are returned.
+        if (Path.GetExtension(record.FileName).Equals(
+                ".txt",
+                StringComparison.OrdinalIgnoreCase) &&
+            TryCaptureHistoricalLogFileSnapshot(
+                deletion,
+                root,
+                record.FileReferenceNumber))
+        {
+            return true;
+        }
+
         return false;
+    }
+
+    private bool TryCaptureHistoricalLogFileSnapshot(
+        DeletionRecord deletion,
+        string root,
+        ulong fileReferenceNumber)
+    {
+        try
+        {
+            var sizeReader = new NtfsLogFileHistoricalSizeService();
+
+            if (!sizeReader.TryRecoverFileSize(
+                    root,
+                    deletion.FileName,
+                    deletion.ParentFileReferenceNumber!.Value,
+                    new DriveInfo(root).TotalSize,
+                    out var historicalSize,
+                    out var sizeEvidence) ||
+                historicalSize <= 0 ||
+                historicalSize > DeleteSnapshotMaxBytes)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile historical snapshot: size lookup failed for " +
+                    $"{deletion.FullPath}: {sizeEvidence}");
+                return false;
+            }
+
+            var dataReader =
+                new NtfsLogFileHistoricalDataService();
+
+            if (!dataReader.TryRecoverFileData(
+                    root,
+                    fileReferenceNumber,
+                    deletion.FileName,
+                    historicalSize,
+                    DeleteSnapshotMaxBytes,
+                    out var recoveredData,
+                    out var dataEvidence))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile historical snapshot: data lookup failed for " +
+                    $"{deletion.FullPath}: {dataEvidence}");
+                return false;
+            }
+
+            if (recoveredData.LongLength != historicalSize)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile historical snapshot: size mismatch for " +
+                    $"{deletion.FullPath}: expected={historicalSize:N0}, " +
+                    $"actual={recoveredData.LongLength:N0}.");
+                return false;
+            }
+
+            if (!_snapshotStore.TrySave(
+                    deletion.Id,
+                    recoveredData,
+                    out var dataFileName,
+                    out var sha256))
+            {
+                return false;
+            }
+
+            deletion.FileSizeBytes = historicalSize;
+            deletion.RecoveryStrength = "Strong";
+            deletion.NtfsDataSnapshot = new NtfsDeletionDataSnapshot
+            {
+                DataCaptured = true,
+                IsResident = false,
+                FileSizeBytes = historicalSize,
+                ValidDataLengthBytes = historicalSize,
+                CapturedByteCount = recoveredData.LongLength,
+                DataFileName = dataFileName,
+                Sha256 = sha256,
+                CapturedAtUtc = DateTime.UtcNow,
+                Evidence =
+                    $"Recovered from exact NTFS $LogFile mapping pairs. " +
+                    $"{dataEvidence} Historical-size evidence: {sizeEvidence}"
+            };
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile historical snapshot saved: " +
+                $"path={deletion.FullPath}, fileRef={fileReferenceNumber}, " +
+                $"size={recoveredData.LongLength:N0}, " +
+                $"dataFile={dataFileName}, sha256={sha256}.");
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile historical snapshot failed: " +
+                $"{deletion.FullPath}: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
     }
 
     public bool TryCaptureRecentDeletionSnapshot(DeletionRecord deletion)
