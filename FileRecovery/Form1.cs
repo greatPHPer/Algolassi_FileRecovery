@@ -524,11 +524,11 @@ public partial class Form1 : Form
 
         try
         {
-            var deletedRecords = await Task.Run(() =>
+            var deletedRecords = //await Task.Run(() =>
                 _usnMonitor.ScanDeletedDirectory(
                     scanDirectory,
                     includeSubdirectories,
-                    CancellationToken.None));
+                    CancellationToken.None);//);
 
             // The background monitor can observe a deletion immediately while this
             // on-demand historical journal reconstruction can still miss that same
