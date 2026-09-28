@@ -17,7 +17,9 @@ public sealed class NtfsLogFileHistoricalDataService
     private const int ErrorIoPending = 997;
 
     private const ushort OpenNonresidentAttribute = 0x001C;
+    private const ushort UpdateResidentValue = 0x0007;
     private const ushort UpdateMappingPairs = 0x0009;
+    private const uint NtfsAttributeTypeData = 0x00000080;
     private const uint LfsClientRecord = 0x0001;
     private const int RecordHeaderMinimumLength = 48;
     private const long MaxLogBytesToRead = 128L * 1024L * 1024L;
@@ -110,6 +112,22 @@ public sealed class NtfsLogFileHistoricalDataService
                 logData,
                 geometry,
                 volumeInfo.BytesPerSector);
+
+            // Small plain-text files normally keep their $DATA value resident
+            // inside the MFT record. UpdateMappingPairs only covers nonresident
+            // data, so try the exact historical UpdateResidentValue records first.
+            if (TryRecoverResidentFileData(
+                    records,
+                    fileReferenceNumber,
+                    fileSizeBytes,
+                    volumeInfo.BytesPerCluster,
+                    volumeInfo.BytesPerFileRecordSegment,
+                    out data,
+                    out var residentEvidence))
+            {
+                evidence = residentEvidence;
+                return true;
+            }
 
             var mappingCandidates =
                 FindTargetMappingCandidates(
@@ -243,6 +261,331 @@ public sealed class NtfsLogFileHistoricalDataService
 
             return false;
         }
+    }
+
+    private static bool TryRecoverResidentFileData(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetFileReference,
+        long fileSizeBytes,
+        uint bytesPerCluster,
+        uint bytesPerFileRecordSegment,
+        out byte[] data,
+        out string evidence)
+    {
+        data = [];
+        evidence = string.Empty;
+
+        var targetSegment =
+            targetFileReference &
+            0x0000FFFFFFFFFFFFUL;
+
+        var targetSequence =
+            checked((ushort)(targetFileReference >> 48));
+
+        var definitions =
+            FindResidentDataDefinitions(
+                records,
+                targetSegment,
+                targetSequence,
+                fileSizeBytes,
+                bytesPerCluster,
+                bytesPerFileRecordSegment);
+
+        var definitionSummary =
+            definitions.Count == 0
+                ? "none"
+                : string.Join(
+                    ", ",
+                    definitions.Select(
+                        item =>
+                            $"offset=0x{item.DataOffset:X}, size={item.InitialValue.Length:N0}"));
+
+        var updates =
+            records
+                .Where(record =>
+                    CalculateTargetMftSegment(
+                        record,
+                        bytesPerCluster,
+                        bytesPerFileRecordSegment) == targetSegment &&
+                    (record.RedoOperation == UpdateResidentValue ||
+                     record.UndoOperation == UpdateResidentValue))
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS $LogFile resident data scan: " +
+            $"targetSegment={targetSegment:N0}, " +
+            $"targetSequence={targetSequence}, " +
+            $"dataDefinitions={definitions.Count:N0} [{definitionSummary}], " +
+            $"UpdateResidentValueRecords={updates.Count:N0}, " +
+            $"targetSize={fileSizeBytes:N0}.");
+
+        if (definitions.Count == 0 || updates.Count == 0)
+        {
+            evidence =
+                $"Exact historical MFT segment {targetSegment:N0} / sequence " +
+                $"{targetSequence} had {definitions.Count:N0} unnamed resident " +
+                $"$DATA definition(s) and {updates.Count:N0} UpdateResidentValue record(s).";
+            return false;
+        }
+
+        foreach (var definition in definitions
+                     .OrderBy(item => item.DataOffset))
+        {
+            var recovered = new byte[checked((int)fileSizeBytes)];
+            var covered = new bool[recovered.Length];
+
+            var initialLength =
+                Math.Min(
+                    definition.InitialValue.Length,
+                    recovered.Length);
+
+            if (initialLength > 0)
+            {
+                Buffer.BlockCopy(
+                    definition.InitialValue,
+                    0,
+                    recovered,
+                    0,
+                    initialLength);
+
+                Array.Fill(
+                    covered,
+                    true,
+                    0,
+                    initialLength);
+            }
+
+            foreach (var record in updates)
+            {
+                var patch =
+                    record.RedoOperation == UpdateResidentValue
+                        ? record.RedoData
+                        : record.UndoData;
+
+                if (patch.Length == 0)
+                {
+                    continue;
+                }
+
+                var targetOffset =
+                    checked(
+                        record.RecordOffset +
+                        record.AttributeOffset);
+
+                var relativeOffset =
+                    targetOffset -
+                    definition.DataOffset;
+
+                if (relativeOffset < 0 ||
+                    relativeOffset >= recovered.Length)
+                {
+                    continue;
+                }
+
+                var bytesToCopy =
+                    Math.Min(
+                        patch.Length,
+                        recovered.Length -
+                        relativeOffset);
+
+                if (bytesToCopy <= 0)
+                {
+                    continue;
+                }
+
+                Buffer.BlockCopy(
+                    patch,
+                    0,
+                    recovered,
+                    checked((int)relativeOffset),
+                    bytesToCopy);
+
+                Array.Fill(
+                    covered,
+                    true,
+                    checked((int)relativeOffset),
+                    bytesToCopy);
+            }
+
+            if (!covered.All(value => value))
+            {
+                continue;
+            }
+
+            data = recovered;
+
+            evidence =
+                $"Recovered {data.LongLength:N0} byte(s) from exact NTFS " +
+                $"$LogFile resident $DATA history at MFT segment " +
+                $"{targetSegment:N0}, sequence {targetSequence}. " +
+                $"The resident $DATA attribute was tied to the same exact " +
+                $"deleted MFT generation and reconstructed from " +
+                $"{updates.Count:N0} UpdateResidentValue record(s).";
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile resident historical data recovery succeeded: " +
+                $"fileRef={targetFileReference}, " +
+                $"segment={targetSegment:N0}, " +
+                $"sequence={targetSequence}, " +
+                $"size={data.LongLength:N0}, " +
+                $"updates={updates.Count:N0}.");
+
+            return true;
+        }
+
+        evidence =
+            $"Exact NTFS $LogFile resident $DATA definition(s) were found for " +
+            $"MFT segment {targetSegment:N0}, sequence {targetSequence}, but " +
+            $"the retained resident updates did not cover all {fileSizeBytes:N0} byte(s).";
+        return false;
+    }
+
+    private static List<ResidentDataDefinition> FindResidentDataDefinitions(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetSegment,
+        ushort targetSequence,
+        long expectedSize,
+        uint bytesPerCluster,
+        uint bytesPerFileRecordSegment)
+    {
+        var definitions =
+            new Dictionary<long, ResidentDataDefinition>();
+
+        foreach (var record in records
+                     .OrderBy(item => item.Lsn)
+                     .ThenBy(item => item.PhysicalOrder))
+        {
+            var segment =
+                CalculateTargetMftSegment(
+                    record,
+                    bytesPerCluster,
+                    bytesPerFileRecordSegment);
+
+            if (segment != targetSegment ||
+                record.RedoOperation != 0x0002)
+            {
+                continue;
+            }
+
+            if (TryFindUnnamedResidentDataAttributes(
+                    record.RedoData,
+                    targetSequence,
+                    expectedSize,
+                    out var initialized))
+            {
+                foreach (var item in initialized)
+                {
+                    definitions[item.DataOffset] = item;
+                }
+            }
+        }
+
+        return definitions.Values.ToList();
+    }
+
+    private static bool TryFindUnnamedResidentDataAttributes(
+        byte[] recordData,
+        ushort expectedSequence,
+        long expectedSize,
+        out List<ResidentDataDefinition> definitions)
+    {
+        definitions = [];
+
+        if (recordData.Length < 24 ||
+            recordData[0] != (byte)'F' ||
+            recordData[1] != (byte)'I' ||
+            recordData[2] != (byte)'L' ||
+            recordData[3] != (byte)'E' ||
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                recordData.AsSpan(16, 2)) != expectedSequence)
+        {
+            return false;
+        }
+
+        var attributesOffset =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                recordData.AsSpan(20, 2));
+
+        if (attributesOffset < 24 ||
+            attributesOffset >= recordData.Length)
+        {
+            return false;
+        }
+
+        var cursor = attributesOffset;
+
+        while (cursor + 16 <= recordData.Length)
+        {
+            var type =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordData.AsSpan(cursor, 4));
+
+            if (type == 0xFFFFFFFF)
+            {
+                break;
+            }
+
+            var length =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordData.AsSpan(cursor + 4, 4));
+
+            if (length < 24 ||
+                cursor + length > recordData.Length)
+            {
+                break;
+            }
+
+            var nonResident =
+                recordData[cursor + 8] != 0;
+
+            var nameLength =
+                recordData[cursor + 9];
+
+            if (type == NtfsAttributeTypeData &&
+                !nonResident &&
+                nameLength == 0)
+            {
+                var valueLength =
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        recordData.AsSpan(cursor + 16, 4));
+
+                var valueOffset =
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        recordData.AsSpan(cursor + 18, 2));
+
+                if (valueOffset >= 24 &&
+                    valueOffset + valueLength <= length)
+                {
+                    var boundedLength =
+                        Math.Min(
+                            (long)valueLength,
+                            Math.Max(
+                                0,
+                                Math.Min(
+                                    (long)recordData.Length -
+                                    cursor -
+                                    valueOffset,
+                                    expectedSize)));
+
+                    definitions.Add(
+                        new ResidentDataDefinition(
+                            checked((long)cursor + valueOffset),
+                            boundedLength == 0
+                                ? []
+                                : recordData
+                                    .AsSpan(
+                                        checked(cursor + valueOffset),
+                                        checked((int)boundedLength))
+                                    .ToArray()));
+                }
+            }
+
+            cursor += checked((int)length);
+        }
+
+        return definitions.Count > 0;
     }
 
     private static List<MappingCandidate> FindTargetMappingCandidates(
@@ -549,6 +892,14 @@ public sealed class NtfsLogFileHistoricalDataService
                         BinaryPrimitives.ReadUInt16LittleEndian(
                             clientData.AsSpan(12, 2));
 
+                    var recordOffset =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientData.AsSpan(16, 2));
+
+                    var attributeOffset =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientData.AsSpan(18, 2));
+
                     var targetVcn =
                         BinaryPrimitives.ReadInt64LittleEndian(
                             clientData.AsSpan(24, 8));
@@ -568,6 +919,8 @@ public sealed class NtfsLogFileHistoricalDataService
                             redoOperation,
                             undoOperation,
                             targetAttribute,
+                            recordOffset,
+                            attributeOffset,
                             targetVcn,
                             clusterBlockOffset,
                             targetBlockSize,
@@ -1117,6 +1470,10 @@ public sealed class NtfsLogFileHistoricalDataService
         ulong FileReference,
         string AttributeName);
 
+    private sealed record ResidentDataDefinition(
+        long DataOffset,
+        byte[] InitialValue);
+
     private sealed record MappingCandidate(
         ulong Lsn,
         ushort TargetAttribute,
@@ -1129,6 +1486,8 @@ public sealed class NtfsLogFileHistoricalDataService
         ushort RedoOperation,
         ushort UndoOperation,
         ushort TargetAttribute,
+        ushort RecordOffset,
+        ushort AttributeOffset,
         long TargetVcn,
         ushort ClusterBlockOffset,
         ushort TargetBlockSize,
