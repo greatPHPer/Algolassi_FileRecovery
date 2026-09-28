@@ -326,7 +326,7 @@ public sealed class NtfsLogFileHistoricalDataService
             evidence =
                 $"Exact historical MFT segment {targetSegment:N0} / sequence " +
                 $"{targetSequence} had {definitions.Count:N0} unnamed resident " +
-                $"$DATA definition(s) and {updates.Count:N0} UpdateResidentValue record(s).";
+                $"$DATA definition(s) and {residentUpdates.Count:N0} UpdateResidentValue record(s).";
             return false;
         }
 
@@ -394,7 +394,7 @@ public sealed class NtfsLogFileHistoricalDataService
 
                 var bytesToCopy =
                     Math.Min(
-                        patch.Length,
+                        (long)patch.Length,
                         recovered.Length -
                         relativeOffset);
 
@@ -408,13 +408,13 @@ public sealed class NtfsLogFileHistoricalDataService
                     0,
                     recovered,
                     checked((int)relativeOffset),
-                    bytesToCopy);
+                    checked((int)bytesToCopy));
 
                 Array.Fill(
                     covered,
                     true,
                     checked((int)relativeOffset),
-                    bytesToCopy);
+                    checked((int)bytesToCopy));
             }
 
             if (!covered.All(value => value))
@@ -541,7 +541,7 @@ public sealed class NtfsLogFileHistoricalDataService
             return false;
         }
 
-        var cursor = attributesOffset;
+        var cursor = checked((int)attributesOffset);
 
         while (cursor + 16 <= recordData.Length)
         {
@@ -919,7 +919,7 @@ public sealed class NtfsLogFileHistoricalDataService
                         BinaryPrimitives.ReadUInt16LittleEndian(
                             clientData.AsSpan(12, 2));
 
-                    var recordOffset =
+                    var targetRecordOffset =
                         BinaryPrimitives.ReadUInt16LittleEndian(
                             clientData.AsSpan(16, 2));
 
@@ -946,7 +946,7 @@ public sealed class NtfsLogFileHistoricalDataService
                             redoOperation,
                             undoOperation,
                             targetAttribute,
-                            recordOffset,
+                            targetRecordOffset,
                             attributeOffset,
                             targetVcn,
                             clusterBlockOffset,
