@@ -524,11 +524,10 @@ public partial class Form1 : Form
 
         try
         {
-            var deletedRecords = //await Task.Run(() =>
-                _usnMonitor.ScanDeletedDirectory(
-                    scanDirectory,
-                    includeSubdirectories,
-                    CancellationToken.None);//);
+            var deletedRecords = _usnMonitor.ScanDeletedDirectory(
+                scanDirectory,
+                includeSubdirectories,
+                CancellationToken.None);
 
             // The background monitor can observe a deletion immediately while this
             // on-demand historical journal reconstruction can still miss that same
@@ -737,12 +736,11 @@ public partial class Form1 : Form
                     // exact path for only those recent targets. The timestamp guard
                     // prevents an unrelated older deletion of the same path from
                     // being promoted.
-                    var pathCandidates = /*await Task.Run(() =>
-                        */_mftCandidateScanner.ScanForPaths(
-                            rootPath,
-                            recentTargetRecordsByPath.Keys.ToList(),
-                            CancellationToken.None,
-                            maxPages: 128/*)*/);
+                    var pathCandidates = _mftCandidateScanner.ScanForPaths(
+                        rootPath,
+                        recentTargetRecordsByPath.Keys.ToList(),
+                        CancellationToken.None,
+                        maxPages: 128);
 
                     directLiveCandidates = pathCandidates
                         .Where(candidate =>
@@ -772,11 +770,10 @@ public partial class Form1 : Form
                 }
             }
 
-            var candidates = (/*await Task.Run(() =>*/
-                _mftCandidateScanner.ScanForFileReferences(
-                    rootPath,
-                    targetRecords,
-                    CancellationToken.None)/*)*/)
+            var candidates = _mftCandidateScanner.ScanForFileReferences(
+                rootPath,
+                targetRecords,
+                CancellationToken.None)
                 .ToList();
 
             var candidatePaths = candidates
@@ -1116,93 +1113,7 @@ public partial class Form1 : Form
                         RecoveryCandidate = candidate
                     };
                 })
-                .OrderByDescending(row => row.RecoveryCandidate?.LastUsnTimestampUtc ?? DateTime.MinValue)
-                .ThenBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
-
-            // Normal Explorer Delete moves an item into the Windows Recycle Bin instead
-            // of generating the same permanent-delete evidence as Shift+Delete. Include
-            // matching Recycle Bin items in this NTFS scan view so the user can inspect
-            // both recovery sources from one scan. Keep the selected directory filter
-            // narrow so the grid is not flooded by unrelated Recycle Bin entries.
-            var recycleBinRows = new List<RecoveryDisplayRow>();
-            var recycleBinItemCount = 0;
-            string? recycleBinMergeError = null;
-            try
-            {
-                var recycleItems = await RunInStaAsync(() => _recycleBinService.Scan());
-                recycleBinItemCount = recycleItems.Count;
-
-                foreach (var item in recycleItems)
-                {
-                    if (string.IsNullOrWhiteSpace(item.OriginalLocation) ||
-                        item.OriginalLocation.Equals("(Unavailable)", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    // Reuse the same directory matcher as the standalone Recycle Bin
-                    // scan. This keeps Normal Delete behavior identical in both views.
-                    var directoryMatches = IsDirectoryMatch(
-                        item.OriginalLocation,
-                        scanDirectory);
-
-                    if (!includeSubdirectories &&
-                        !string.Equals(
-                            NormalizeForComparison(item.OriginalLocation).TrimEnd(Path.DirectorySeparatorChar),
-                            NormalizeForComparison(scanDirectory).TrimEnd(Path.DirectorySeparatorChar),
-                            StringComparison.OrdinalIgnoreCase))
-                    {
-                        directoryMatches = false;
-                    }
-
-                    if (!directoryMatches)
-                    {
-                        continue;
-                    }
-
-                    recycleBinRows.Add(new RecoveryDisplayRow
-                    {
-                        Name = item.Name,
-                        DeletedOn = item.DeletedDate,
-                        FileSize = item.Size,
-                        RecoveryStrength = "Strong",
-                        Evidence =
-                            $"Windows Recycle Bin item; original location: {item.OriginalLocation}. " +
-                            "Windows can currently restore this item.",
-                        RecoverableItem = item
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                recycleBinMergeError = $"{ex.GetType().Name}: {ex.Message}";
-                System.Diagnostics.Debug.WriteLine(
-                    $"NTFS scan Recycle Bin merge failed: {recycleBinMergeError}");
-            }
-
-            if (recycleBinRows.Count > 0)
-            {
-                // When the same deleted path is present in both views, prefer the
-                // Recycle Bin representation because it is directly restorable.
-                var recyclePaths = recycleBinRows
-                    .Select(row => NormalizePath(
-                        Path.Combine(
-                            GetRecycleBinOriginalLocation(row),
-                            row.Name)))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-                filtered = filtered
-                    .Where(row =>
-                        row.RecoveryCandidate is null ||
-                        !recyclePaths.Contains(NormalizePath(row.RecoveryCandidate.FullPath)))
-                    .Concat(recycleBinRows)
-                    .OrderByDescending(row =>
-                        row.RecoveryCandidate?.LastUsnTimestampUtc ??
-                        ParseRecycleBinDeletedDate(row.DeletedOn))
-                    .ThenBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-            }
 
             _suppressGridSelectionChanged = true;
             try
@@ -1220,21 +1131,15 @@ public partial class Form1 : Form
 
             _ntfsResultsDisplayed = true;
             lblFiles.Text = $"NTFS candidates ({filtered.Count:N0})";
-            lblStatus.Text = recycleBinMergeError is not null
-                ? $"Found {filtered.Count:N0} NTFS candidate(s) under {scanDirectory}; " +
-                  $"Recycle Bin merge failed: {recycleBinMergeError}"
-                : filtered.Count == 0
-                    ? $"No deleted-file metadata candidates were found under {scanDirectory}; " +
-                      $"Recycle Bin items scanned: {recycleBinItemCount:N0}, matching: {recycleBinRows.Count:N0}."
-                    : mergedLiveHistoryCount > 0 ||
-                      mergedLiveUsnCount > 0 ||
-                      directLiveCandidates.Count > 0 ||
-                      liveEvidenceCandidateCount > 0
-                        ? $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}; " +
-                          $"{mergedLiveUsnCount + mergedLiveHistoryCount + directLiveCandidates.Count + liveEvidenceCandidateCount:N0} recent live deletion evidence item(s) were included; " +
-                          $"Recycle Bin: {recycleBinRows.Count:N0} matching of {recycleBinItemCount:N0} scanned."
-                        : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}; " +
-                          $"Recycle Bin: {recycleBinRows.Count:N0} matching of {recycleBinItemCount:N0} scanned.";
+            lblStatus.Text = filtered.Count == 0
+                ? $"No deleted-file metadata candidates were found under {scanDirectory}."
+                : mergedLiveHistoryCount > 0 ||
+                  mergedLiveUsnCount > 0 ||
+                  directLiveCandidates.Count > 0 ||
+                  liveEvidenceCandidateCount > 0
+                    ? $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}; " +
+                      $"{mergedLiveUsnCount + mergedLiveHistoryCount + directLiveCandidates.Count + liveEvidenceCandidateCount:N0} recent live deletion evidence item(s) were included."
+                    : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}.";
         }
         catch (UnauthorizedAccessException)
         {
