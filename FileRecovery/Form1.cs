@@ -772,11 +772,11 @@ public partial class Form1 : Form
                 }
             }
 
-            var candidates = (await Task.Run(() =>
-                    _mftCandidateScanner.ScanForFileReferences(
-                        rootPath,
-                        targetRecords,
-                        CancellationToken.None)))
+            var candidates = (/*await Task.Run(() =>*/
+                _mftCandidateScanner.ScanForFileReferences(
+                    rootPath,
+                    targetRecords,
+                    CancellationToken.None)/*)*/)
                 .ToList();
 
             var candidatePaths = candidates
