@@ -300,7 +300,7 @@ public sealed class NtfsLogFileHistoricalDataService
                         item =>
                             $"offset=0x{item.DataOffset:X}, size={item.InitialValue.Length:N0}"));
 
-        var updates =
+        var residentUpdates =
             records
                 .Where(record =>
                     CalculateTargetMftSegment(
@@ -318,10 +318,10 @@ public sealed class NtfsLogFileHistoricalDataService
             $"targetSegment={targetSegment:N0}, " +
             $"targetSequence={targetSequence}, " +
             $"dataDefinitions={definitions.Count:N0} [{definitionSummary}], " +
-            $"UpdateResidentValueRecords={updates.Count:N0}, " +
+            $"UpdateResidentValueRecords={residentUpdates.Count:N0}, " +
             $"targetSize={fileSizeBytes:N0}.");
 
-        if (definitions.Count == 0 || updates.Count == 0)
+        if (definitions.Count == 0)
         {
             evidence =
                 $"Exact historical MFT segment {targetSegment:N0} / sequence " +
@@ -333,6 +333,14 @@ public sealed class NtfsLogFileHistoricalDataService
         foreach (var definition in definitions
                      .OrderBy(item => item.DataOffset))
         {
+            var updates =
+                residentUpdates
+                    .Where(record =>
+                        record.Lsn > definition.GenerationStartLsn &&
+                        (!definition.GenerationEndLsnExclusive.HasValue ||
+                         record.Lsn < definition.GenerationEndLsnExclusive.Value))
+                    .ToList();
+
             var recovered = new byte[checked((int)fileSizeBytes)];
             var covered = new bool[recovered.Length];
 
@@ -422,7 +430,8 @@ public sealed class NtfsLogFileHistoricalDataService
                 $"{targetSegment:N0}, sequence {targetSequence}. " +
                 $"The resident $DATA attribute was tied to the same exact " +
                 $"deleted MFT generation and reconstructed from " +
-                $"{updates.Count:N0} UpdateResidentValue record(s).";
+                $"{updates.Count:N0} UpdateResidentValue record(s) " +
+                $"within that exact generation.";
 
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS $LogFile resident historical data recovery succeeded: " +
@@ -450,39 +459,57 @@ public sealed class NtfsLogFileHistoricalDataService
         uint bytesPerCluster,
         uint bytesPerFileRecordSegment)
     {
+        var initializations =
+            records
+                .Where(record =>
+                    record.RedoOperation == 0x0002 &&
+                    CalculateTargetMftSegment(
+                        record,
+                        bytesPerCluster,
+                        bytesPerFileRecordSegment) == targetSegment)
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
+
         var definitions =
-            new Dictionary<long, ResidentDataDefinition>();
+            new List<ResidentDataDefinition>();
 
-        foreach (var record in records
-                     .OrderBy(item => item.Lsn)
-                     .ThenBy(item => item.PhysicalOrder))
+        for (var i = 0; i < initializations.Count; i++)
         {
-            var segment =
-                CalculateTargetMftSegment(
-                    record,
-                    bytesPerCluster,
-                    bytesPerFileRecordSegment);
+            var record = initializations[i];
 
-            if (segment != targetSegment ||
-                record.RedoOperation != 0x0002)
-            {
-                continue;
-            }
-
-            if (TryFindUnnamedResidentDataAttributes(
+            if (!TryFindUnnamedResidentDataAttributes(
                     record.RedoData,
                     targetSequence,
                     expectedSize,
                     out var initialized))
             {
-                foreach (var item in initialized)
+                continue;
+            }
+
+            ulong? nextGenerationLsn = null;
+
+            for (var j = i + 1; j < initializations.Count; j++)
+            {
+                if (initializations[j].Lsn > record.Lsn)
                 {
-                    definitions[item.DataOffset] = item;
+                    nextGenerationLsn = initializations[j].Lsn;
+                    break;
                 }
+            }
+
+            foreach (var item in initialized)
+            {
+                definitions.Add(
+                    item with
+                    {
+                        GenerationStartLsn = record.Lsn,
+                        GenerationEndLsnExclusive = nextGenerationLsn
+                    });
             }
         }
 
-        return definitions.Values.ToList();
+        return definitions;
     }
 
     private static bool TryFindUnnamedResidentDataAttributes(
@@ -1472,7 +1499,9 @@ public sealed class NtfsLogFileHistoricalDataService
 
     private sealed record ResidentDataDefinition(
         long DataOffset,
-        byte[] InitialValue);
+        byte[] InitialValue,
+        ulong GenerationStartLsn = 0,
+        ulong? GenerationEndLsnExclusive = null);
 
     private sealed record MappingCandidate(
         ulong Lsn,
