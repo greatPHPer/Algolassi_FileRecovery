@@ -529,6 +529,40 @@ public partial class Form1 : Form
                 includeSubdirectories,
                 CancellationToken.None);
 
+            // When AlgoLassi is opened after Shift+Delete, the historical USN scan
+            // can discover the deletion even though the background monitor was not
+            // running when it happened. Capture the NTFS $DATA snapshot immediately
+            // from the exact file/parent references returned by that historical USN
+            // record so recovery does not depend on having the app open at delete time.
+            var historicalSnapshotCutoffUtc = DateTime.UtcNow.AddMinutes(-15);
+            var historicalSnapshotsCaptured = 0;
+
+            foreach (var deletedRecord in deletedRecords.Where(record =>
+                         record.DeletedAtUtc >= historicalSnapshotCutoffUtc))
+            {
+                try
+                {
+                    if (_usnMonitor.TryCaptureHistoricalDeletionSnapshot(
+                            deletedRecord,
+                            out var snapshotRecord))
+                    {
+                        _history.Upsert(snapshotRecord);
+                        historicalSnapshotsCaptured++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS historical deletion snapshot failed: " +
+                        $"{deletedRecord.FullPath}: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS historical deletion snapshots: " +
+                $"recentRecords={deletedRecords.Count(record => record.DeletedAtUtc >= historicalSnapshotCutoffUtc):N0}, " +
+                $"captured={historicalSnapshotsCaptured:N0}.");
+
             // The background monitor can observe a deletion immediately while this
             // on-demand historical journal reconstruction can still miss that same
             // event because parent-path resolution is timing-sensitive. First repair
