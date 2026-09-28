@@ -2326,8 +2326,7 @@ public partial class Form1 : Form
                 // live/deleted text such as an old source-file copy.
                 // Require a distinctive user-supplied marker before whole-volume text
                 // recovery is attempted.
-                if (candidate.FileSizeBytes <= 0 &&
-                    Path.GetExtension(candidate.Name).Equals(
+                if (Path.GetExtension(candidate.Name).Equals(
                         ".txt",
                         StringComparison.OrdinalIgnoreCase))
                 {
@@ -2338,8 +2337,8 @@ public partial class Form1 : Form
                         !forensicMarkerDeclined.Contains(markerKey))
                     {
                         var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
-                            $"The original size of '{candidate.Name}' is unknown.\r\n\r\n" +
-                            "Enter a unique text string that was definitely contained in this " +
+                            $"Enter a unique text string that was definitely contained in '{candidate.Name}'.\r\n\r\n" +
+                            "AlgoLassi will search every byte of the source volume " +
                             "deleted file. AlgoLassi will search every byte of the source volume " +
                             "for that exact UTF-8 marker before attempting broader carving.\r\n\r\n" +
                             "Leave this blank to skip the whole-volume forensic scan.",
