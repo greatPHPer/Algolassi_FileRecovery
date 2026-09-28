@@ -541,6 +541,33 @@ public partial class Form1 : Form
                 .OrderByDescending(record => record.DeletedAtUtc)
                 .ToList();
 
+            // Give recent deletions one direct USN-journal-tail snapshot attempt before
+            // the broader historical scan. This is independent of the background monitor
+            // cursor, so a large journal backlog cannot delay deletion-time $DATA capture.
+            foreach (var recentRecord in historyRecords.Where(record =>
+                         record.DeletedAtUtc >= recentHistoryCutoffUtc))
+            {
+                if (recentRecord.NtfsDataSnapshot?.IsComplete == true)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (_usnMonitor.TryCaptureRecentDeletionSnapshot(recentRecord))
+                    {
+                        await Task.Run(() => _history.Upsert(recentRecord))
+                            .ConfigureAwait(true);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS recent deletion snapshot retry failed: " +
+                        $"{recentRecord.FullPath}: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
             // ScanDeletedDirectory() already reconstructs the historical USN journal for
             // the selected directory. If a history row predates this application session,
             // copy the exact historical file/parent reference from that journal result
