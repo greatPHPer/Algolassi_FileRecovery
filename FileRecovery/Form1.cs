@@ -524,44 +524,49 @@ public partial class Form1 : Form
 
         try
         {
+            // Capture recent historical deletions while the USN journal is being
+            // enumerated. This avoids waiting for the entire journal scan to finish
+            // before reading the deleted MFT record and its $DATA stream.
+            var historicalSnapshotCutoffUtc = DateTime.UtcNow.AddMinutes(-15);
+            var historicalSnapshotRecords = new List<DeletionRecord>();
+
             var deletedRecords = _usnMonitor.ScanDeletedDirectory(
                 scanDirectory,
                 includeSubdirectories,
-                CancellationToken.None);
-
-            // When AlgoLassi is opened after Shift+Delete, the historical USN scan
-            // can discover the deletion even though the background monitor was not
-            // running when it happened. Capture the NTFS $DATA snapshot immediately
-            // from the exact file/parent references returned by that historical USN
-            // record so recovery does not depend on having the app open at delete time.
-            var historicalSnapshotCutoffUtc = DateTime.UtcNow.AddMinutes(-15);
-            var historicalSnapshotsCaptured = 0;
-
-            foreach (var deletedRecord in deletedRecords.Where(record =>
-                         record.DeletedAtUtc >= historicalSnapshotCutoffUtc))
-            {
-                try
+                CancellationToken.None,
+                deletedRecord =>
                 {
-                    if (_usnMonitor.TryCaptureHistoricalDeletionSnapshot(
-                            deletedRecord,
-                            out var snapshotRecord))
+                    if (deletedRecord.DeletedAtUtc < historicalSnapshotCutoffUtc)
                     {
-                        _history.Upsert(snapshotRecord);
-                        historicalSnapshotsCaptured++;
+                        return;
                     }
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"NTFS historical deletion snapshot failed: " +
-                        $"{deletedRecord.FullPath}: {ex.GetType().Name}: {ex.Message}");
-                }
+
+                    try
+                    {
+                        if (_usnMonitor.TryCaptureHistoricalDeletionSnapshot(
+                                deletedRecord,
+                                out var snapshotRecord))
+                        {
+                            historicalSnapshotRecords.Add(snapshotRecord);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"NTFS historical deletion snapshot failed: " +
+                            $"{deletedRecord.FullPath}: {ex.GetType().Name}: {ex.Message}");
+                    }
+                });
+
+            foreach (var snapshotRecord in historicalSnapshotRecords)
+            {
+                _history.Upsert(snapshotRecord);
             }
 
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS historical deletion snapshots: " +
                 $"recentRecords={deletedRecords.Count(record => record.DeletedAtUtc >= historicalSnapshotCutoffUtc):N0}, " +
-                $"captured={historicalSnapshotsCaptured:N0}.");
+                $"captured={historicalSnapshotRecords.Count:N0}.");
 
             // The background monitor can observe a deletion immediately while this
             // on-demand historical journal reconstruction can still miss that same
