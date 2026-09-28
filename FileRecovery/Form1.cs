@@ -1123,9 +1123,12 @@ public partial class Form1 : Form
             // both recovery sources from one scan. Keep the selected directory filter
             // narrow so the grid is not flooded by unrelated Recycle Bin entries.
             var recycleBinRows = new List<RecoveryDisplayRow>();
+            var recycleBinItemCount = 0;
+            string? recycleBinMergeError = null;
             try
             {
                 var recycleItems = await RunInStaAsync(() => _recycleBinService.Scan());
+                recycleBinItemCount = recycleItems.Count;
 
                 foreach (var item in recycleItems)
                 {
@@ -1172,8 +1175,9 @@ public partial class Form1 : Form
             }
             catch (Exception ex)
             {
+                recycleBinMergeError = $"{ex.GetType().Name}: {ex.Message}";
                 System.Diagnostics.Debug.WriteLine(
-                    $"NTFS scan Recycle Bin merge failed: {ex.GetType().Name}: {ex.Message}");
+                    $"NTFS scan Recycle Bin merge failed: {recycleBinMergeError}");
             }
 
             if (recycleBinRows.Count > 0)
@@ -1215,15 +1219,21 @@ public partial class Form1 : Form
 
             _ntfsResultsDisplayed = true;
             lblFiles.Text = $"NTFS candidates ({filtered.Count:N0})";
-            lblStatus.Text = filtered.Count == 0
-                ? $"No deleted-file metadata candidates were found under {scanDirectory}."
-                : mergedLiveHistoryCount > 0 ||
-                  mergedLiveUsnCount > 0 ||
-                  directLiveCandidates.Count > 0 ||
-                  liveEvidenceCandidateCount > 0
-                    ? $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}; " +
-                      $"{mergedLiveUsnCount + mergedLiveHistoryCount + directLiveCandidates.Count + liveEvidenceCandidateCount:N0} recent live deletion evidence item(s) were included."
-                    : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}.";
+            lblStatus.Text = recycleBinMergeError is not null
+                ? $"Found {filtered.Count:N0} NTFS candidate(s) under {scanDirectory}; " +
+                  $"Recycle Bin merge failed: {recycleBinMergeError}"
+                : filtered.Count == 0
+                    ? $"No deleted-file metadata candidates were found under {scanDirectory}; " +
+                      $"Recycle Bin items scanned: {recycleBinItemCount:N0}, matching: {recycleBinRows.Count:N0}."
+                    : mergedLiveHistoryCount > 0 ||
+                      mergedLiveUsnCount > 0 ||
+                      directLiveCandidates.Count > 0 ||
+                      liveEvidenceCandidateCount > 0
+                        ? $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}; " +
+                          $"{mergedLiveUsnCount + mergedLiveHistoryCount + directLiveCandidates.Count + liveEvidenceCandidateCount:N0} recent live deletion evidence item(s) were included; " +
+                          $"Recycle Bin: {recycleBinRows.Count:N0} matching of {recycleBinItemCount:N0} scanned."
+                        : $"Found {filtered.Count:N0} deleted-file candidate(s) under {scanDirectory}; " +
+                          $"Recycle Bin: {recycleBinRows.Count:N0} matching of {recycleBinItemCount:N0} scanned.";
         }
         catch (UnauthorizedAccessException)
         {
