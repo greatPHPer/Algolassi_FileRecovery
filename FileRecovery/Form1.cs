@@ -737,12 +737,12 @@ public partial class Form1 : Form
                     // exact path for only those recent targets. The timestamp guard
                     // prevents an unrelated older deletion of the same path from
                     // being promoted.
-                    var pathCandidates = await Task.Run(() =>
-                        _mftCandidateScanner.ScanForPaths(
+                    var pathCandidates = /*await Task.Run(() =>
+                        */_mftCandidateScanner.ScanForPaths(
                             rootPath,
                             recentTargetRecordsByPath.Keys.ToList(),
                             CancellationToken.None,
-                            maxPages: 128));
+                            maxPages: 128/*)*/);
 
                     directLiveCandidates = pathCandidates
                         .Where(candidate =>
