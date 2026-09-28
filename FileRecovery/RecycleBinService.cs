@@ -139,6 +139,25 @@ public sealed class RecycleBinService
             }
         }
 
+        // Windows uses these standard Recycle Bin Details columns on the
+        // English Shell: Name=0, Original Location=1, Date Deleted=2, Size=3.
+        // Header discovery can fail on localized/custom Shell configurations,
+        // so retain the known column positions as safe fallbacks.
+        if (originalLocation < 0)
+        {
+            originalLocation = 1;
+        }
+
+        if (deletedDate < 0)
+        {
+            deletedDate = 2;
+        }
+
+        if (size < 0)
+        {
+            size = 3;
+        }
+
         return (originalLocation, deletedDate, size);
     }
 
