@@ -1117,6 +1117,88 @@ public partial class Form1 : Form
                 .ThenBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
+            // Normal Explorer Delete moves an item into the Windows Recycle Bin instead
+            // of generating the same permanent-delete evidence as Shift+Delete. Include
+            // matching Recycle Bin items in this NTFS scan view so the user can inspect
+            // both recovery sources from one scan. Keep the selected directory filter
+            // narrow so the grid is not flooded by unrelated Recycle Bin entries.
+            var recycleBinRows = new List<RecoveryDisplayRow>();
+            try
+            {
+                var recycleItems = await RunInStaAsync(() => _recycleBinService.Scan());
+
+                foreach (var item in recycleItems)
+                {
+                    var originalLocation = NormalizePath(item.OriginalLocation);
+                    var normalizedScanDirectory =
+                        NormalizePath(scanDirectory).TrimEnd(Path.DirectorySeparatorChar);
+
+                    if (string.IsNullOrWhiteSpace(originalLocation) ||
+                        originalLocation.Equals("(Unavailable)", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var normalizedOriginalLocation =
+                        originalLocation.TrimEnd(Path.DirectorySeparatorChar);
+
+                    var directoryMatches =
+                        string.Equals(
+                            normalizedOriginalLocation,
+                            normalizedScanDirectory,
+                            StringComparison.OrdinalIgnoreCase) ||
+                        (includeSubdirectories &&
+                         normalizedOriginalLocation.StartsWith(
+                             normalizedScanDirectory + Path.DirectorySeparatorChar,
+                             StringComparison.OrdinalIgnoreCase));
+
+                    if (!directoryMatches)
+                    {
+                        continue;
+                    }
+
+                    recycleBinRows.Add(new RecoveryDisplayRow
+                    {
+                        Name = item.Name,
+                        DeletedOn = item.DeletedDate,
+                        FileSize = item.Size,
+                        RecoveryStrength = "Strong",
+                        Evidence =
+                            $"Windows Recycle Bin item; original location: {item.OriginalLocation}. " +
+                            "Windows can currently restore this item.",
+                        RecoverableItem = item
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS scan Recycle Bin merge failed: {ex.GetType().Name}: {ex.Message}");
+            }
+
+            if (recycleBinRows.Count > 0)
+            {
+                // When the same deleted path is present in both views, prefer the
+                // Recycle Bin representation because it is directly restorable.
+                var recyclePaths = recycleBinRows
+                    .Select(row => NormalizePath(
+                        Path.Combine(
+                            GetRecycleBinOriginalLocation(row),
+                            row.Name)))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                filtered = filtered
+                    .Where(row =>
+                        row.RecoveryCandidate is null ||
+                        !recyclePaths.Contains(NormalizePath(row.RecoveryCandidate.FullPath)))
+                    .Concat(recycleBinRows)
+                    .OrderByDescending(row =>
+                        row.RecoveryCandidate?.LastUsnTimestampUtc ??
+                        ParseRecycleBinDeletedDate(row.DeletedOn))
+                    .ThenBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+            }
+
             _suppressGridSelectionChanged = true;
             try
             {
@@ -1169,6 +1251,35 @@ public partial class Form1 : Form
             SetBusy(false);
             UpdateRecoverButton();
         }
+    }
+
+    private static string GetRecycleBinOriginalLocation(RecoveryDisplayRow row)
+    {
+        var evidence = row.Evidence ?? string.Empty;
+        const string marker = "original location: ";
+
+        var start = evidence.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0)
+        {
+            return string.Empty;
+        }
+
+        start += marker.Length;
+        var end = evidence.IndexOf('.', start);
+        return end > start
+            ? evidence[start..end].Trim()
+            : evidence[start..].Trim();
+    }
+
+    private static DateTime ParseRecycleBinDeletedDate(string value)
+    {
+        return DateTime.TryParse(
+            value,
+            System.Globalization.CultureInfo.CurrentCulture,
+            System.Globalization.DateTimeStyles.AllowWhiteSpaces,
+            out var parsed)
+            ? parsed.ToUniversalTime()
+            : DateTime.MinValue;
     }
 
     private static string NormalizeForComparison(string path)
