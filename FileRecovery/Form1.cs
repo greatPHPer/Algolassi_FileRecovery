@@ -524,10 +524,11 @@ public partial class Form1 : Form
 
         try
         {
-            var deletedRecords = _usnMonitor.ScanDeletedDirectory(
-                scanDirectory,
-                includeSubdirectories,
-                CancellationToken.None);
+            var deletedRecords = await Task.Run(() =>
+                _usnMonitor.ScanDeletedDirectory(
+                    scanDirectory,
+                    includeSubdirectories,
+                    CancellationToken.None));
 
             // The background monitor can observe a deletion immediately while this
             // on-demand historical journal reconstruction can still miss that same
@@ -736,11 +737,12 @@ public partial class Form1 : Form
                     // exact path for only those recent targets. The timestamp guard
                     // prevents an unrelated older deletion of the same path from
                     // being promoted.
-                    var pathCandidates = _mftCandidateScanner.ScanForPaths(
-                        rootPath,
-                        recentTargetRecordsByPath.Keys.ToList(),
-                        CancellationToken.None,
-                        maxPages: 128);
+                    var pathCandidates = await Task.Run(() =>
+                        _mftCandidateScanner.ScanForPaths(
+                            rootPath,
+                            recentTargetRecordsByPath.Keys.ToList(),
+                            CancellationToken.None,
+                            maxPages: 128));
 
                     directLiveCandidates = pathCandidates
                         .Where(candidate =>
@@ -770,10 +772,11 @@ public partial class Form1 : Form
                 }
             }
 
-            var candidates = _mftCandidateScanner.ScanForFileReferences(
-                rootPath,
-                targetRecords,
-                CancellationToken.None)
+            var candidates = (await Task.Run(() =>
+                    _mftCandidateScanner.ScanForFileReferences(
+                        rootPath,
+                        targetRecords,
+                        CancellationToken.None)))
                 .ToList();
 
             var candidatePaths = candidates
