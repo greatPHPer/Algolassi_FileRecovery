@@ -282,6 +282,56 @@ public sealed class NtfsLogFileHistoricalDataService
         var targetSequence =
             checked((ushort)(targetFileReference >> 48));
 
+        var targetSegmentRecords =
+            records
+                .Where(record =>
+                    CalculateTargetMftSegment(
+                        record,
+                        bytesPerCluster,
+                        bytesPerFileRecordSegment) == targetSegment)
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
+
+        var operationCounts =
+            targetSegmentRecords
+                .GroupBy(record =>
+                {
+                    var operation =
+                        record.RedoOperation != 0
+                            ? record.RedoOperation
+                            : record.UndoOperation;
+                    return operation;
+                })
+                .OrderBy(group => group.Key)
+                .Select(group => $"0x{group.Key:X4}={group.Count():N0}")
+                .ToArray();
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS $LogFile target MFT diagnostics: " +
+            $"fileRef={targetFileReference}, " +
+            $"segment={targetSegment:N0}, " +
+            $"sequence={targetSequence}, " +
+            $"records={targetSegmentRecords.Count:N0}, " +
+            $"ops={(operationCounts.Length == 0 ? "(none)" : string.Join(", ", operationCounts))}.");
+
+        foreach (var targetRecord in targetSegmentRecords.Take(32))
+        {
+            var redoLength = targetRecord.RedoData.Length;
+            var undoLength = targetRecord.UndoData.Length;
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile target MFT record: " +
+                $"lsn=0x{targetRecord.Lsn:X16}, " +
+                $"redo=0x{targetRecord.RedoOperation:X4}/{redoLength:N0}, " +
+                $"undo=0x{targetRecord.UndoOperation:X4}/{undoLength:N0}, " +
+                $"recordOffset={targetRecord.RecordOffset}, " +
+                $"attributeOffset={targetRecord.AttributeOffset}, " +
+                $"targetVcn={targetRecord.TargetVcn}, " +
+                $"clusterBlock={targetRecord.ClusterBlockOffset}, " +
+                $"targetBlockSize={targetRecord.TargetBlockSize}." );
+        }
+
         var definitions =
             FindResidentDataDefinitions(
                 records,
@@ -323,6 +373,13 @@ public sealed class NtfsLogFileHistoricalDataService
 
         if (definitions.Count == 0)
         {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile resident data scan: " +
+                $"NO resident $DATA definition survived for segment={targetSegment:N0}, " +
+                $"sequence={targetSequence}. " +
+                $"InitializeFileRecordSegment records with an exact sequence were not enough " +
+                $"to reconstruct a resident unnamed $DATA attribute.");
+
             evidence =
                 $"Exact historical MFT segment {targetSegment:N0} / sequence " +
                 $"{targetSequence} had {definitions.Count:N0} unnamed resident " +
@@ -486,6 +543,14 @@ public sealed class NtfsLogFileHistoricalDataService
             {
                 continue;
             }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile resident definition candidate: " +
+                $"lsn=0x{record.Lsn:X16}, " +
+                $"segment={targetSegment:N0}, " +
+                $"sequence={targetSequence}, " +
+                $"attributes={initialized.Count:N0}, " +
+                $"redoBytes={record.RedoData.Length:N0}.");
 
             ulong? nextGenerationLsn = null;
 
