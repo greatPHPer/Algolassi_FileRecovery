@@ -718,10 +718,10 @@ public sealed class NtfsLogFileHistoricalDataService
                     page.AsSpan(60, 4));
 
             if (targetOffset <
-                    geometry.WrappedStartPage *
-                    geometry.LogPageSize ||
+                    (uint)(geometry.WrappedStartPage *
+                        geometry.LogPageSize) ||
                 targetOffset +
-                    geometry.LogPageSize >
+                    (uint)geometry.LogPageSize >
                     (uint)logData.Length ||
                 targetOffset %
                     (uint)geometry.LogPageSize != 0)
