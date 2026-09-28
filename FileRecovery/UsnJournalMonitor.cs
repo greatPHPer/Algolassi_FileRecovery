@@ -761,7 +761,7 @@ public sealed class UsnJournalMonitor : IDisposable
                     DeleteSnapshotMaxBytes,
                     out var stream,
                     out var capturedData,
-                    expectedDeletedAtUtc: deletion.DeletedAtUtc)
+                    expectedDeletedAtUtc: deletion.DeletedAtUtc))
             {
                 return;
             }
