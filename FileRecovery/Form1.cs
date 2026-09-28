@@ -1132,28 +1132,26 @@ public partial class Form1 : Form
 
                 foreach (var item in recycleItems)
                 {
-                    var originalLocation = NormalizePath(item.OriginalLocation);
-                    var normalizedScanDirectory =
-                        NormalizePath(scanDirectory).TrimEnd(Path.DirectorySeparatorChar);
-
-                    if (string.IsNullOrWhiteSpace(originalLocation) ||
-                        originalLocation.Equals("(Unavailable)", StringComparison.OrdinalIgnoreCase))
+                    if (string.IsNullOrWhiteSpace(item.OriginalLocation) ||
+                        item.OriginalLocation.Equals("(Unavailable)", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
 
-                    var normalizedOriginalLocation =
-                        originalLocation.TrimEnd(Path.DirectorySeparatorChar);
+                    // Reuse the same directory matcher as the standalone Recycle Bin
+                    // scan. This keeps Normal Delete behavior identical in both views.
+                    var directoryMatches = IsDirectoryMatch(
+                        item.OriginalLocation,
+                        scanDirectory);
 
-                    var directoryMatches =
-                        string.Equals(
-                            normalizedOriginalLocation,
-                            normalizedScanDirectory,
-                            StringComparison.OrdinalIgnoreCase) ||
-                        (includeSubdirectories &&
-                         normalizedOriginalLocation.StartsWith(
-                             normalizedScanDirectory + Path.DirectorySeparatorChar,
-                             StringComparison.OrdinalIgnoreCase));
+                    if (!includeSubdirectories &&
+                        !string.Equals(
+                            NormalizeForComparison(item.OriginalLocation).TrimEnd(Path.DirectorySeparatorChar),
+                            NormalizeForComparison(scanDirectory).TrimEnd(Path.DirectorySeparatorChar),
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        directoryMatches = false;
+                    }
 
                     if (!directoryMatches)
                     {
