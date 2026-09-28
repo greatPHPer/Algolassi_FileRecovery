@@ -2338,7 +2338,7 @@ public partial class Form1 : Form
                     {
                         var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
                             $"Enter a unique text string that was definitely contained in '{candidate.Name}'.\r\n\r\n" +
-                            "deleted file. AlgoLassi will search every byte of the source volume " +
+                            "AlgoLassi will search every byte of the source volume " +
                             "for that exact UTF-8 marker before attempting broader carving.\r\n\r\n" +
                             "Leave this blank to skip the whole-volume forensic scan.",
                             "Full-volume forensic text scan",
