@@ -1503,7 +1503,7 @@ public sealed class NtfsLogFileHistoricalDataService
 
         var handle =
             CreateFile(
-                $@"\.{volumeName[..2]}",
+                $@"\\\\.{volumeName[..2]}",
                 GenericRead,
                 FileShareRead |
                 FileShareWrite |
