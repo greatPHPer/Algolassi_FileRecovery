@@ -2392,7 +2392,97 @@ public partial class Form1 : Form
                 // at recovery time as well as during the recent-deletion snapshot pass;
                 // otherwise an older deletion can have a known size but never invoke the
                 // exact LogFile data reader.
-                if (Path.GetExtension(candidate.Name).Equals(\n                        ".txt",\n                        StringComparison.OrdinalIgnoreCase) &&\n                    candidate.FileReferenceNumber != 0 &&\n                    candidate.ParentFileReferenceNumber != 0 &&\n                    candidate.FileSizeBytes > 0)\n                {\n                    var sourceRoot = GetSourceVolumeRoot(candidate.FullPath);\n\n                    if (!string.IsNullOrWhiteSpace(sourceRoot) &&\n                        candidate.FileSizeBytes <= 16L * 1024L * 1024L)\n                    {\n                        try\n                        {\n                            var historicalDataReader =\n                                new NtfsLogFileHistoricalDataService();\n\n                            if (historicalDataReader.TryRecoverFileData(\n                                    sourceRoot,\n                                    candidate.FileReferenceNumber,\n                                    candidate.Name,\n                                    candidate.FileSizeBytes,\n                                    16L * 1024L * 1024L,\n                                    out var historicalData,\n                                    out var historicalDataEvidence))\n                            {\n                                var destinationPath =\n                                    RecoveryDestinationPolicy.CreateSafeFilePath(\n                                        destinationDirectory,\n                                        candidate.Name);\n\n                                try\n                                {\n                                    File.WriteAllBytes(\n                                        destinationPath,\n                                        historicalData);\n                                }\n                                catch\n                                {\n                                    try\n                                    {\n                                        if (File.Exists(destinationPath))\n                                        {\n                                            File.Delete(destinationPath);\n                                        }\n                                    }\n                                    catch\n                                    {\n                                        // Preserve the original write failure.\n                                    }\n\n                                    throw;\n                                }\n\n                                successes.Add(new RecoveryResult\n                                {\n                                    Success = true,\n                                    SourcePath = candidate.FullPath,\n                                    DestinationPath = destinationPath,\n                                    BytesRecovered = historicalData.LongLength,\n                                    Evidence =\n                                        $"Recovered {historicalData.LongLength:N0} byte(s) from exact " +\n                                        $"NTFS $LogFile historical data. {historicalDataEvidence}"\n                                });\n\n                                System.Diagnostics.Debug.WriteLine(\n                                    $"NTFS recovery-time $LogFile historical data recovery succeeded: " +\n                                    $"path={candidate.FullPath}, " +\n                                    $"fileRef={candidate.FileReferenceNumber}, " +\n                                    $"size={historicalData.LongLength:N0}.");\n\n                                continue;\n                            }\n\n                            System.Diagnostics.Debug.WriteLine(\n                                $"NTFS recovery-time $LogFile historical data unavailable: " +\n                                $"path={candidate.FullPath}, " +\n                                $"fileRef={candidate.FileReferenceNumber}, " +\n                                $"size={candidate.FileSizeBytes:N0}, " +\n                                $"reason={historicalDataEvidence}");\n                        }\n                        catch (Exception ex)\n                        {\n                            System.Diagnostics.Debug.WriteLine(\n                                $"NTFS recovery-time $LogFile historical data failed: " +\n                                $"{candidate.FullPath}: {ex.GetType().Name}: {ex.Message}");\n                        }\n                    }\n                }\n\n                // Plain text has no intrinsic file boundary, so it must never be
+                if (Path.GetExtension(candidate.Name).Equals(
+                        ".txt",
+                        StringComparison.OrdinalIgnoreCase) &&
+                    candidate.FileReferenceNumber != 0 &&
+                    candidate.ParentFileReferenceNumber != 0 &&
+                    candidate.FileSizeBytes > 0)
+                {
+                    var sourceRoot = GetSourceVolumeRoot(candidate.FullPath);
+
+                    if (!string.IsNullOrWhiteSpace(sourceRoot) &&
+                        candidate.FileSizeBytes <= 16L * 1024L * 1024L)
+                    {
+                        try
+                        {
+                            var historicalDataReader =
+                                new NtfsLogFileHistoricalDataService();
+
+                            if (historicalDataReader.TryRecoverFileData(
+                                    sourceRoot,
+                                    candidate.FileReferenceNumber,
+                                    candidate.Name,
+                                    candidate.FileSizeBytes,
+                                    16L * 1024L * 1024L,
+                                    out var historicalData,
+                                    out var historicalDataEvidence))
+                            {
+                                var destinationPath =
+                                    RecoveryDestinationPolicy.CreateSafeFilePath(
+                                        destinationDirectory,
+                                        candidate.Name);
+
+                                try
+                                {
+                                    File.WriteAllBytes(
+                                        destinationPath,
+                                        historicalData);
+                                }
+                                catch
+                                {
+                                    try
+                                    {
+                                        if (File.Exists(destinationPath))
+                                        {
+                                            File.Delete(destinationPath);
+                                        }
+                                    }
+                                    catch
+                                    {
+                                        // Preserve the original write failure.
+                                    }
+
+                                    throw;
+                                }
+
+                                successes.Add(new RecoveryResult
+                                {
+                                    Success = true,
+                                    SourcePath = candidate.FullPath,
+                                    DestinationPath = destinationPath,
+                                    BytesRecovered = historicalData.LongLength,
+                                    Evidence =
+                                        $"Recovered {historicalData.LongLength:N0} byte(s) from exact " +
+                                        $"NTFS $LogFile historical data. {historicalDataEvidence}"
+                                });
+
+                                System.Diagnostics.Debug.WriteLine(
+                                    $"NTFS recovery-time $LogFile historical data recovery succeeded: " +
+                                    $"path={candidate.FullPath}, " +
+                                    $"fileRef={candidate.FileReferenceNumber}, " +
+                                    $"size={historicalData.LongLength:N0}.");
+
+                                continue;
+                            }
+
+                            System.Diagnostics.Debug.WriteLine(
+                                $"NTFS recovery-time $LogFile historical data unavailable: " +
+                                $"path={candidate.FullPath}, " +
+                                $"fileRef={candidate.FileReferenceNumber}, " +
+                                $"size={candidate.FileSizeBytes:N0}, " +
+                                $"reason={historicalDataEvidence}");
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine(
+                                $"NTFS recovery-time $LogFile historical data failed: " +
+                                $"{candidate.FullPath}: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    }
+                }
+
+                // Plain text has no intrinsic file boundary, so it must never be
                 // automatically accepted from arbitrary free clusters merely because the
                 // candidate size is known. A known size alone can still match unrelated
                 // live/deleted text such as an old source-file copy.
