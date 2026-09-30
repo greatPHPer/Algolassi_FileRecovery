@@ -129,6 +129,25 @@ public sealed class NtfsLogFileHistoricalDataService
                 return true;
             }
 
+            // A nonresident file's runlist can be preserved in the
+            // historical InitializeFileRecordSegment record even when the
+            // $LogFile journal window contains no later UpdateMappingPairs record.
+            // For reused deleted MFT segments this is still an exact identity link:
+            // the FILE record sequence must match the original USN file reference.
+            if (TryRecoverNonresidentDataFromHistoricalMftInitialization(
+                    records,
+                    fileReferenceNumber,
+                    fileSizeBytes,
+                    volumeInfo.BytesPerCluster,
+                    volumeInfo.BytesPerFileRecordSegment,
+                    rawHandle,
+                    out data,
+                    out var historicalMftEvidence))
+            {
+                evidence = historicalMftEvidence;
+                return true;
+            }
+
             var mappingCandidates =
                 FindTargetMappingCandidates(
                     records,
@@ -671,6 +690,336 @@ public sealed class NtfsLogFileHistoricalDataService
                                         checked(cursor + valueOffset),
                                         checked((int)boundedLength))
                                     .ToArray()));
+                }
+            }
+
+            cursor += checked((int)length);
+        }
+
+        return definitions.Count > 0;
+    }
+
+    private static bool TryRecoverNonresidentDataFromHistoricalMftInitialization(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetFileReference,
+        long fileSizeBytes,
+        uint bytesPerCluster,
+        uint bytesPerFileRecordSegment,
+        SafeFileHandle rawVolumeHandle,
+        out byte[] data,
+        out string evidence)
+    {
+        data = [];
+        evidence = string.Empty;
+
+        var targetSegment =
+            targetFileReference &
+            0x0000FFFFFFFFFFFFUL;
+
+        var targetSequence =
+            checked((ushort)(targetFileReference >> 48));
+
+        var initializations =
+            records
+                .Where(record =>
+                    record.RedoOperation == 0x0002 &&
+                    CalculateTargetMftSegment(
+                        record,
+                        bytesPerCluster,
+                        bytesPerFileRecordSegment) == targetSegment)
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile historical nonresident MFT initialization scan: " +
+            $"fileRef={targetFileReference}, " +
+            $"segment={targetSegment:N0}, " +
+            $"sequence={targetSequence}, " +
+            $"initializationRecords={initializations.Count:N0}, " +
+            $"targetSize={fileSizeBytes:N0}.");
+
+        foreach (var initialization in initializations)
+        {
+            if (!TryFindUnnamedNonresidentDataAttributes(
+                    initialization.RedoData,
+                    targetSequence,
+                    fileSizeBytes,
+                    out var definitions))
+            {
+                continue;
+            }
+
+            foreach (var definition in definitions)
+            {
+                var summary =
+                    definition.Extents.Count == 0
+                        ? "none"
+                        : string.Join(
+                            "; ",
+                            definition.Extents.Select(
+                                extent =>
+                                    $"vcn={extent.VirtualClusterNumber:N0}, " +
+                                    $"clusters={extent.ClusterCount:N0}, " +
+                                    $"lcn={(extent.IsSparse ? "sparse" : extent.LogicalClusterNumber.ToString("N0"))}"));
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile historical nonresident $DATA candidate: " +
+                    $"fileRef={targetFileReference}, " +
+                    $"lsn=0x{initialization.Lsn:X16}, " +
+                    $"attributeOffset=0x{definition.AttributeOffset:X}, " +
+                    $"startVcn={definition.StartingVcn:N0}, " +
+                    $"endVcn={definition.EndingVcn:N0}, " +
+                    $"declaredFileSize={definition.FileSizeBytes:N0}, " +
+                    $"mappingBytes={definition.MappingPairsLength:N0}, " +
+                    $"extents={definition.Extents.Count:N0} [{summary}].");
+
+                if (definition.StartingVcn != 0)
+                {
+                    continue;
+                }
+
+                var requiredClusters = checked(
+                    (fileSizeBytes + bytesPerCluster - 1) /
+                    bytesPerCluster);
+
+                if (!TryBuildCompleteChain(
+                        definition.Extents,
+                        requiredClusters,
+                        out var extents,
+                        out var chainEvidence))
+                {
+                    continue;
+                }
+
+                var recovered = new byte[checked((int)fileSizeBytes)];
+                var remaining = fileSizeBytes;
+                var destinationOffset = 0;
+                var expectedVcn = 0L;
+
+                try
+                {
+                    foreach (var extent in extents)
+                    {
+                        if (extent.VirtualClusterNumber != expectedVcn)
+                        {
+                            throw new InvalidDataException(
+                                $"Historical MFT initialization extent chain has a VCN gap at {expectedVcn:N0}.");
+                        }
+
+                        var extentBytes = checked(
+                            extent.ClusterCount * (long)bytesPerCluster);
+
+                        var bytesToRead = Math.Min(
+                            extentBytes,
+                            remaining);
+
+                        if (bytesToRead > 0)
+                        {
+                            if (extent.LogicalClusterNumber < 0)
+                            {
+                                Array.Clear(
+                                    recovered,
+                                    destinationOffset,
+                                    checked((int)bytesToRead));
+                            }
+                            else
+                            {
+                                ReadRawExact(
+                                    rawVolumeHandle,
+                                    checked(
+                                        extent.LogicalClusterNumber *
+                                        (long)bytesPerCluster),
+                                    recovered,
+                                    destinationOffset,
+                                    checked((int)bytesToRead));
+                            }
+
+                            destinationOffset = checked(
+                                destinationOffset + (int)bytesToRead);
+                            remaining -= bytesToRead;
+                        }
+
+                        expectedVcn = checked(
+                            expectedVcn + extent.ClusterCount);
+
+                        if (remaining == 0)
+                        {
+                            break;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS $LogFile historical nonresident MFT initialization read failed: " +
+                        $"fileRef={targetFileReference}, lsn=0x{initialization.Lsn:X16}, " +
+                        $"{ex.GetType().Name}: {ex.Message}");
+                    continue;
+                }
+
+                if (remaining != 0)
+                {
+                    continue;
+                }
+
+                data = recovered;
+
+                evidence =
+                    $"Recovered {data.LongLength:N0} byte(s) from the exact historical " +
+                    $"MFT InitializeFileRecordSegment $DATA runlist. {chainEvidence}";
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile historical nonresident MFT initialization recovery succeeded: " +
+                    $"fileRef={targetFileReference}, " +
+                    $"segment={targetSegment:N0}, " +
+                    $"sequence={targetSequence}, " +
+                    $"size={data.LongLength:N0}, " +
+                    $"lsn=0x{initialization.Lsn:X16}.");
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryFindUnnamedNonresidentDataAttributes(
+        byte[] recordData,
+        ushort expectedSequence,
+        long expectedSize,
+        out List<NonresidentDataDefinition> definitions)
+    {
+        definitions = [];
+
+        if (recordData.Length < 40 ||
+            recordData[0] != (byte)'F' ||
+            recordData[1] != (byte)'I' ||
+            recordData[2] != (byte)'L' ||
+            recordData[3] != (byte)'E' ||
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                recordData.AsSpan(16, 2)) != expectedSequence)
+        {
+            return false;
+        }
+
+        var attributesOffset =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                recordData.AsSpan(20, 2));
+
+        if (attributesOffset < 24 ||
+            attributesOffset >= recordData.Length)
+        {
+            return false;
+        }
+
+        var cursor = checked((int)attributesOffset);
+
+        while (cursor + 16 <= recordData.Length)
+        {
+            var type =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordData.AsSpan(cursor, 4));
+
+            if (type == 0xFFFFFFFF)
+            {
+                break;
+            }
+
+            var length =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordData.AsSpan(cursor + 4, 4));
+
+            if (length < 24 ||
+                cursor + length > recordData.Length)
+            {
+                break;
+            }
+
+            var nonResident =
+                recordData[cursor + 8] != 0;
+
+            var nameLength =
+                recordData[cursor + 9];
+
+            if (type == NtfsAttributeTypeData &&
+                nonResident &&
+                nameLength == 0 &&
+                length >= 64)
+            {
+                var startingVcn =
+                    BinaryPrimitives.ReadInt64LittleEndian(
+                        recordData.AsSpan(cursor + 16, 8));
+
+                var endingVcn =
+                    BinaryPrimitives.ReadInt64LittleEndian(
+                        recordData.AsSpan(cursor + 24, 8));
+
+                var mappingPairsOffset =
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        recordData.AsSpan(cursor + 32, 2));
+
+                var declaredFileSize =
+                    BinaryPrimitives.ReadInt64LittleEndian(
+                        recordData.AsSpan(cursor + 48, 8));
+
+                if (mappingPairsOffset >= 64 &&
+                    mappingPairsOffset < length &&
+                    declaredFileSize >= 0)
+                {
+                    var mappingStart =
+                        checked(cursor + mappingPairsOffset);
+
+                    var mappingLength =
+                        checked((int)length - mappingPairsOffset);
+
+                    var mappingBytes =
+                        recordData.AsSpan(
+                            mappingStart,
+                            mappingLength);
+
+                    var terminator = mappingBytes.IndexOf((byte)0);
+
+                    if (terminator >= 0)
+                    {
+                        var mappingSpan =
+                            mappingBytes[..terminator];
+
+                        try
+                        {
+                            var extents =
+                                NtfsMappingPairsParser.Parse(
+                                    mappingSpan,
+                                    startingVcn);
+
+                            var expectedEndingVcn =
+                                extents.Count == 0
+                                    ? startingVcn - 1
+                                    : checked(
+                                        extents[^1].VirtualClusterNumber +
+                                        extents[^1].ClusterCount -
+                                        1);
+
+                            if (extents.Count > 0 &&
+                                expectedEndingVcn == endingVcn &&
+                                (declaredFileSize == expectedSize ||
+                                 declaredFileSize == 0))
+                            {
+                                definitions.Add(
+                                    new NonresidentDataDefinition(
+                                        checked((long)cursor),
+                                        startingVcn,
+                                        endingVcn,
+                                        declaredFileSize,
+                                        terminator,
+                                        extents));
+                            }
+                        }
+                        catch
+                        {
+                            // Ignore malformed historical attribute candidates.
+                        }
+                    }
                 }
             }
 
@@ -1567,6 +1916,14 @@ public sealed class NtfsLogFileHistoricalDataService
         byte[] InitialValue,
         ulong GenerationStartLsn = 0,
         ulong? GenerationEndLsnExclusive = null);
+
+    private sealed record NonresidentDataDefinition(
+        long AttributeOffset,
+        long StartingVcn,
+        long EndingVcn,
+        long FileSizeBytes,
+        int MappingPairsLength,
+        IReadOnlyList<NtfsDataExtent> Extents);
 
     private sealed record MappingCandidate(
         ulong Lsn,
