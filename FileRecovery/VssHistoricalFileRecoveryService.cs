@@ -45,7 +45,7 @@ public sealed class VssHistoricalFileRecoveryService
         SnapshotInfo[] snapshots;
         try
         {
-            if (!_snapshotCache.TryGetValue(sourceRoot, out snapshots!))
+            if (!_snapshotCache.TryGetValue(sourceRoot, out snapshots))
             {
                 snapshots = QuerySnapshots(sourceRoot);
                 _snapshotCache[sourceRoot] = snapshots;
@@ -378,7 +378,7 @@ public sealed class VssHistoricalFileRecoveryService
     {
         var cleanDevice =
             deviceObject.TrimEnd(
-                '\',
+                '\\',
                 '/');
 
         return Path.Combine(
