@@ -368,6 +368,8 @@ public sealed class NtfsLogFileHistoricalDataService
             System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile target MFT record: " +
                 $"lsn=0x{targetRecord.Lsn:X16}, " +
+                $"previousLsn=0x{targetRecord.ClientPreviousLsn:X16}, " +
+                $"undoNextLsn=0x{targetRecord.ClientUndoNextLsn:X16}, " +
                 $"transaction=0x{targetRecord.TransactionId:X8}, " +
                 $"redo=0x{targetRecord.RedoOperation:X4}/{redoLength:N0}, " +
                 $"undo=0x{targetRecord.UndoOperation:X4}/{undoLength:N0}, " +
@@ -1870,6 +1872,14 @@ public sealed class NtfsLogFileHistoricalDataService
                         BinaryPrimitives.ReadUInt64LittleEndian(
                             page.AsSpan(recordOffset, 8));
 
+                    var clientPreviousLsn =
+                        BinaryPrimitives.ReadUInt64LittleEndian(
+                            page.AsSpan(recordOffset + 8, 8));
+
+                    var clientUndoNextLsn =
+                        BinaryPrimitives.ReadUInt64LittleEndian(
+                            page.AsSpan(recordOffset + 16, 8));
+
                     var redoOperation =
                         BinaryPrimitives.ReadUInt16LittleEndian(
                             clientData.AsSpan(0, 2));
@@ -1905,6 +1915,8 @@ public sealed class NtfsLogFileHistoricalDataService
                     result.Add(
                         new ParsedLogRecord(
                             thisLsn,
+                            clientPreviousLsn,
+                            clientUndoNextLsn,
                             transactionId,
                             physicalOrder++,
                             redoOperation,
@@ -2483,6 +2495,8 @@ public sealed class NtfsLogFileHistoricalDataService
 
     private sealed record ParsedLogRecord(
         ulong Lsn,
+        ulong ClientPreviousLsn,
+        ulong ClientUndoNextLsn,
         uint TransactionId,
         long PhysicalOrder,
         ushort RedoOperation,
