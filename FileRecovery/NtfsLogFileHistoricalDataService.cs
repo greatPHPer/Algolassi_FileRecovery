@@ -19,6 +19,9 @@ public sealed class NtfsLogFileHistoricalDataService
     private const ushort OpenNonresidentAttribute = 0x001C;
     private const ushort UpdateResidentValue = 0x0007;
     private const ushort UpdateMappingPairs = 0x0009;
+    private const ushort DeallocateFileRecordSegment = 0x0003;
+    private const ushort SetBitsInNonresidentBitmap = 0x0015;
+    private const ushort ClearBitsInNonresidentBitmap = 0x0016;
     private const uint NtfsAttributeTypeData = 0x00000080;
     private const uint LfsClientRecord = 0x0001;
     private const int RecordHeaderMinimumLength = 48;
@@ -145,6 +148,26 @@ public sealed class NtfsLogFileHistoricalDataService
                     out var historicalMftEvidence))
             {
                 evidence = historicalMftEvidence;
+                return true;
+            }
+
+            // Transaction-correlated bitmap clears preserve the LCN range(s)
+            // released by a deletion even when the historical MFT $DATA runlist
+            // is no longer present. Accept only an exact single-range match tied
+            // to the same MFT deallocation transaction and still free now.
+            if (TryRecoverFromHistoricalBitmapClear(
+                    records,
+                    fileReferenceNumber,
+                    expectedFileName,
+                    fileSizeBytes,
+                    volumeInfo.BytesPerCluster,
+                    rawHandle,
+                    metadataHandle,
+                    volumeInfo,
+                    out data,
+                    out var bitmapEvidence))
+            {
+                evidence = bitmapEvidence;
                 return true;
             }
 
@@ -342,6 +365,7 @@ public sealed class NtfsLogFileHistoricalDataService
             System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile target MFT record: " +
                 $"lsn=0x{targetRecord.Lsn:X16}, " +
+                $"transaction=0x{targetRecord.TransactionId:X8}, " +
                 $"redo=0x{targetRecord.RedoOperation:X4}/{redoLength:N0}, " +
                 $"undo=0x{targetRecord.UndoOperation:X4}/{undoLength:N0}, " +
                 $"recordOffset={targetRecord.RecordOffset}, " +
@@ -1126,6 +1150,339 @@ public sealed class NtfsLogFileHistoricalDataService
         return definitions.Count > 0;
     }
 
+    private static bool TryRecoverFromHistoricalBitmapClear(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetFileReference,
+        string expectedFileName,
+        long fileSizeBytes,
+        uint bytesPerCluster,
+        SafeFileHandle rawVolumeHandle,
+        SafeFileHandle metadataHandle,
+        NtfsVolumeInfo volumeInfo,
+        out byte[] data,
+        out string evidence)
+    {
+        data = [];
+        evidence = string.Empty;
+
+        if (fileSizeBytes <= 0 || bytesPerCluster == 0)
+            return false;
+
+        var targetSegment = targetFileReference & 0x0000FFFFFFFFFFFFUL;
+        var requiredClusters =
+            checked((fileSizeBytes + bytesPerCluster - 1) / bytesPerCluster);
+
+        var deletionTransactionIds = records
+            .Where(record =>
+                record.TransactionId != 0 &&
+                CalculateTargetMftSegment(
+                    record,
+                    bytesPerCluster,
+                    volumeInfo.BytesPerFileRecordSegment) == targetSegment &&
+                (record.RedoOperation == DeallocateFileRecordSegment ||
+                 record.UndoOperation == DeallocateFileRecordSegment))
+            .Select(record => record.TransactionId)
+            .Distinct()
+            .ToArray();
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile historical bitmap scan: fileRef={targetFileReference}, " +
+            $"name={expectedFileName}, segment={targetSegment:N0}, " +
+            $"requiredClusters={requiredClusters:N0}, " +
+            $"deletionTransactions={deletionTransactionIds.Length:N0} " +
+            $"[{(deletionTransactionIds.Length == 0 ? "(none)" : string.Join(", ", deletionTransactionIds.Select(id => $"0x{id:X8}")))}].");
+
+        if (deletionTransactionIds.Length == 0)
+        {
+            evidence =
+                $"No retained DeallocateFileRecordSegment transaction could be tied " +
+                $"to MFT segment {targetSegment:N0}.";
+            return false;
+        }
+
+        var ranges = new List<HistoricalBitmapRange>();
+
+        foreach (var record in records
+                     .Where(record =>
+                         deletionTransactionIds.Contains(record.TransactionId) &&
+                         record.RedoOperation == ClearBitsInNonresidentBitmap &&
+                         record.UndoOperation == SetBitsInNonresidentBitmap)
+                     .OrderBy(record => record.Lsn)
+                     .ThenBy(record => record.PhysicalOrder))
+        {
+            if (!TryParseBitmapRange(
+                    record.RedoData,
+                    out var startingLcn,
+                    out var bitCount))
+            {
+                continue;
+            }
+
+            ranges.Add(
+                new HistoricalBitmapRange(
+                    record.Lsn,
+                    record.TransactionId,
+                    startingLcn,
+                    bitCount));
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile historical bitmap clear: fileRef={targetFileReference}, " +
+                $"transaction=0x{record.TransactionId:X8}, lsn=0x{record.Lsn:X16}, " +
+                $"startingLcn={startingLcn:N0}, bitCount={bitCount:N0}, " +
+                $"bytes={bitCount * (long)bytesPerCluster:N0}.");
+        }
+
+        var exactRanges = ranges
+            .Where(range => range.BitCount == requiredClusters)
+            .ToList();
+
+        if (exactRanges.Count != 1)
+        {
+            evidence =
+                $"Found {ranges.Count:N0} transaction-correlated bitmap clear range(s), " +
+                $"but not exactly one range containing the required {requiredClusters:N0} " +
+                $"cluster(s). Ambiguous ranges are not accepted.";
+            return false;
+        }
+
+        var selected = exactRanges[0];
+
+        if (!TryReadCurrentBitmapRange(
+                rawVolumeHandle,
+                metadataHandle,
+                volumeInfo,
+                selected.StartingLcn,
+                selected.BitCount,
+                out var bitmapIsFree,
+                out var bitmapEvidence))
+        {
+            evidence =
+                $"Current $Bitmap validation failed for the historical range. {bitmapEvidence}";
+            return false;
+        }
+
+        if (!bitmapIsFree)
+        {
+            evidence =
+                $"Historical bitmap range at LCN {selected.StartingLcn:N0} is no longer " +
+                "entirely free; current contents are not accepted.";
+            return false;
+        }
+
+        data = new byte[checked((int)fileSizeBytes)];
+
+        try
+        {
+            ReadRawExact(
+                rawVolumeHandle,
+                checked(selected.StartingLcn * (long)bytesPerCluster),
+                data,
+                0,
+                data.Length);
+        }
+        catch (Exception ex)
+        {
+            data = [];
+            evidence =
+                $"Historical bitmap range is free, but reading its contents failed: " +
+                $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+
+        evidence =
+            $"Recovered {data.LongLength:N0} byte(s) from an exact NTFS deletion " +
+            $"transaction bitmap-clear range. Transaction 0x{selected.TransactionId:X8} " +
+            $"cleared exactly {selected.BitCount:N0} clusters beginning at LCN " +
+            $"{selected.StartingLcn:N0}, matching the historical file size, and the " +
+            "same range remains free in the current $Bitmap.";
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile historical bitmap-clear recovery succeeded: " +
+            $"fileRef={targetFileReference}, name={expectedFileName}, " +
+            $"transaction=0x{selected.TransactionId:X8}, lsn=0x{selected.Lsn:X16}, " +
+            $"startingLcn={selected.StartingLcn:N0}, clusters={selected.BitCount:N0}, " +
+            $"size={data.LongLength:N0}.");
+
+        return true;
+    }
+
+    private static bool TryParseBitmapRange(
+        byte[] data,
+        out long startingLcn,
+        out long bitCount)
+    {
+        startingLcn = 0;
+        bitCount = 0;
+
+        if (data.Length < 8)
+            return false;
+
+        startingLcn = BinaryPrimitives.ReadUInt32LittleEndian(
+            data.AsSpan(0, 4));
+        bitCount = BinaryPrimitives.ReadUInt32LittleEndian(
+            data.AsSpan(4, 4));
+
+        return bitCount > 0;
+    }
+
+    private static bool TryReadCurrentBitmapRange(
+        SafeFileHandle rawVolumeHandle,
+        SafeFileHandle metadataHandle,
+        NtfsVolumeInfo volumeInfo,
+        long startingLcn,
+        long bitCount,
+        out bool allFree,
+        out string evidence)
+    {
+        allFree = false;
+        evidence = string.Empty;
+
+        var bitmapStream = new NtfsMftDataReader().ReadMetadataFileDataStream(
+            volumeInfo,
+            metadataHandle,
+            6);
+
+        if (!bitmapStream.Found ||
+            bitmapStream.IsResident ||
+            bitmapStream.Extents.Count == 0)
+        {
+            evidence = "NTFS $Bitmap did not expose a usable nonresident $DATA stream.";
+            return false;
+        }
+
+        var endingBitExclusive = checked(startingLcn + bitCount);
+        var logicalByteStart = startingLcn / 8;
+        var logicalByteEndExclusive = checked((endingBitExclusive + 7) / 8);
+        var logicalByteLength = checked(logicalByteEndExclusive - logicalByteStart);
+
+        if (logicalByteStart < 0 ||
+            logicalByteLength <= 0 ||
+            logicalByteLength > int.MaxValue)
+        {
+            evidence = "The historical bitmap range is outside supported bounds.";
+            return false;
+        }
+
+        var bitmapBytes = ReadMappedLogicalRange(
+            rawVolumeHandle,
+            volumeInfo.BytesPerCluster,
+            bitmapStream.Extents,
+            logicalByteStart,
+            logicalByteLength);
+
+        for (var bit = 0L; bit < bitCount; bit++)
+        {
+            var absoluteBit = checked(startingLcn + bit);
+            var byteIndex = checked(
+                (int)((absoluteBit / 8) - logicalByteStart));
+            var bitMask = (byte)(1 << (int)(absoluteBit & 7));
+
+            if ((bitmapBytes[byteIndex] & bitMask) != 0)
+            {
+                evidence = $"Current $Bitmap reports LCN {absoluteBit:N0} as allocated.";
+                return true;
+            }
+        }
+
+        allFree = true;
+        evidence =
+            $"Current $Bitmap reports all {bitCount:N0} historical cluster bit(s) as free.";
+        return true;
+    }
+
+    private static byte[] ReadMappedLogicalRange(
+        SafeFileHandle volumeHandle,
+        uint bytesPerCluster,
+        IReadOnlyList<NtfsDataExtent> extents,
+        long logicalOffset,
+        long length)
+    {
+        if (logicalOffset < 0 ||
+            length <= 0 ||
+            length > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(length));
+        }
+
+        var result = new byte[checked((int)length)];
+        var logicalEnd = checked(logicalOffset + length);
+        var destinationOffset = 0;
+
+        foreach (var extent in extents.OrderBy(
+                     item => item.VirtualClusterNumber))
+        {
+            var extentLogicalStart =
+                checked(
+                    extent.VirtualClusterNumber *
+                    (long)bytesPerCluster);
+
+            var extentLogicalEnd =
+                checked(
+                    extentLogicalStart +
+                    extent.ClusterCount *
+                    (long)bytesPerCluster);
+
+            var overlapStart =
+                Math.Max(
+                    logicalOffset,
+                    extentLogicalStart);
+
+            var overlapEnd =
+                Math.Min(
+                    logicalEnd,
+                    extentLogicalEnd);
+
+            if (overlapStart >= overlapEnd)
+                continue;
+
+            var bytesToCopy =
+                checked((int)(overlapEnd - overlapStart));
+
+            var extentOffset =
+                checked(overlapStart - extentLogicalStart);
+
+            if (extent.IsSparse)
+            {
+                Array.Clear(
+                    result,
+                    destinationOffset,
+                    bytesToCopy);
+            }
+            else
+            {
+                ReadRawExact(
+                    volumeHandle,
+                    checked(
+                        extent.LogicalClusterNumber *
+                        (long)bytesPerCluster +
+                        extentOffset),
+                    result,
+                    destinationOffset,
+                    bytesToCopy);
+            }
+
+            destinationOffset += bytesToCopy;
+
+            if (destinationOffset == result.Length)
+                break;
+        }
+
+        if (destinationOffset != result.Length)
+        {
+            throw new EndOfStreamException(
+                $"NTFS mapped range did not cover logical offset " +
+                $"{logicalOffset:N0} for {length:N0} byte(s).");
+        }
+
+        return result;
+    }
+
+    private sealed record HistoricalBitmapRange(
+        ulong Lsn,
+        uint TransactionId,
+        long StartingLcn,
+        long BitCount);
+
     private static List<MappingCandidate> FindTargetMappingCandidates(
         IReadOnlyList<ParsedLogRecord> records,
         ulong targetFileReference,
@@ -1406,6 +1763,10 @@ public sealed class NtfsLogFileHistoricalDataService
                     BinaryPrimitives.ReadUInt32LittleEndian(
                         page.AsSpan(recordOffset + 32, 4));
 
+                var transactionId =
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        page.AsSpan(recordOffset + 36, 4));
+
                 if (recordType == LfsClientRecord)
                 {
                     var clientData =
@@ -1453,6 +1814,7 @@ public sealed class NtfsLogFileHistoricalDataService
                     result.Add(
                         new ParsedLogRecord(
                             thisLsn,
+                            transactionId,
                             physicalOrder++,
                             redoOperation,
                             undoOperation,
@@ -2030,6 +2392,7 @@ public sealed class NtfsLogFileHistoricalDataService
 
     private sealed record ParsedLogRecord(
         ulong Lsn,
+        uint TransactionId,
         long PhysicalOrder,
         ushort RedoOperation,
         ushort UndoOperation,
