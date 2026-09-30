@@ -2102,6 +2102,7 @@ public partial class Form1 : Form
         var successes = new List<RecoveryResult>();
         var forensicMarkers = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         var forensicMarkerDeclined = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var vssHistoricalRecovery = new VssHistoricalFileRecoveryService();
 
         if (string.IsNullOrWhiteSpace(destinationDirectory))
         {
@@ -2113,6 +2114,31 @@ public partial class Form1 : Form
         {
             try
             {
+                // An existing Volume Shadow Copy created before deletion is an
+                // authoritative historical source. Try it before journal/file-record
+                // reconstruction because it can preserve the complete file directly.
+                if (candidate.FileReferenceNumber != 0 &&
+                    candidate.ParentFileReferenceNumber != 0 &&
+                    candidate.LastUsnTimestampUtc != default &&
+                    vssHistoricalRecovery.TryRecoverFile(
+                        candidate,
+                        destinationDirectory,
+                        out var vssRecovery,
+                        out var vssEvidence))
+                {
+                    successes.Add(vssRecovery);
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(vssEvidence))
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS VSS historical recovery unavailable: " +
+                        $"path={candidate.FullPath}, " +
+                        $"fileRef={candidate.FileReferenceNumber}, " +
+                        $"reason={vssEvidence}");
+                }
+
                 // If the live and historical MFT views are already reused, inspect
                 // the NTFS transaction journal before asking the user for a content marker.
                 // $LogFile is finite and may have wrapped, so failure here is expected for
