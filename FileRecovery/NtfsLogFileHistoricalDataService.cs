@@ -220,7 +220,7 @@ public sealed class NtfsLogFileHistoricalDataService
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine(
+                    System.Diagnostics.Trace.WriteLine(
                         $"NTFS $LogFile historical cluster read failed: " +
                         $"{ex.GetType().Name}: {ex.Message}");
                     continue;
@@ -237,7 +237,7 @@ public sealed class NtfsLogFileHistoricalDataService
                     $"Recovered {data.LongLength:N0} byte(s) from exact NTFS $LogFile " +
                     $"file-reference mapping. {chainEvidence}";
 
-                System.Diagnostics.Debug.WriteLine(
+                System.Diagnostics.Trace.WriteLine(
                     $"NTFS $LogFile historical data recovery succeeded: " +
                     $"fileRef={fileReferenceNumber}, name={expectedFileName}, " +
                     $"size={data.LongLength:N0}, lsn=0x{candidate.Lsn:X16}.");
@@ -256,7 +256,7 @@ public sealed class NtfsLogFileHistoricalDataService
                 $"NTFS $LogFile historical data recovery failed: " +
                 $"{ex.GetType().Name}: {ex.Message}";
 
-            System.Diagnostics.Debug.WriteLine(
+            System.Diagnostics.Trace.WriteLine(
                 evidence);
 
             return false;
@@ -307,7 +307,7 @@ public sealed class NtfsLogFileHistoricalDataService
                 .Select(group => $"0x{group.Key:X4}={group.Count():N0}")
                 .ToArray();
 
-        System.Diagnostics.Debug.WriteLine(
+        System.Diagnostics.Trace.WriteLine(
             $"NTFS $LogFile target MFT diagnostics: " +
             $"fileRef={targetFileReference}, " +
             $"segment={targetSegment:N0}, " +
@@ -320,7 +320,7 @@ public sealed class NtfsLogFileHistoricalDataService
             var redoLength = targetRecord.RedoData.Length;
             var undoLength = targetRecord.UndoData.Length;
 
-            System.Diagnostics.Debug.WriteLine(
+            System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile target MFT record: " +
                 $"lsn=0x{targetRecord.Lsn:X16}, " +
                 $"redo=0x{targetRecord.RedoOperation:X4}/{redoLength:N0}, " +
@@ -363,7 +363,7 @@ public sealed class NtfsLogFileHistoricalDataService
                 .ThenBy(record => record.PhysicalOrder)
                 .ToList();
 
-        System.Diagnostics.Debug.WriteLine(
+        System.Diagnostics.Trace.WriteLine(
             $"NTFS $LogFile resident data scan: " +
             $"targetSegment={targetSegment:N0}, " +
             $"targetSequence={targetSequence}, " +
@@ -373,7 +373,7 @@ public sealed class NtfsLogFileHistoricalDataService
 
         if (definitions.Count == 0)
         {
-            System.Diagnostics.Debug.WriteLine(
+            System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile resident data scan: " +
                 $"NO resident $DATA definition survived for segment={targetSegment:N0}, " +
                 $"sequence={targetSequence}. " +
@@ -490,7 +490,7 @@ public sealed class NtfsLogFileHistoricalDataService
                 $"{updates.Count:N0} UpdateResidentValue record(s) " +
                 $"within that exact generation.";
 
-            System.Diagnostics.Debug.WriteLine(
+            System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile resident historical data recovery succeeded: " +
                 $"fileRef={targetFileReference}, " +
                 $"segment={targetSegment:N0}, " +
@@ -544,7 +544,7 @@ public sealed class NtfsLogFileHistoricalDataService
                 continue;
             }
 
-            System.Diagnostics.Debug.WriteLine(
+            System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile resident definition candidate: " +
                 $"lsn=0x{record.Lsn:X16}, " +
                 $"segment={targetSegment:N0}, " +
