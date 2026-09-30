@@ -296,10 +296,6 @@ public sealed class VssHistoricalFileRecoveryService
         var startInfo = new ProcessStartInfo
         {
             FileName = "powershell.exe",
-            Arguments =
-                "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass " +
-                "-Command " +
-                QuotePowerShellArgument(script),
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
@@ -307,6 +303,14 @@ public sealed class VssHistoricalFileRecoveryService
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8
         };
+
+        startInfo.ArgumentList.Add("-NoLogo");
+        startInfo.ArgumentList.Add("-NoProfile");
+        startInfo.ArgumentList.Add("-NonInteractive");
+        startInfo.ArgumentList.Add("-ExecutionPolicy");
+        startInfo.ArgumentList.Add("Bypass");
+        startInfo.ArgumentList.Add("-Command");
+        startInfo.ArgumentList.Add(script);
 
         using var process = new Process
         {
@@ -348,17 +352,6 @@ public sealed class VssHistoricalFileRecoveryService
         }
 
         return output.Trim();
-    }
-
-    private static string QuotePowerShellArgument(string script)
-    {
-        var escaped =
-            script.Replace(
-                "'",
-                "''",
-                StringComparison.Ordinal);
-
-        return $"\"& {{ {escaped} }}\"";
     }
 
     private static string GetVolumeName(string root)
