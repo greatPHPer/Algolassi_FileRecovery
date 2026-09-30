@@ -2126,7 +2126,7 @@ public partial class Form1 : Form
                         candidate,
                         destinationDirectory,
                         out var vssRecovery,
-                        out var vssEvidence))
+                        out vssEvidence))
                 {
                     successes.Add(vssRecovery);
                     continue;
