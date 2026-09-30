@@ -45,7 +45,11 @@ public sealed class VssHistoricalFileRecoveryService
         SnapshotInfo[] snapshots;
         try
         {
-            if (!_snapshotCache.TryGetValue(sourceRoot, out snapshots))
+            if (_snapshotCache.TryGetValue(sourceRoot, out var cachedSnapshots))
+            {
+                snapshots = cachedSnapshots;
+            }
+            else
             {
                 snapshots = QuerySnapshots(sourceRoot);
                 _snapshotCache[sourceRoot] = snapshots;
