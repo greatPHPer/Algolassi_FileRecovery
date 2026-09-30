@@ -926,15 +926,26 @@ public sealed class NtfsLogFileHistoricalDataService
                 break;
             }
 
-            var length =
+            var declaredLength =
                 BinaryPrimitives.ReadUInt32LittleEndian(
                     recordData.AsSpan(cursor + 4, 4));
 
-            if (length < 24 ||
-                cursor + length > recordData.Length)
+            if (declaredLength < 24)
             {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile historical MFT attribute scan: " +
+                    $"invalid attribute length={declaredLength} at offset=0x{cursor:X}.");
                 break;
             }
+
+            // InitializeFileRecordSegment redo data can be shorter than the full
+            // declared MFT attribute while still containing the complete useful
+            // $DATA header/runlist prefix. Never reject the final attribute merely
+            // because its declared end extends beyond the retained redo payload.
+            var availableLength =
+                Math.Min(
+                    checked((int)declaredLength),
+                    recordData.Length - cursor);
 
             var nonResident =
                 recordData[cursor + 8] != 0;
@@ -942,10 +953,17 @@ public sealed class NtfsLogFileHistoricalDataService
             var nameLength =
                 recordData[cursor + 9];
 
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile historical MFT attribute: " +
+                $"offset=0x{cursor:X}, type=0x{type:X8}, " +
+                $"declaredLength={declaredLength:N0}, " +
+                $"availableLength={availableLength:N0}, " +
+                $"nonResident={nonResident}, nameLength={nameLength}.");
+
             if (type == NtfsAttributeTypeData &&
                 nonResident &&
                 nameLength == 0 &&
-                length >= 64)
+                availableLength >= 64)
             {
                 var startingVcn =
                     BinaryPrimitives.ReadInt64LittleEndian(
@@ -964,21 +982,22 @@ public sealed class NtfsLogFileHistoricalDataService
                         recordData.AsSpan(cursor + 48, 8));
 
                 if (mappingPairsOffset >= 64 &&
-                    mappingPairsOffset < length &&
+                    mappingPairsOffset < availableLength &&
                     declaredFileSize >= 0)
                 {
                     var mappingStart =
                         checked(cursor + mappingPairsOffset);
 
                     var mappingLength =
-                        checked((int)length - mappingPairsOffset);
+                        availableLength - mappingPairsOffset;
 
                     var mappingBytes =
                         recordData.AsSpan(
                             mappingStart,
                             mappingLength);
 
-                    var terminator = mappingBytes.IndexOf((byte)0);
+                    var terminator =
+                        mappingBytes.IndexOf((byte)0);
 
                     if (terminator >= 0)
                     {
@@ -1014,16 +1033,51 @@ public sealed class NtfsLogFileHistoricalDataService
                                         terminator,
                                         extents));
                             }
+                            else
+                            {
+                                System.Diagnostics.Trace.WriteLine(
+                                    $"NTFS $LogFile historical MFT nonresident $DATA rejected: " +
+                                    $"offset=0x{cursor:X}, startVcn={startingVcn:N0}, " +
+                                    $"endVcn={endingVcn:N0}, parsedEndVcn={expectedEndingVcn:N0}, " +
+                                    $"declaredFileSize={declaredFileSize:N0}, " +
+                                    $"expectedSize={expectedSize:N0}, extents={extents.Count:N0}.");
+                            }
                         }
-                        catch
+                        catch (Exception ex)
                         {
-                            // Ignore malformed historical attribute candidates.
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS $LogFile historical MFT nonresident $DATA mapping parse failed: " +
+                                $"offset=0x{cursor:X}, " +
+                                $"{ex.GetType().Name}: {ex.Message}");
                         }
                     }
+                    else
+                    {
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS $LogFile historical MFT nonresident $DATA rejected: " +
+                            $"mapping-pairs terminator not present in available redo payload. " +
+                            $"offset=0x{cursor:X}, mappingOffset={mappingPairsOffset}, " +
+                            $"availableLength={availableLength}.");
+                    }
+                }
+                else
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS $LogFile historical MFT nonresident $DATA rejected: " +
+                        $"mappingOffset={mappingPairsOffset}, " +
+                        $"availableLength={availableLength}, " +
+                        $"declaredFileSize={declaredFileSize:N0}.");
                 }
             }
 
-            cursor += checked((int)length);
+            // We cannot safely advance into a record past a truncated final
+            // attribute because the next attribute header is not available.
+            if (availableLength < declaredLength)
+            {
+                break;
+            }
+
+            cursor += checked((int)declaredLength);
         }
 
         return definitions.Count > 0;
