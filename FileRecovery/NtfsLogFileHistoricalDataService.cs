@@ -892,24 +892,67 @@ public sealed class NtfsLogFileHistoricalDataService
     {
         definitions = [];
 
-        if (recordData.Length < 40 ||
-            recordData[0] != (byte)'F' ||
-            recordData[1] != (byte)'I' ||
-            recordData[2] != (byte)'L' ||
-            recordData[3] != (byte)'E' ||
-            BinaryPrimitives.ReadUInt16LittleEndian(
-                recordData.AsSpan(16, 2)) != expectedSequence)
+        if (recordData.Length < 40)
         {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile historical MFT initialization rejected: " +
+                $"redoDataLength={recordData.Length}, expectedSequence={expectedSequence}.");
             return false;
         }
+
+        var signature =
+            System.Text.Encoding.ASCII.GetString(
+                recordData,
+                0,
+                Math.Min(4, recordData.Length));
+
+        var actualSequence =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                recordData.AsSpan(16, 2));
 
         var attributesOffset =
             BinaryPrimitives.ReadUInt16LittleEndian(
                 recordData.AsSpan(20, 2));
 
+        var flags =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                recordData.AsSpan(22, 2));
+
+        var usedLength =
+            BinaryPrimitives.ReadUInt32LittleEndian(
+                recordData.AsSpan(24, 4));
+
+        var totalLength =
+            BinaryPrimitives.ReadUInt32LittleEndian(
+                recordData.AsSpan(28, 4));
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile historical MFT initialization header: " +
+            $"redoDataLength={recordData.Length}, " +
+            $"signature='{signature}', " +
+            $"expectedSequence={expectedSequence}, " +
+            $"actualSequence={actualSequence}, " +
+            $"attributesOffset={attributesOffset}, " +
+            $"flags=0x{flags:X4}, " +
+            $"usedLength={usedLength}, " +
+            $"totalLength={totalLength}.");
+
+        if (!string.Equals(
+                signature,
+                "FILE",
+                StringComparison.Ordinal) ||
+            actualSequence != expectedSequence)
+        {
+            return false;
+        }
+
         if (attributesOffset < 24 ||
             attributesOffset >= recordData.Length)
         {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile historical MFT initialization rejected: " +
+                $"invalid attributesOffset={attributesOffset}, " +
+                $"redoDataLength={recordData.Length}.");
             return false;
         }
 
