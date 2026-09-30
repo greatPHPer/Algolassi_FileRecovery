@@ -2114,6 +2114,8 @@ public partial class Form1 : Form
         {
             try
             {
+                var vssEvidence = string.Empty;
+
                 // An existing Volume Shadow Copy created before deletion is an
                 // authoritative historical source. Try it before journal/file-record
                 // reconstruction because it can preserve the complete file directly.
