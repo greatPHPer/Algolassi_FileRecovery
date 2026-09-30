@@ -858,16 +858,38 @@ public partial class Form1 : Form
                 .Where(candidate => !candidate.DataStreamFound)
                 .ToList();
 
-            var missingDataPaths = missingDataCandidates
+            // Plain-text candidates deliberately use the marker-driven forensic path
+            // when retained NTFS $DATA is unavailable. Do not make the user wait for
+            // an exhaustive whole-$MFT pass that still cannot prove text-file identity.
+            // Non-text formats retain the existing exhaustive MFT fallback because their
+            // format-specific recovery paths may be able to use the recovered stream.
+            var exhaustiveMftCandidates = missingDataCandidates
+                .Where(candidate =>
+                    !Path.GetExtension(candidate.Name).Equals(
+                        ".txt",
+                        StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var missingDataPaths = exhaustiveMftCandidates
                 .Select(candidate => candidate.FullPath)
                 .Where(path => !string.IsNullOrWhiteSpace(path))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
+            if (missingDataCandidates.Count != exhaustiveMftCandidates.Count)
+            {
+                var deferredTextCount =
+                    missingDataCandidates.Count - exhaustiveMftCandidates.Count;
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS exhaustive MFT fallback: deferred {deferredTextCount:N0} plain-text " +
+                    "candidate(s) to marker-driven forensic recovery.");
+            }
+
             if (missingDataPaths.Count > 0)
             {
                 lblStatus.Text =
-                    $"Found {candidates.Count:N0} candidate(s); exhaustively scanning the NTFS $MFT for retained deleted records ({missingDataPaths.Count:N0} item(s))...";
+                    $"Found {candidates.Count:N0} candidate(s); exhaustively scanning the NTFS $MFT for retained deleted records ({missingDataPaths.Count:N0} non-text item(s))...";
 
                 var fallbackCandidates =
                     await _mftCandidateScanner.ScanRawMftForPathsAsync(
@@ -875,7 +897,7 @@ public partial class Form1 : Form
                         missingDataPaths,
                         CancellationToken.None,
                         maxBytesToScan: long.MaxValue,
-                        targetReferences: missingDataCandidates
+                        targetReferences: exhaustiveMftCandidates
                             .Where(candidate => candidate.FileReferenceNumber != 0)
                             .Select(candidate => (
                                 FullPath: candidate.FullPath,
@@ -2527,12 +2549,11 @@ public partial class Form1 : Form
                         !forensicMarkerDeclined.Contains(markerKey))
                     {
                         var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
-                            $"Enter a unique text string that was definitely contained in '{candidate.Name}'.\r\n\r\n" +
-                            "AlgoLassi will search every byte of the source volume " +
-                            "deleted file. AlgoLassi will search every byte of the source volume " +
-                            "for that exact UTF-8 marker before attempting broader carving.\r\n\r\n" +
-                            "Leave this blank to skip the whole-volume forensic scan.",
-                            "Full-volume forensic text scan",
+                            $"Enter a distinctive text string that you know was inside '{candidate.Name}'.\r\n\r\n" +
+                            "This is the marker TEXT input, not a recovery confirmation. " +
+                            "Type the exact text (at least 4 bytes) and click OK to start the full-volume forensic scan.\r\n\r\n" +
+                            "Click Cancel, or click OK with an empty box, to skip the forensic scan.",
+                            "Enter forensic marker",
                             "");
 
                         if (string.IsNullOrWhiteSpace(enteredMarker))
@@ -2597,12 +2618,18 @@ public partial class Form1 : Form
                         StringComparison.OrdinalIgnoreCase))
                 {
                     failures.Add(
-                        candidate.FileSizeBytes > 0
-                            ? $"{candidate.Name}: no retained NTFS $DATA evidence was available for the known " +
-                              $"{candidate.FileSizeBytes:N0}-byte file; automatic free-space carving is disabled " +
-                              "for plain-text files because size alone cannot prove file identity."
-                            : $"{candidate.Name}: no retained NTFS $DATA evidence was available and the original " +
-                              "text-file size is unknown. Provide a distinctive marker for forensic recovery.");
+                        forensicMarkerDeclined.Contains(NormalizePath(candidate.FullPath))
+                            ? candidate.FileSizeBytes > 0
+                                ? $"{candidate.Name}: no retained NTFS $DATA evidence was available for the known " +
+                                  $"{candidate.FileSizeBytes:N0}-byte file, and the marker-driven forensic scan was skipped. " +
+                                  "Enter a distinctive marker from the deleted file to search the raw volume."
+                                : $"{candidate.Name}: no retained NTFS $DATA evidence was available and the forensic marker scan " +
+                                  "was skipped. Provide a distinctive marker from the deleted file."
+                            : candidate.FileSizeBytes > 0
+                                ? $"{candidate.Name}: no retained NTFS $DATA evidence was available for the known " +
+                                  $"{candidate.FileSizeBytes:N0}-byte file; the marker-driven forensic recovery did not produce a result."
+                                : $"{candidate.Name}: no retained NTFS $DATA evidence was available; the marker-driven forensic " +
+                                  "recovery did not produce a result.");
                     continue;
                 }
 
