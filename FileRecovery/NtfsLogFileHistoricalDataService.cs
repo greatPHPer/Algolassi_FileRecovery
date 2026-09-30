@@ -22,6 +22,9 @@ public sealed class NtfsLogFileHistoricalDataService
     private const ushort DeallocateFileRecordSegment = 0x0003;
     private const ushort SetBitsInNonresidentBitmap = 0x0015;
     private const ushort ClearBitsInNonresidentBitmap = 0x0016;
+    private const ushort PrepareTransaction = 0x0019;
+    private const ushort CommitTransaction = 0x001A;
+    private const ushort ForgetTransaction = 0x001B;
     private const uint NtfsAttributeTypeData = 0x00000080;
     private const uint LfsClientRecord = 0x0001;
     private const int RecordHeaderMinimumLength = 48;
@@ -1165,83 +1168,162 @@ public sealed class NtfsLogFileHistoricalDataService
         data = [];
         evidence = string.Empty;
 
-        if (fileSizeBytes <= 0 || bytesPerCluster == 0)
+        if (fileSizeBytes <= 0 ||
+            bytesPerCluster == 0)
+        {
             return false;
+        }
 
-        var targetSegment = targetFileReference & 0x0000FFFFFFFFFFFFUL;
+        var targetSegment =
+            targetFileReference &
+            0x0000FFFFFFFFFFFFUL;
+
         var requiredClusters =
-            checked((fileSizeBytes + bytesPerCluster - 1) / bytesPerCluster);
+            checked(
+                (fileSizeBytes + bytesPerCluster - 1) /
+                bytesPerCluster);
 
-        var deletionTransactionIds = records
-            .Where(record =>
-                record.TransactionId != 0 &&
-                CalculateTargetMftSegment(
-                    record,
-                    bytesPerCluster,
-                    volumeInfo.BytesPerFileRecordSegment) == targetSegment &&
-                (record.RedoOperation == DeallocateFileRecordSegment ||
-                 record.UndoOperation == DeallocateFileRecordSegment))
-            .Select(record => record.TransactionId)
-            .Distinct()
-            .ToArray();
+        var deletionRecords =
+            records
+                .Where(record =>
+                    record.TransactionId != 0 &&
+                    (record.RedoOperation == DeallocateFileRecordSegment ||
+                     record.UndoOperation == DeallocateFileRecordSegment) &&
+                    CalculateTargetMftSegment(
+                        record,
+                        bytesPerCluster,
+                        volumeInfo.BytesPerFileRecordSegment) == targetSegment)
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
 
-        System.Diagnostics.Trace.WriteLine(
-            $"NTFS $LogFile historical bitmap scan: fileRef={targetFileReference}, " +
-            $"name={expectedFileName}, segment={targetSegment:N0}, " +
-            $"requiredClusters={requiredClusters:N0}, " +
-            $"deletionTransactions={deletionTransactionIds.Length:N0} " +
-            $"[{(deletionTransactionIds.Length == 0 ? "(none)" : string.Join(", ", deletionTransactionIds.Select(id => $"0x{id:X8}")))}].");
-
-        if (deletionTransactionIds.Length == 0)
+        if (deletionRecords.Count == 0)
         {
             evidence =
-                $"No retained DeallocateFileRecordSegment transaction could be tied " +
+                $"No retained DeallocateFileRecordSegment record could be tied " +
                 $"to MFT segment {targetSegment:N0}.";
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile historical bitmap scan: fileRef={targetFileReference}, " +
+                $"name={expectedFileName}, segment={targetSegment:N0}, " +
+                $"requiredClusters={requiredClusters:N0}, deletionRecords=0.");
             return false;
+        }
+
+        var candidateWindows =
+            new List<(ulong StartLsn, ulong EndLsn, uint TransactionId, ulong DeallocateLsn)>();
+
+        foreach (var deletion in deletionRecords)
+        {
+            var transactionId = deletion.TransactionId;
+
+            var previousPrepare =
+                records
+                    .Where(record =>
+                        record.TransactionId == transactionId &&
+                        record.Lsn <= deletion.Lsn &&
+                        (record.RedoOperation == PrepareTransaction ||
+                         record.UndoOperation == PrepareTransaction))
+                    .OrderByDescending(record => record.Lsn)
+                    .ThenByDescending(record => record.PhysicalOrder)
+                    .FirstOrDefault();
+
+            var nextTransactionEnd =
+                records
+                    .Where(record =>
+                        record.TransactionId == transactionId &&
+                        record.Lsn > deletion.Lsn &&
+                        (record.RedoOperation == CommitTransaction ||
+                         record.UndoOperation == CommitTransaction ||
+                         record.RedoOperation == ForgetTransaction ||
+                         record.UndoOperation == ForgetTransaction))
+                    .OrderBy(record => record.Lsn)
+                    .ThenBy(record => record.PhysicalOrder)
+                    .FirstOrDefault();
+
+            var startLsn =
+                previousPrepare?.Lsn ?? deletion.Lsn;
+
+            var endLsn =
+                nextTransactionEnd?.Lsn ?? ulong.MaxValue;
+
+            candidateWindows.Add(
+                (startLsn, endLsn, transactionId, deletion.Lsn));
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile historical bitmap transaction window: " +
+                $"fileRef={targetFileReference}, " +
+                $"transaction=0x{transactionId:X8}, " +
+                $"startLsn=0x{startLsn:X16}, " +
+                $"deallocateLsn=0x{deletion.Lsn:X16}, " +
+                $"endLsn={(endLsn == ulong.MaxValue ? "MAX" : $"0x{endLsn:X16}")}.");
         }
 
         var ranges = new List<HistoricalBitmapRange>();
 
-        foreach (var record in records
-                     .Where(record =>
-                         deletionTransactionIds.Contains(record.TransactionId) &&
-                         record.RedoOperation == ClearBitsInNonresidentBitmap &&
-                         record.UndoOperation == SetBitsInNonresidentBitmap)
-                     .OrderBy(record => record.Lsn)
-                     .ThenBy(record => record.PhysicalOrder))
+        foreach (var window in candidateWindows)
         {
-            if (!TryParseBitmapRange(
-                    record.RedoData,
-                    out var startingLcn,
-                    out var bitCount))
+            foreach (var record in records
+                         .Where(record =>
+                             record.TransactionId == window.TransactionId &&
+                             record.Lsn >= window.StartLsn &&
+                             record.Lsn <= window.EndLsn &&
+                             record.RedoOperation == ClearBitsInNonresidentBitmap &&
+                             record.UndoOperation == SetBitsInNonresidentBitmap)
+                         .OrderBy(record => record.Lsn)
+                         .ThenBy(record => record.PhysicalOrder))
             {
-                continue;
+                if (!TryParseBitmapRange(
+                        record.RedoData,
+                        out var startingLcn,
+                        out var bitCount))
+                {
+                    continue;
+                }
+
+                ranges.Add(
+                    new HistoricalBitmapRange(
+                        record.Lsn,
+                        record.TransactionId,
+                        startingLcn,
+                        bitCount,
+                        window.DeallocateLsn));
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile historical bitmap clear candidate: " +
+                    $"fileRef={targetFileReference}, " +
+                    $"transaction=0x{record.TransactionId:X8}, " +
+                    $"lsn=0x{record.Lsn:X16}, " +
+                    $"deallocateLsn=0x{window.DeallocateLsn:X16}, " +
+                    $"startingLcn={startingLcn:N0}, " +
+                    $"bitCount={bitCount:N0}, " +
+                    $"bytes={bitCount * (long)bytesPerCluster:N0}.");
             }
-
-            ranges.Add(
-                new HistoricalBitmapRange(
-                    record.Lsn,
-                    record.TransactionId,
-                    startingLcn,
-                    bitCount));
-
-            System.Diagnostics.Trace.WriteLine(
-                $"NTFS $LogFile historical bitmap clear: fileRef={targetFileReference}, " +
-                $"transaction=0x{record.TransactionId:X8}, lsn=0x{record.Lsn:X16}, " +
-                $"startingLcn={startingLcn:N0}, bitCount={bitCount:N0}, " +
-                $"bytes={bitCount * (long)bytesPerCluster:N0}.");
         }
 
-        var exactRanges = ranges
-            .Where(range => range.BitCount == requiredClusters)
-            .ToList();
+        var exactRanges =
+            ranges
+                .Where(range =>
+                    range.BitCount == requiredClusters)
+                .ToList();
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile historical bitmap scan: " +
+            $"fileRef={targetFileReference}, " +
+            $"name={expectedFileName}, " +
+            $"segment={targetSegment:N0}, " +
+            $"requiredClusters={requiredClusters:N0}, " +
+            $"deletionRecords={deletionRecords.Count:N0}, " +
+            $"transactionWindows={candidateWindows.Count:N0}, " +
+            $"clearCandidates={ranges.Count:N0}, " +
+            $"exactSizeCandidates={exactRanges.Count:N0}.");
 
         if (exactRanges.Count != 1)
         {
             evidence =
-                $"Found {ranges.Count:N0} transaction-correlated bitmap clear range(s), " +
-                $"but not exactly one range containing the required {requiredClusters:N0} " +
-                $"cluster(s). Ambiguous ranges are not accepted.";
+                $"Found {ranges.Count:N0} bitmap clear range(s) inside the retained " +
+                $"deletion transaction window(s), but exactly one matching " +
+                $"{requiredClusters:N0}-cluster range was not available. " +
+                "Ambiguous historical allocation evidence is not accepted.";
             return false;
         }
 
@@ -1257,7 +1339,8 @@ public sealed class NtfsLogFileHistoricalDataService
                 out var bitmapEvidence))
         {
             evidence =
-                $"Current $Bitmap validation failed for the historical range. {bitmapEvidence}";
+                $"Current $Bitmap validation failed for the historical range. " +
+                $"{bitmapEvidence}";
             return false;
         }
 
@@ -1269,13 +1352,16 @@ public sealed class NtfsLogFileHistoricalDataService
             return false;
         }
 
-        data = new byte[checked((int)fileSizeBytes)];
+        data =
+            new byte[checked((int)fileSizeBytes)];
 
         try
         {
             ReadRawExact(
                 rawVolumeHandle,
-                checked(selected.StartingLcn * (long)bytesPerCluster),
+                checked(
+                    selected.StartingLcn *
+                    (long)bytesPerCluster),
                 data,
                 0,
                 data.Length);
@@ -1293,14 +1379,18 @@ public sealed class NtfsLogFileHistoricalDataService
             $"Recovered {data.LongLength:N0} byte(s) from an exact NTFS deletion " +
             $"transaction bitmap-clear range. Transaction 0x{selected.TransactionId:X8} " +
             $"cleared exactly {selected.BitCount:N0} clusters beginning at LCN " +
-            $"{selected.StartingLcn:N0}, matching the historical file size, and the " +
-            "same range remains free in the current $Bitmap.";
+            $"{selected.StartingLcn:N0} within the retained transaction lifetime; " +
+            "the same range remains entirely free in the current $Bitmap.";
 
         System.Diagnostics.Trace.WriteLine(
             $"NTFS $LogFile historical bitmap-clear recovery succeeded: " +
-            $"fileRef={targetFileReference}, name={expectedFileName}, " +
-            $"transaction=0x{selected.TransactionId:X8}, lsn=0x{selected.Lsn:X16}, " +
-            $"startingLcn={selected.StartingLcn:N0}, clusters={selected.BitCount:N0}, " +
+            $"fileRef={targetFileReference}, " +
+            $"name={expectedFileName}, " +
+            $"transaction=0x{selected.TransactionId:X8}, " +
+            $"lsn=0x{selected.Lsn:X16}, " +
+            $"deallocateLsn=0x{selected.DeallocateLsn:X16}, " +
+            $"startingLcn={selected.StartingLcn:N0}, " +
+            $"clusters={selected.BitCount:N0}, " +
             $"size={data.LongLength:N0}.");
 
         return true;
@@ -1481,7 +1571,8 @@ public sealed class NtfsLogFileHistoricalDataService
         ulong Lsn,
         uint TransactionId,
         long StartingLcn,
-        long BitCount);
+        long BitCount,
+        ulong DeallocateLsn);
 
     private static List<MappingCandidate> FindTargetMappingCandidates(
         IReadOnlyList<ParsedLogRecord> records,
