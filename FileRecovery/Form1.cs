@@ -716,6 +716,7 @@ public partial class Form1 : Form
                     record.FullPath,
                     record.FileReferenceNumber,
                     record.ParentFileReferenceNumber,
+                    FileSizeBytes: record.FileSizeBytes ?? 0L,
                     record.DeletedAtUtc))
                 .ToList();
 
@@ -738,6 +739,7 @@ public partial class Form1 : Form
                     record.FullPath,
                     record.FileReferenceNumber,
                     record.ParentFileReferenceNumber,
+                    FileSizeBytes: 0L,
                     record.DeletedAtUtc));
 
                 mergedLiveUsnCount++;
@@ -755,6 +757,7 @@ public partial class Form1 : Form
                     record.FullPath,
                     record.FileReferenceNumber!.Value,
                     record.ParentFileReferenceNumber!.Value,
+                    FileSizeBytes: record.FileSizeBytes ?? 0L,
                     record.DeletedAtUtc));
 
                 mergedLiveHistoryCount++;
