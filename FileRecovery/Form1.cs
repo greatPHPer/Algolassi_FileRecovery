@@ -925,6 +925,71 @@ public partial class Form1 : Form
                     .First())
                 .ToList();
 
+            // Historical USN/MFT targets can reach the raw-MFT scanner without a
+            // persisted file size. Recover the exact historical size from $LogFile
+            // before the raw-MFT pass so historical MFT-slack $DATA matching can use
+            // a trusted size constraint. This is deliberately limited to historical
+            // targets that still have an unresolved size; it avoids invoking the
+            // whole-volume forensic marker scan merely to discover the file length.
+            if (historicalRawMftTargets.Any(target => target.FileSizeBytes <= 0))
+            {
+                var historicalLogFileSizeReader = new NtfsLogFileHistoricalSizeService();
+                var maximumHistoricalFileSize = new DriveInfo(rootPath).TotalSize;
+
+                for (var i = 0; i < historicalRawMftTargets.Count; i++)
+                {
+                    var historicalTarget = historicalRawMftTargets[i];
+
+                    if (historicalTarget.FileSizeBytes > 0)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        if (historicalLogFileSizeReader.TryRecoverFileSize(
+                            rootPath,
+                            Path.GetFileName(historicalTarget.FullPath),
+                            historicalTarget.ParentFileReferenceNumber,
+                            maximumHistoricalFileSize,
+                            out var historicalLogFileSize,
+                            out var historicalLogFileEvidence) &&
+                            historicalLogFileSize > 0)
+                        {
+                            historicalRawMftTargets[i] = (
+                                historicalTarget.FullPath,
+                                historicalTarget.FileReferenceNumber,
+                                historicalTarget.ParentFileReferenceNumber,
+                                historicalLogFileSize,
+                                historicalTarget.DeletedAtUtc);
+
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS historical raw-MFT target size enrichment: " +
+                                $"match=$LogFile, path={historicalTarget.FullPath}, " +
+                                $"fileRef={historicalTarget.FileReferenceNumber}, " +
+                                $"size={historicalLogFileSize:N0} bytes, " +
+                                $"evidence={historicalLogFileEvidence}");
+                        }
+                        else
+                        {
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS historical raw-MFT target $LogFile size lookup: " +
+                                $"no match for path={historicalTarget.FullPath}, " +
+                                $"fileRef={historicalTarget.FileReferenceNumber}. " +
+                                $"{historicalLogFileEvidence}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS historical raw-MFT target $LogFile size lookup failed: " +
+                            $"path={historicalTarget.FullPath}, " +
+                            $"fileRef={historicalTarget.FileReferenceNumber}, " +
+                            $"exception={ex.GetType().Name}: {ex.Message}");
+                    }
+                }
+            }
+
             foreach (var historicalTarget in historicalRawMftTargets)
             {
                 rawMftTargetPaths.Add(historicalTarget.FullPath);
