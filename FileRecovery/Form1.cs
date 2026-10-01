@@ -904,7 +904,11 @@ public partial class Form1 : Form
                             NormalizePath(candidate.FullPath),
                             NormalizePath(target.FullPath),
                             StringComparison.OrdinalIgnoreCase) &&
-                        candidate.DataStreamFound))
+                        candidate.DataStreamFound &&
+                        target.FileSizeBytes is long historicalSize &&
+                        historicalSize > 0 &&
+                        candidate.FileSizeBytes > 0 &&
+                        candidate.FileSizeBytes == historicalSize))
                 .Select(target => (
                     FullPath: NormalizePath(target.FullPath),
                     FileReferenceNumber: target.FileReferenceNumber is ulong fileReferenceNumber
