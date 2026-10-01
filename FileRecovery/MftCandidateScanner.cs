@@ -71,7 +71,7 @@ public sealed class MftCandidateScanner
         CancellationToken cancellationToken = default,
         long maxBytesToScan = 512L * 1024L * 1024L,
         IProgress<long>? progress = null,
-        IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, DateTime DeletedAtUtc)>? targetReferences = null,
+        IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, long FileSizeBytes, DateTime DeletedAtUtc)>? targetReferences = null,
         string? targetDirectory = null,
         bool includeSubdirectories = false)
     {
@@ -155,6 +155,7 @@ public sealed class MftCandidateScanner
                 FullPath: NormalizePath(target.FullPath),
                 FileReferenceNumber: target.FileReferenceNumber,
                 ParentFileReferenceNumber: target.ParentFileReferenceNumber,
+                FileSizeBytes: target.FileSizeBytes,
                 DeletedAtUtc: target.DeletedAtUtc,
                 SegmentNumber: target.FileReferenceNumber & 0x0000FFFFFFFFFFFFUL))
             .GroupBy(target => target.SegmentNumber)
@@ -337,6 +338,7 @@ public sealed class MftCandidateScanner
                                 directHistoricalRecord,
                                 historicalName,
                                 historicalTarget.ParentFileReferenceNumber,
+                                expectedFileSizeBytes: historicalTarget.FileSizeBytes,
                                 historicalSlackOnly: true);
 
                         if (!historicalData.Found)

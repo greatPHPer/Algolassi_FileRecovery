@@ -2884,6 +2884,7 @@ public sealed class NtfsMftDataReader
         byte[] record,
         string? expectedFileName = null,
         ulong? expectedParentFileReferenceNumber = null,
+        long expectedFileSizeBytes = 0,
         bool historicalSlackOnly = false)
     {
         ArgumentNullException.ThrowIfNull(record);
@@ -2909,6 +2910,7 @@ public sealed class NtfsMftDataReader
             record,
             expectedFileName,
             expectedParentFileReferenceNumber,
+            expectedFileSizeBytes,
             historicalSlackOnly);
     }
 
@@ -2920,6 +2922,7 @@ public sealed class NtfsMftDataReader
         byte[] record,
         string? expectedFileName = null,
         ulong? expectedParentFileReferenceNumber = null,
+        long expectedFileSizeBytes = 0,
         bool historicalSlackOnly = false)
     {
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
@@ -2944,6 +2947,19 @@ public sealed class NtfsMftDataReader
             volumeInfo.TotalClusters * (long)volumeInfo.BytesPerCluster,
             expectedFileName,
             expectedParentFileReferenceNumber);
+
+        // The reused MFT segment may no longer retain the old $FILE_NAME
+        // value, but the deletion-history record already captured the exact
+        // historical size. Use that trusted size to continue the narrow slack
+        // search instead of requiring the old $FILE_NAME size to survive.
+        if (historicalFileSize <= 0 && expectedFileSizeBytes > 0)
+        {
+            historicalFileSize = expectedFileSizeBytes;
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical MFT slack search: using supplied historical file size " +
+                $"fileRef={fileReferenceNumber}, expectedSize={historicalFileSize:N0}.");
+        }
 
         if (historicalSlackOnly)
         {

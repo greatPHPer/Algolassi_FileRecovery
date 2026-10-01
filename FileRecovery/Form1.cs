@@ -893,6 +893,9 @@ public partial class Form1 : Form
                     ParentFileReferenceNumber: target.ParentFileReferenceNumber is ulong parentFileReferenceNumber
                         ? parentFileReferenceNumber
                         : 0UL,
+                    FileSizeBytes: target.FileSizeBytes is long fileSizeBytes
+                        ? fileSizeBytes
+                        : 0L,
                     DeletedAtUtc: target.DeletedAtUtc))
                 .GroupBy(
                     target => target.FullPath,
@@ -913,6 +916,7 @@ public partial class Form1 : Form
                     FullPath: NormalizePath(candidate.FullPath),
                     FileReferenceNumber: candidate.FileReferenceNumber,
                     ParentFileReferenceNumber: candidate.ParentFileReferenceNumber,
+                    FileSizeBytes: candidate.FileSizeBytes,
                     DeletedAtUtc: candidate.LastUsnTimestampUtc))
                 .Concat(historicalRawMftTargets)
                 .GroupBy(
