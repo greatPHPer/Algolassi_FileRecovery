@@ -31,12 +31,26 @@ internal static class Program
                 logDirectory,
                 "AlgoLassi-FileRecovery-debug.txt");
 
+            var recoveryLogPath = Path.Combine(
+                logDirectory,
+                "AlgoLassi-FileRecovery-recovery.txt");
+
             Trace.Listeners.Clear();
             Trace.Listeners.Add(new BoundedFileTraceListener(logPath));
+
+            // Keep only the recovery-stage diagnostics in a separate small log.
+            // This prevents a verbose 122 GB forensic scan from rotating away
+            // the important USN/MFT evidence collected earlier in the same scan.
+            var recoveryListener = new RecoveryDiagnosticTraceListener(recoveryLogPath);
+            Trace.Listeners.Add(recoveryListener);
+            Debug.Listeners.Add(recoveryListener);
+
             Trace.AutoFlush = true;
 
             Trace.WriteLine(
                 $"[{DateTime.UtcNow:O}] AlgoLassi diagnostic logging started: {logPath}");
+            Trace.WriteLine(
+                $"[{DateTime.UtcNow:O}] AlgoLassi recovery-stage logging started: {recoveryLogPath}");
         }
         catch
         {
