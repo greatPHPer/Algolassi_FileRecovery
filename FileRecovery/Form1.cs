@@ -711,12 +711,29 @@ public partial class Form1 : Form
 
             var rootPath = Path.GetPathRoot(scanDirectory)!;
 
+            var historicalFileSizesByPath = historyRecords
+                .Where(record => record.FileSizeBytes.HasValue)
+                .GroupBy(
+                    record => NormalizePath(record.FullPath),
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .OrderByDescending(record => record.DeletedAtUtc)
+                        .Select(record => record.FileSizeBytes!.Value)
+                        .First(),
+                    StringComparer.OrdinalIgnoreCase);
+
             var targetRecords = deletedRecords
                 .Select(record => (
                     record.FullPath,
                     record.FileReferenceNumber,
                     record.ParentFileReferenceNumber,
-                    FileSizeBytes: record.FileSizeBytes ?? 0L,
+                    FileSizeBytes: historicalFileSizesByPath.TryGetValue(
+                        NormalizePath(record.FullPath),
+                        out var historicalFileSize)
+                        ? historicalFileSize
+                        : 0L,
                     record.DeletedAtUtc))
                 .ToList();
 
