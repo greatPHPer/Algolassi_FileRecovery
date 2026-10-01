@@ -2881,7 +2881,9 @@ public sealed class NtfsMftDataReader
         NtfsVolumeInfo volumeInfo,
         SafeFileHandle volumeHandle,
         ulong fileReferenceNumber,
-        byte[] record)
+        byte[] record,
+        string? expectedFileName = null,
+        ulong? expectedParentFileReferenceNumber = null)
     {
         ArgumentNullException.ThrowIfNull(record);
 
@@ -2937,6 +2939,57 @@ public sealed class NtfsMftDataReader
             volumeInfo.TotalClusters * (long)volumeInfo.BytesPerCluster,
             expectedFileName,
             expectedParentFileReferenceNumber);
+
+        // When the current attribute list no longer exposes the deleted file's
+        // nonresident $DATA stream, the old attribute record may still survive
+        // in MFT slack after the end-of-attributes marker. This is a narrow
+        // forensic fallback: require an exact historical $FILE_NAME match,
+        // require the old $DATA file size to equal that historical size, and
+        // require valid mapping pairs before treating the slack as recovery
+        // evidence.
+        if (dataAttributes.Count == 0 &&
+            !string.IsNullOrWhiteSpace(expectedFileName) &&
+            expectedParentFileReferenceNumber.HasValue)
+        {
+            var slackStart = FindAttributeSlackStart(record);
+
+            if (slackStart >= 0)
+            {
+                var expectedNameBytes = Encoding.Unicode.GetBytes(expectedFileName);
+
+                var historicalFileNameOffset = FindHistoricalFileNameValue(
+                    record,
+                    slackStart,
+                    expectedNameBytes,
+                    expectedParentFileReferenceNumber.Value,
+                    out var historicalSlackFileSize);
+
+                if (historicalFileNameOffset >= 0 &&
+                    historicalSlackFileSize > 0)
+                {
+                    var historicalSlackData = FindHistoricalNonResidentDataAttributes(
+                        record,
+                        volumeInfo,
+                        slackStart,
+                        historicalFileNameOffset,
+                        historicalSlackFileSize);
+
+                    if (historicalSlackData.Count > 0)
+                    {
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS historical MFT slack $DATA evidence: " +
+                            $"fileRef={fileReferenceNumber}, " +
+                            $"fileName={expectedFileName}, " +
+                            $"fileSize={historicalSlackFileSize:N0}, " +
+                            $"extents={historicalSlackData.Sum(x => x.Extents.Count):N0}.");
+
+                        return BuildDataStream(
+                            historicalSlackData,
+                            1);
+                    }
+                }
+            }
+        }
 
         var attributeList = FindAttributeList(record, volumeInfo, volumeHandle);
         if (!attributeList.Found)
@@ -3148,6 +3201,176 @@ public sealed class NtfsMftDataReader
         }
 
         return 0;
+    }
+
+    private static List<DataAttributeDescriptor> FindHistoricalNonResidentDataAttributes(
+        byte[] record,
+        NtfsVolumeInfo volumeInfo,
+        int slackStart,
+        int historicalFileNameOffset,
+        long historicalFileSize)
+    {
+        var result = new List<DataAttributeDescriptor>();
+
+        if (slackStart < 0 ||
+            slackStart >= record.Length ||
+            historicalFileSize <= 0)
+        {
+            return result;
+        }
+
+        const int nonResidentMinimumLength = 64;
+        const int maxRelatedSlackDistance = 4096;
+
+        for (var attributeOffset = slackStart;
+             attributeOffset + nonResidentMinimumLength <= record.Length;
+             attributeOffset++)
+        {
+            if (historicalFileNameOffset >= 0 &&
+                Math.Abs(attributeOffset - historicalFileNameOffset) > maxRelatedSlackDistance)
+            {
+                continue;
+            }
+
+            var type = BinaryPrimitives.ReadUInt32LittleEndian(
+                record.AsSpan(attributeOffset, 4));
+
+            if (type != NtfsAttributeData)
+            {
+                continue;
+            }
+
+            var attributeLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                record.AsSpan(attributeOffset + 4, 4));
+
+            if (attributeLength < nonResidentMinimumLength ||
+                attributeOffset + attributeLength > record.Length)
+            {
+                continue;
+            }
+
+            var formCode = record[attributeOffset + 8];
+            var nameLength = record[attributeOffset + 9];
+
+            if (formCode != NonResidentForm ||
+                nameLength != 0)
+            {
+                continue;
+            }
+
+            var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(attributeOffset + 16, 8));
+
+            var mappingPairsOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                record.AsSpan(attributeOffset + 32, 2));
+
+            var fileSize = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(attributeOffset + 48, 8));
+
+            var validDataLength = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(attributeOffset + 56, 8));
+
+            if (lowestVcn < 0 ||
+                lowestVcn != 0 ||
+                mappingPairsOffset < nonResidentMinimumLength ||
+                mappingPairsOffset >= attributeLength ||
+                fileSize <= 0 ||
+                fileSize != historicalFileSize ||
+                validDataLength < 0 ||
+                validDataLength > fileSize)
+            {
+                continue;
+            }
+
+            if (volumeInfo.BytesPerCluster == 0)
+            {
+                continue;
+            }
+
+            var volumeSizeBytes = checked(
+                volumeInfo.TotalClusters * (long)volumeInfo.BytesPerCluster);
+
+            if (fileSize > volumeSizeBytes)
+            {
+                continue;
+            }
+
+            IReadOnlyList<NtfsDataExtent> extents;
+
+            try
+            {
+                extents = NtfsMappingPairsParser.Parse(
+                    record.AsSpan(
+                        attributeOffset + mappingPairsOffset,
+                        attributeLength - mappingPairsOffset),
+                    lowestVcn);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS historical slack $DATA mapping-pair parse rejected: " +
+                    $"attributeOffset={attributeOffset}, " +
+                    $"fileSize={fileSize:N0}, error={ex.Message}.");
+                continue;
+            }
+
+            if (extents.Count == 0)
+            {
+                continue;
+            }
+
+            var expectedClusters = checked(
+                (validDataLength + volumeInfo.BytesPerCluster - 1) /
+                volumeInfo.BytesPerCluster);
+
+            long coveredClusters = 0;
+            var expectedVcn = lowestVcn;
+            var validExtentChain = true;
+
+            foreach (var extent in extents)
+            {
+                if (extent.ClusterCount <= 0 ||
+                    extent.VirtualClusterNumber != expectedVcn)
+                {
+                    validExtentChain = false;
+                    break;
+                }
+
+                coveredClusters = checked(
+                    coveredClusters + extent.ClusterCount);
+
+                expectedVcn = checked(
+                    expectedVcn + extent.ClusterCount);
+            }
+
+            if (!validExtentChain ||
+                coveredClusters < expectedClusters)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS historical slack $DATA mapping coverage rejected: " +
+                    $"attributeOffset={attributeOffset}, " +
+                    $"fileSize={fileSize:N0}, validDataLength={validDataLength:N0}, " +
+                    $"coveredClusters={coveredClusters:N0}, expectedClusters={expectedClusters:N0}.");
+                continue;
+            }
+
+            result.Add(
+                new DataAttributeDescriptor
+                {
+                    LowestVcn = lowestVcn,
+                    IsResident = false,
+                    FileSizeBytes = fileSize,
+                    ValidDataLengthBytes = validDataLength,
+                    Extents = extents
+                });
+
+            // The base $DATA stream must begin at VCN 0. Return the first
+            // structurally valid size-matched attribute; extension-record
+            // reconstruction remains the responsibility of $ATTRIBUTE_LIST.
+            break;
+        }
+
+        return result;
     }
 
     private static List<DataAttributeDescriptor> FindUnnamedDataAttributes(
