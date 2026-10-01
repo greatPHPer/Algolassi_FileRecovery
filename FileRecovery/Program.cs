@@ -43,7 +43,6 @@ internal static class Program
             // the important USN/MFT evidence collected earlier in the same scan.
             var recoveryListener = new RecoveryDiagnosticTraceListener(recoveryLogPath);
             Trace.Listeners.Add(recoveryListener);
-            Debug.Listeners.Add(recoveryListener);
 
             Trace.AutoFlush = true;
 
