@@ -2598,6 +2598,7 @@ public sealed class NtfsMftDataReader
         ulong expectedParentFileReferenceNumber,
         string expectedFileName,
         string? expectedFullPath,
+        DateTime expectedDeletedAtUtc,
         out NtfsDataStreamInfo stream)
     {
         stream = NotFound("The deleted file's NTFS $DATA stream could not be read.");
@@ -2631,7 +2632,8 @@ public sealed class NtfsMftDataReader
                 fileReferenceNumber,
                 expectedFileName,
                 expectedParentFileReferenceNumber,
-                expectedFullPath);
+                expectedFullPath,
+                expectedDeletedAtUtc);
 
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS recovery-time $DATA lookup: fileRef={fileReferenceNumber}, " +
