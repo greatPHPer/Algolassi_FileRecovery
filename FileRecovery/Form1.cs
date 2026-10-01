@@ -2641,6 +2641,7 @@ public partial class Form1 : Form
                             continue;
                         }
                     }
+                }
 
                 // A reused MFT segment can still retain the deleted file's resident
                 // $DATA attribute in record slack. Try that forensic source before
@@ -2719,6 +2720,7 @@ public partial class Form1 : Form
                             continue;
                         }
                     }
+                }
 
                 // Do not use generic allocated-file slack as a successful recovery source here.
                 // It is not tied strongly enough to the deleted file's identity and can
