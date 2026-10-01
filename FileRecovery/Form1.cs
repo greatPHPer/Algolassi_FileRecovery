@@ -995,6 +995,70 @@ public partial class Form1 : Form
                 rawMftTargetPaths.Add(historicalTarget.FullPath);
             }
 
+            var historicalSizeByPath = historicalRawMftTargets
+                .Where(target => target.FileSizeBytes > 0)
+                .GroupBy(
+                    target => NormalizePath(target.FullPath),
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .Select(target => target.FileSizeBytes)
+                        .OrderByDescending(size => size)
+                        .First(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            candidates = candidates
+                .Select(candidate =>
+                {
+                    var path = NormalizePath(candidate.FullPath);
+
+                    if (!candidate.DataStreamFound ||
+                        !historicalSizeByPath.TryGetValue(path, out var historicalSize) ||
+                        historicalSize <= 0 ||
+                        candidate.FileSizeBytes <= 0 ||
+                        candidate.FileSizeBytes == historicalSize)
+                    {
+                        return candidate;
+                    }
+
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS current candidate quarantined for historical-size mismatch: " +
+                        $"path={candidate.FullPath}, " +
+                        $"fileRef={candidate.FileReferenceNumber}, " +
+                        $"currentSize={candidate.FileSizeBytes:N0}, " +
+                        $"historicalSize={historicalSize:N0}.");
+
+                    return new RecoveryCandidate
+                    {
+                        FileReferenceNumber = candidate.FileReferenceNumber,
+                        ParentFileReferenceNumber = candidate.ParentFileReferenceNumber,
+                        Name = candidate.Name,
+                        DirectoryPath = candidate.DirectoryPath,
+                        LastUsnTimestampUtc = candidate.LastUsnTimestampUtc,
+                        Strength = candidate.Strength,
+                        Evidence = string.Join(
+                            " ",
+                            new[]
+                            {
+                                candidate.Evidence,
+                                "The retained current MFT $DATA size conflicted with trusted historical deletion size, so the current stream was quarantined and will not be used for recovery."
+                            }.Where(text => !string.IsNullOrWhiteSpace(text))),
+                        DataStreamFound = false,
+                        DataStreamResident = false,
+                        FileSizeBytes = historicalSize,
+                        ValidDataLengthBytes = 0,
+                        NtfsDataSnapshot = candidate.NtfsDataSnapshot?.Clone(),
+                        ResidentData = null,
+                        DataExtents = [],
+                        ExtentAllocations = [],
+                        FreeDataClusterCount = 0,
+                        AllocatedDataClusterCount = 0,
+                        DataEvidence = string.Empty
+                    };
+                })
+                .ToList();
+
             var rawMftReferences = exhaustiveMftCandidates
                 .Where(candidate => candidate.FileReferenceNumber != 0)
                 .Select(candidate => (
@@ -1253,11 +1317,10 @@ public partial class Form1 : Form
                 }
             }
 
-            // A metadata-only candidate may have a valid historical deletion
-            // record with the original byte length even though its current MFT $DATA
-            // stream is gone. Carry that size into the candidate so exact-size deep
-            // carving can be attempted for formats such as plain text.
-            foreach (var candidate in candidates.Where(candidate => candidate.FileSizeBytes <= 0))
+            // Carry the trusted historical deletion size into every matching
+            // candidate. This also detects a reused/current MFT record whose retained
+            // $DATA stream reports a different size than the historical deletion.
+            foreach (var candidate in candidates)
             {
                 // Prefer the exact historical MFT file reference because the current
                 // candidate path can differ in formatting (for example, \\?\\ prefixes)
@@ -1297,6 +1360,7 @@ public partial class Form1 : Form
                          (sizeMatch.DeletedAtUtc - candidate.LastUsnTimestampUtc)
                              .TotalMinutes) <= 5))
                 {
+                    var previousSize = candidate.FileSizeBytes;
                     candidate.FileSizeBytes = knownSize;
 
                     var matchKind = referenceMatch is not null
@@ -1306,11 +1370,12 @@ public partial class Form1 : Form
                     System.Diagnostics.Debug.WriteLine(
                         $"NTFS candidate size enrichment: match={matchKind}, " +
                         $"path={candidate.FullPath}, fileRef={candidate.FileReferenceNumber}, " +
-                        $"size={knownSize:N0} bytes.");
+                        $"size={knownSize:N0} bytes, previousSize={previousSize:N0}.");
                 }
-                else if (candidate.FileSizeBytes <= 0 &&
-                         candidate.FileReferenceNumber != 0 &&
-                         candidate.ParentFileReferenceNumber != 0)
+
+                if (candidate.FileSizeBytes <= 0 &&
+                    candidate.FileReferenceNumber != 0 &&
+                    candidate.ParentFileReferenceNumber != 0)
                 {
                     var historicalMftReader = new NtfsMftDataReader();
 
@@ -2575,9 +2640,7 @@ public partial class Form1 : Form
 
                             continue;
                         }
-                        }
                     }
-                }
 
                 // A reused MFT segment can still retain the deleted file's resident
                 // $DATA attribute in record slack. Try that forensic source before
@@ -2655,9 +2718,7 @@ public partial class Form1 : Form
 
                             continue;
                         }
-                        }
                     }
-                }
 
                 // Do not use generic allocated-file slack as a successful recovery source here.
                 // It is not tied strongly enough to the deleted file's identity and can
