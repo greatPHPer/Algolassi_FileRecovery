@@ -3494,8 +3494,6 @@ public sealed class NtfsMftDataReader
             // reconstruction remains the responsibility of $ATTRIBUTE_LIST.
             break;
         }
-
-            }
         }
         catch (Exception ex)
         {
