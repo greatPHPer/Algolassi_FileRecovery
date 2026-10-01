@@ -2983,7 +2983,8 @@ public sealed class NtfsMftDataReader
                     volumeInfo,
                     slackStart,
                     historicalFileNameOffset: -1,
-                    historicalFileSize);
+                    historicalFileSize,
+                    fileReferenceNumber);
 
                 System.Diagnostics.Trace.WriteLine(
                     $"NTFS historical-only MFT slack $DATA search: " +
@@ -3039,7 +3040,8 @@ public sealed class NtfsMftDataReader
                     volumeInfo,
                     slackStart,
                     historicalFileNameOffset: -1,
-                    historicalFileSize);
+                    historicalFileSize,
+                    fileReferenceNumber);
 
                 System.Diagnostics.Trace.WriteLine(
                     $"NTFS historical MFT slack $DATA search: " +
@@ -3281,7 +3283,8 @@ public sealed class NtfsMftDataReader
         NtfsVolumeInfo volumeInfo,
         int slackStart,
         int historicalFileNameOffset,
-        long historicalFileSize)
+        long historicalFileSize,
+        ulong fileReferenceNumber = 0)
     {
         var result = new List<DataAttributeDescriptor>();
 
@@ -3294,6 +3297,14 @@ public sealed class NtfsMftDataReader
 
         const int nonResidentMinimumLength = 64;
         const int maxRelatedSlackDistance = 4096;
+
+        var dataTypeHits = 0;
+        var unnamedNonResidentHits = 0;
+        var geometryMatches = 0;
+        var sizeMatches = 0;
+        var mappingParseSuccesses = 0;
+        var coverageMatches = 0;
+        var sizeMatchDetails = new List<string>();
 
         for (var attributeOffset = slackStart;
              attributeOffset + nonResidentMinimumLength <= record.Length;
@@ -3313,6 +3324,8 @@ public sealed class NtfsMftDataReader
                 continue;
             }
 
+            dataTypeHits++;
+
             var attributeLength = BinaryPrimitives.ReadUInt32LittleEndian(
                 record.AsSpan(attributeOffset + 4, 4));
 
@@ -3331,11 +3344,16 @@ public sealed class NtfsMftDataReader
                 continue;
             }
 
+            unnamedNonResidentHits++;
+
             var lowestVcn = BinaryPrimitives.ReadInt64LittleEndian(
                 record.AsSpan(attributeOffset + 16, 8));
 
             var mappingPairsOffset = BinaryPrimitives.ReadUInt16LittleEndian(
                 record.AsSpan(attributeOffset + 32, 2));
+
+            var allocatedSize = BinaryPrimitives.ReadInt64LittleEndian(
+                record.AsSpan(attributeOffset + 40, 8));
 
             var fileSize = BinaryPrimitives.ReadInt64LittleEndian(
                 record.AsSpan(attributeOffset + 48, 8));
@@ -3348,11 +3366,28 @@ public sealed class NtfsMftDataReader
                 mappingPairsOffset < nonResidentMinimumLength ||
                 mappingPairsOffset >= attributeLength ||
                 fileSize <= 0 ||
-                fileSize != historicalFileSize ||
                 validDataLength < 0 ||
-                validDataLength > fileSize)
+                validDataLength > fileSize ||
+                allocatedSize < fileSize)
             {
                 continue;
+            }
+
+            geometryMatches++;
+
+            if (fileSize != historicalFileSize)
+            {
+                continue;
+            }
+
+            sizeMatches++;
+
+            if (sizeMatchDetails.Count < 16)
+            {
+                sizeMatchDetails.Add(
+                    $"offset={attributeOffset},attrLen={attributeLength},mappingOffset={mappingPairsOffset}," +
+                    $"lowestVcn={lowestVcn},allocated={allocatedSize:N0},fileSize={fileSize:N0}," +
+                    $"validLength={validDataLength:N0}");
             }
 
             if (volumeInfo.BytesPerCluster == 0)
@@ -3389,6 +3424,8 @@ public sealed class NtfsMftDataReader
                         mappingPairsStart,
                         mappingPairsLength),
                     lowestVcn);
+
+                mappingParseSuccesses++;
             }
             catch (Exception ex)
             {
@@ -3439,6 +3476,8 @@ public sealed class NtfsMftDataReader
                 continue;
             }
 
+            coverageMatches++;
+
             result.Add(
                 new DataAttributeDescriptor
                 {
@@ -3455,9 +3494,25 @@ public sealed class NtfsMftDataReader
             break;
         }
 
+        if (fileReferenceNumber != 0)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical targeted slack $DATA diagnostic: " +
+                $"fileRef={fileReferenceNumber}, " +
+                $"slackStart={slackStart}, " +
+                $"expectedSize={historicalFileSize:N0}, " +
+                $"dataTypeHits={dataTypeHits}, " +
+                $"unnamedNonResidentHits={unnamedNonResidentHits}, " +
+                $"geometryMatches={geometryMatches}, " +
+                $"sizeMatches={sizeMatches}, " +
+                $"mappingParseSuccesses={mappingParseSuccesses}, " +
+                $"coverageMatches={coverageMatches}, " +
+                $"accepted={result.Count}, " +
+                $"sizeMatchDetails={(sizeMatchDetails.Count == 0 ? "(none)" : string.Join(" | ", sizeMatchDetails))}.");
+        }
+
         return result;
     }
-
     private static List<DataAttributeDescriptor> FindUnnamedDataAttributes(
         byte[] record,
         NtfsVolumeInfo volumeInfo)
