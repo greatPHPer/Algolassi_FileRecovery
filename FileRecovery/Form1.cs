@@ -2323,6 +2323,7 @@ public partial class Form1 : Form
                         candidate.ParentFileReferenceNumber,
                         candidate.Name,
                         candidate.FullPath,
+                        candidate.LastUsnTimestampUtc,
                         out var freshResidentData) &&
                         freshResidentData.Length > 0)
                     {
