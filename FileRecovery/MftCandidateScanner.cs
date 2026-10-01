@@ -755,7 +755,7 @@ public sealed class MftCandidateScanner
 
     public IReadOnlyList<RecoveryCandidate> ScanForFileReferences(
         string rootPath,
-        IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, DateTime DeletedAtUtc)> targets,
+        IReadOnlyCollection<(string FullPath, ulong FileReferenceNumber, ulong ParentFileReferenceNumber, long FileSizeBytes, DateTime DeletedAtUtc)> targets,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(targets);
@@ -770,6 +770,7 @@ public sealed class MftCandidateScanner
                 FullPath: NormalizePath(target.FullPath),
                 target.FileReferenceNumber,
                 target.ParentFileReferenceNumber,
+                target.FileSizeBytes,
                 target.DeletedAtUtc))
             .ToList();
 
