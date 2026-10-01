@@ -468,7 +468,9 @@ public sealed class MftCandidateScanner
                         volumeInfo,
                         volumeHandle,
                         fileReferenceNumber,
-                        scannedRecord);
+                        scannedRecord,
+                        entry.Name,
+                        entry.ParentFileReferenceNumber);
 
                     if (!data.Found)
                     {
