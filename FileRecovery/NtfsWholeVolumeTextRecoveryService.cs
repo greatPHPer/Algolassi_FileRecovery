@@ -200,75 +200,113 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 previousTail.Length,
                 bytesRead);
 
-            (string Encoding, byte[] Bytes)? matchedMarker = null;
-            var markerOffsetInWindow = -1;
+            var searchStartOffset = 0;
+            var recoveredThisWindow = false;
 
-            foreach (var markerVariant in markerVariants)
+            while (searchStartOffset < window.Length)
             {
-                var candidateOffset = window.AsSpan().IndexOf(markerVariant.Bytes);
-                if (candidateOffset < 0)
+                (string Encoding, byte[] Bytes)? matchedMarker = null;
+                var markerOffsetInWindow = -1;
+
+                foreach (var markerVariant in markerVariants)
                 {
-                    continue;
+                    var searchSpan = window.AsSpan(searchStartOffset);
+                    var candidateOffset = searchSpan.IndexOf(markerVariant.Bytes);
+                    if (candidateOffset < 0)
+                    {
+                        continue;
+                    }
+
+                    candidateOffset = checked(searchStartOffset + candidateOffset);
+
+                    var absoluteCandidateOffset = checked(
+                        physicalOffset -
+                        previousTail.Length +
+                        candidateOffset);
+
+                    if (IsUtf16Encoding(markerVariant.Encoding) &&
+                        (absoluteCandidateOffset & 1L) != 0)
+                    {
+                        searchStartOffset = checked(candidateOffset + 1);
+                        continue;
+                    }
+
+                    if (markerOffsetInWindow < 0 ||
+                        candidateOffset < markerOffsetInWindow)
+                    {
+                        markerOffsetInWindow = candidateOffset;
+                        matchedMarker = markerVariant;
+                    }
                 }
 
-                var absoluteCandidateOffset = checked(
-                    physicalOffset -
-                    previousTail.Length +
-                    candidateOffset);
-
-                if (IsUtf16Encoding(markerVariant.Encoding) &&
-                    (absoluteCandidateOffset & 1L) != 0)
+                if (!matchedMarker.HasValue ||
+                    markerOffsetInWindow < 0)
                 {
-                    // Reject byte-shifted UTF-16 false positives. A UTF-16 text
-                    // stream recovered from NTFS file data starts on an even byte
-                    // boundary, so the opposite-endian interpretation beginning
-                    // at the adjacent byte is not a valid target hit.
-                    continue;
+                    break;
                 }
 
-                if (markerOffsetInWindow < 0 || candidateOffset < markerOffsetInWindow)
+                scannedBytes = checked(scannedBytes + bytesRead);
+
+                if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
+                    scannedBytes == totalVolumeBytes)
                 {
-                    markerOffsetInWindow = candidateOffset;
-                    matchedMarker = markerVariant;
+                    lastReportedBytes = scannedBytes;
+                    progress?.Report(scannedBytes);
+                }
+
+                try
+                {
+                    var recovery = RecoverTextRegionFromScannedBuffer(
+                        candidate,
+                        destinationDirectory,
+                        volumeInfo,
+                        volumeHandle,
+                        matchedMarker.Value.Bytes,
+                        matchedMarker.Value.Encoding,
+                        window,
+                        checked(physicalOffset - previousTail.Length),
+                        markerOffsetInWindow,
+                        cancellationToken);
+
+                    var absoluteMarkerOffset = checked(
+                        physicalOffset -
+                        previousTail.Length +
+                        markerOffsetInWindow);
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS whole-volume target scan hit: " +
+                        $"candidate={candidate.FullPath}, " +
+                        $"encoding={matchedMarker.Value.Encoding}, " +
+                        $"markerOffset={absoluteMarkerOffset:N0}, " +
+                        $"scanned={scannedBytes:N0}.");
+
+                    return recovery;
+                }
+                catch (MarkerRecoverySizeMismatchException ex)
+                {
+                    var absoluteMarkerOffset = checked(
+                        physicalOffset -
+                        previousTail.Length +
+                        markerOffsetInWindow);
+
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS whole-volume target scan rejected marker region: " +
+                        $"candidate={candidate.FullPath}, " +
+                        $"encoding={matchedMarker.Value.Encoding}, " +
+                        $"markerOffset={absoluteMarkerOffset:N0}, " +
+                        $"recoveredBytes={ex.RecoveredBytes:N0}, " +
+                        $"expectedBytes={candidate.FileSizeBytes:N0}.");
+
+                    searchStartOffset = checked(markerOffsetInWindow + 1);
+                    recoveredThisWindow = true;
                 }
             }
 
-            scannedBytes = checked(scannedBytes + bytesRead);
-
-            if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
-                scannedBytes == totalVolumeBytes)
+            if (recoveredThisWindow)
             {
-                lastReportedBytes = scannedBytes;
-                progress?.Report(scannedBytes);
-            }
-
-            if (matchedMarker.HasValue && markerOffsetInWindow >= 0)
-            {
-                var absoluteMarkerOffset = checked(
-                    physicalOffset -
-                    previousTail.Length +
-                    markerOffsetInWindow);
-
-                var recovery = RecoverTextRegionFromScannedBuffer(
-                    candidate,
-                    destinationDirectory,
-                    volumeInfo,
-                    volumeHandle,
-                    matchedMarker.Value.Bytes,
-                    matchedMarker.Value.Encoding,
-                    window,
-                    checked(physicalOffset - previousTail.Length),
-                    markerOffsetInWindow,
-                    cancellationToken);
-
-                System.Diagnostics.Debug.WriteLine(
-                    $"NTFS whole-volume target scan hit: " +
-                    $"candidate={candidate.FullPath}, " +
-                    $"encoding={matchedMarker.Value.Encoding}, " +
-                    $"markerOffset={absoluteMarkerOffset:N0}, " +
-                    $"scanned={scannedBytes:N0}.");
-
-                return recovery;
+                // The window contained marker hits, but every size-mismatched hit
+                // was rejected. Continue into the next physical scan window so a
+                // later occurrence can identify the real deleted file.
             }
 
             previousTail = buffer.Length <= overlapLength
@@ -511,6 +549,14 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 $"The text region containing the marker exceeds the {MaxRecoveredTextBytes:N0}-byte forensic recovery limit.");
         }
 
+        if (candidate.FileSizeBytes > 0 &&
+            recoveredLength != candidate.FileSizeBytes)
+        {
+            throw new MarkerRecoverySizeMismatchException(
+                recoveredLength,
+                candidate.FileSizeBytes);
+        }
+
         var absoluteStart = checked(scanWindowAbsoluteOffset + start);
         var absoluteEnd = checked(scanWindowAbsoluteOffset + end);
 
@@ -670,6 +716,20 @@ public sealed class NtfsWholeVolumeTextRecoveryService
     private static bool IsUtf16Encoding(string encoding) =>
         string.Equals(encoding, "UTF-16LE", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(encoding, "UTF-16BE", StringComparison.OrdinalIgnoreCase);
+
+    private sealed class MarkerRecoverySizeMismatchException : Exception
+    {
+        public MarkerRecoverySizeMismatchException(
+            int recoveredBytes,
+            long expectedBytes)
+            : base(
+                $"Marker region size mismatch: recovered={recoveredBytes:N0}, expected={expectedBytes:N0}.")
+        {
+            RecoveredBytes = recoveredBytes;
+        }
+
+        public int RecoveredBytes { get; }
+    }
 
     private static bool IsUtf16TextCodeUnit(
         byte[] buffer,
