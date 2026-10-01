@@ -1009,6 +1009,7 @@ public partial class Form1 : Form
                     StringComparer.OrdinalIgnoreCase)
                 .Select(group => group
                     .OrderByDescending(target => target.DeletedAtUtc)
+                    .ThenByDescending(target => target.FileSizeBytes)
                     .First())
                 .ToList();
 
