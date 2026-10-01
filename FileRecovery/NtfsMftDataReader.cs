@@ -2883,7 +2883,8 @@ public sealed class NtfsMftDataReader
         ulong fileReferenceNumber,
         byte[] record,
         string? expectedFileName = null,
-        ulong? expectedParentFileReferenceNumber = null)
+        ulong? expectedParentFileReferenceNumber = null,
+        bool historicalSlackOnly = false)
     {
         ArgumentNullException.ThrowIfNull(record);
 
@@ -2907,7 +2908,8 @@ public sealed class NtfsMftDataReader
             fileReferenceNumber,
             record,
             expectedFileName,
-            expectedParentFileReferenceNumber);
+            expectedParentFileReferenceNumber,
+            historicalSlackOnly);
     }
 
     private NtfsDataStreamInfo ReadDefaultDataStreamFromMftRecord(
@@ -2917,7 +2919,8 @@ public sealed class NtfsMftDataReader
         ulong fileReferenceNumber,
         byte[] record,
         string? expectedFileName = null,
-        ulong? expectedParentFileReferenceNumber = null)
+        ulong? expectedParentFileReferenceNumber = null,
+        bool historicalSlackOnly = false)
     {
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
         var dataAttributes = FindUnnamedDataAttributes(record, volumeInfo);
@@ -2941,6 +2944,50 @@ public sealed class NtfsMftDataReader
             volumeInfo.TotalClusters * (long)volumeInfo.BytesPerCluster,
             expectedFileName,
             expectedParentFileReferenceNumber);
+
+        if (historicalSlackOnly)
+        {
+            var slackStart = FindAttributeSlackStart(record);
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical-only MFT slack search: " +
+                $"fileRef={fileReferenceNumber}, " +
+                $"fileName={expectedFileName ?? "(none)"}, " +
+                $"parentRef={expectedParentFileReferenceNumber?.ToString() ?? "(none)"}, " +
+                $"fileNameSize={historicalFileSize:N0}, " +
+                $"slackStart={slackStart}.");
+
+            if (slackStart >= 0 &&
+                historicalFileSize > 0 &&
+                !string.IsNullOrWhiteSpace(expectedFileName) &&
+                expectedParentFileReferenceNumber.HasValue)
+            {
+                var historicalSlackData = FindHistoricalNonResidentDataAttributes(
+                    record,
+                    volumeInfo,
+                    slackStart,
+                    historicalFileNameOffset: -1,
+                    historicalFileSize);
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical-only MFT slack $DATA search: " +
+                    $"fileRef={fileReferenceNumber}, " +
+                    $"fileName={expectedFileName}, " +
+                    $"expectedSize={historicalFileSize:N0}, " +
+                    $"matches={historicalSlackData.Count:N0}.");
+
+                if (historicalSlackData.Count > 0)
+                {
+                    return BuildDataStream(
+                        historicalSlackData,
+                        1);
+                }
+            }
+
+            return BuildFileNameSizeOnlyResult(
+                historicalFileSize,
+                "The historical MFT segment was inspected for the deleted file's nonresident $DATA in MFT slack, but no structurally valid size-matched mapping-pair attribute was found.");
+        }
 
         // When the current attribute list no longer exposes the deleted file's
         // nonresident $DATA stream, the old attribute record may still survive
