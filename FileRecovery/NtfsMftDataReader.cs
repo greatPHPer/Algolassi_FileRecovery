@@ -3041,7 +3041,14 @@ public sealed class NtfsMftDataReader
                     }
                 }
 
-                var nonZeroSlackBytes = rawSlack.Count(value => value != 0);
+                var nonZeroSlackBytes = 0;
+                for (var i = 0; i < rawSlack.Length; i++)
+                {
+                    if (rawSlack[i] != 0)
+                    {
+                        nonZeroSlackBytes++;
+                    }
+                }
 
                 System.Diagnostics.Trace.WriteLine(
                     $"NTFS historical reader CORE SLACK RAW: " +
