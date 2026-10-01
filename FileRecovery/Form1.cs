@@ -858,17 +858,12 @@ public partial class Form1 : Form
                 .Where(candidate => !candidate.DataStreamFound)
                 .ToList();
 
-            // Plain-text candidates deliberately use the marker-driven forensic path
-            // when retained NTFS $DATA is unavailable. Do not make the user wait for
-            // an exhaustive whole-$MFT pass that still cannot prove text-file identity.
-            // Non-text formats retain the existing exhaustive MFT fallback because their
-            // format-specific recovery paths may be able to use the recovered stream.
-            var exhaustiveMftCandidates = missingDataCandidates
-                .Where(candidate =>
-                    !Path.GetExtension(candidate.Name).Equals(
-                        ".txt",
-                        StringComparison.OrdinalIgnoreCase))
-                .ToList();
+            // Give every missing-data candidate, including plain-text files, one
+            // targeted raw-MFT pass before falling back to marker-based carving. For
+            // deleted text files, the historical nonresident $DATA mapping pairs may
+            // still survive in the deleted/reused MFT record's slack even though the
+            // normal attribute enumeration no longer exposes them.
+            var exhaustiveMftCandidates = missingDataCandidates.ToList();
 
             var missingDataPaths = exhaustiveMftCandidates
                 .Select(candidate => candidate.FullPath)
