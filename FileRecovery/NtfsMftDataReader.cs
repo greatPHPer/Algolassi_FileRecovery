@@ -2905,7 +2905,9 @@ public sealed class NtfsMftDataReader
             volumeHandle,
             rawMftVolumeHandle,
             fileReferenceNumber,
-            record);
+            record,
+            expectedFileName,
+            expectedParentFileReferenceNumber);
     }
 
     private NtfsDataStreamInfo ReadDefaultDataStreamFromMftRecord(
