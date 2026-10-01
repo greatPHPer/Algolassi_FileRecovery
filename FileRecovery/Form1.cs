@@ -877,14 +877,14 @@ public partial class Form1 : Form
                     missingDataCandidates.Count - exhaustiveMftCandidates.Count;
 
                 System.Diagnostics.Trace.WriteLine(
-                    $"NTFS exhaustive MFT fallback: deferred {deferredTextCount:N0} plain-text " +
-                    "candidate(s) to marker-driven forensic recovery.");
+                    $"NTFS exhaustive MFT fallback: {deferredTextCount:N0} plain-text " +
+                    "candidate(s) remain for marker-driven forensic recovery after the raw-MFT pass.");
             }
 
             if (missingDataPaths.Count > 0)
             {
                 lblStatus.Text =
-                    $"Found {candidates.Count:N0} candidate(s); exhaustively scanning the NTFS $MFT for retained deleted records ({missingDataPaths.Count:N0} non-text item(s))...";
+                    $"Found {candidates.Count:N0} candidate(s); scanning the NTFS $MFT for retained deleted records ({missingDataPaths.Count:N0} item(s))...";
 
                 var fallbackCandidates =
                     await _mftCandidateScanner.ScanRawMftForPathsAsync(
