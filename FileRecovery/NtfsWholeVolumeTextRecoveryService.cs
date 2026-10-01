@@ -234,6 +234,16 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     previousTail.Length +
                     markerOffsetInWindow);
 
+                if (IsUtf16Encoding(matchedMarker.Value.Encoding) &&
+                    (absoluteMarkerOffset & 1L) != 0)
+                {
+                    // Reject byte-shifted UTF-16 false positives. A UTF-16 text
+                    // stream recovered from NTFS file data starts on an even byte
+                    // boundary, so the opposite-endian interpretation beginning
+                    // at the adjacent byte is not a valid target hit.
+                    continue;
+                }
+
                 var recovery = RecoverTextRegionFromScannedBuffer(
                     candidate,
                     destinationDirectory,
@@ -403,6 +413,12 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     physicalOffset -
                     previousTail.Length +
                     markerOffset);
+
+                if (IsUtf16Encoding(markerVariant.Encoding) &&
+                    (absoluteOffset & 1L) != 0)
+                {
+                    continue;
+                }
 
                 scannedBytes = checked(scannedBytes + buffer.Length);
                 progress?.Report(scannedBytes);
@@ -645,6 +661,10 @@ public sealed class NtfsWholeVolumeTextRecoveryService
 
         return (plainStart, plainEnd);
     }
+
+    private static bool IsUtf16Encoding(string encoding) =>
+        string.Equals(encoding, "UTF-16LE", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(encoding, "UTF-16BE", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsUtf16TextCodeUnit(
         byte[] buffer,
