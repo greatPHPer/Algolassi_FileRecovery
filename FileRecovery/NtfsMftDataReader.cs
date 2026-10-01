@@ -3299,10 +3299,22 @@ public sealed class NtfsMftDataReader
 
             try
             {
+                var mappingPairsStart = checked(
+                    attributeOffset + (int)mappingPairsOffset);
+                var mappingPairsLength = checked(
+                    (int)attributeLength - (int)mappingPairsOffset);
+
+                if (mappingPairsStart < attributeOffset ||
+                    mappingPairsLength <= 0 ||
+                    mappingPairsStart + mappingPairsLength > record.Length)
+                {
+                    continue;
+                }
+
                 extents = NtfsMappingPairsParser.Parse(
                     record.AsSpan(
-                        attributeOffset + mappingPairsOffset,
-                        attributeLength - mappingPairsOffset),
+                        mappingPairsStart,
+                        mappingPairsLength),
                     lowestVcn);
             }
             catch (Exception ex)
