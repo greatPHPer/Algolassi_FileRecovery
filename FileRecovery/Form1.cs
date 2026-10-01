@@ -919,6 +919,20 @@ public partial class Form1 : Form
                     .First())
                 .ToList();
 
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS raw-MFT target handoff: pathTargets={missingDataCandidates.Count:N0}, " +
+                $"historicalTargets={historicalRawMftTargets.Count:N0}, " +
+                $"combinedTargets={rawMftReferences.Count:N0}.");
+
+            foreach (var target in rawMftReferences)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS raw-MFT target: path={target.FullPath}, " +
+                    $"fileRef={target.FileReferenceNumber}, " +
+                    $"parentRef={target.ParentFileReferenceNumber}, " +
+                    $"deletedAtUtc={target.DeletedAtUtc:O}.");
+            }
+
             var missingDataPaths = rawMftTargetPaths
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
