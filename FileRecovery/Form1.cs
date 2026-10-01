@@ -1056,8 +1056,45 @@ public partial class Form1 : Form
 
                 if (fallbackCandidates.Count > 0)
                 {
+                    var historicalSizeByPath = rawMftReferences
+                        .Where(target => target.FileSizeBytes > 0)
+                        .GroupBy(
+                            target => NormalizePath(target.FullPath),
+                            StringComparer.OrdinalIgnoreCase)
+                        .ToDictionary(
+                            group => group.Key,
+                            group => group
+                                .Select(target => target.FileSizeBytes)
+                                .OrderByDescending(size => size)
+                                .First(),
+                            StringComparer.OrdinalIgnoreCase);
+
                     var fallbackByPath = fallbackCandidates
                         .Where(candidate => candidate.DataStreamFound)
+                        .Where(candidate =>
+                        {
+                            var path = NormalizePath(candidate.FullPath);
+
+                            if (!historicalSizeByPath.TryGetValue(path, out var expectedSize) ||
+                                expectedSize <= 0 ||
+                                candidate.FileSizeBytes <= 0)
+                            {
+                                return true;
+                            }
+
+                            var matches = candidate.FileSizeBytes == expectedSize;
+
+                            if (!matches)
+                            {
+                                System.Diagnostics.Trace.WriteLine(
+                                    $"NTFS raw-MFT fallback candidate rejected for historical-size mismatch: " +
+                                    $"path={candidate.FullPath}, " +
+                                    $"candidateSize={candidate.FileSizeBytes:N0}, " +
+                                    $"historicalSize={expectedSize:N0}.");
+                            }
+
+                            return matches;
+                        })
                         .GroupBy(candidate => candidate.FullPath, StringComparer.OrdinalIgnoreCase)
                         .ToDictionary(
                             group => group.Key,
@@ -2476,7 +2513,18 @@ public partial class Form1 : Form
                         out var freshResidentData) &&
                         freshResidentData.Length > 0)
                     {
-                        var destinationPath =
+                        if (candidate.FileSizeBytes > 0 &&
+                            freshResidentData.LongLength != candidate.FileSizeBytes)
+                        {
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS fresh resident recovery rejected for historical-size mismatch: " +
+                                $"path={candidate.FullPath}, " +
+                                $"candidateSize={candidate.FileSizeBytes:N0}, " +
+                                $"residentBytes={freshResidentData.LongLength:N0}.");
+                        }
+                        else
+                        {
+                            var destinationPath =
                             RecoveryDestinationPolicy.CreateSafeFilePath(
                                 destinationDirectory,
                                 candidate.Name);
@@ -2499,24 +2547,24 @@ public partial class Form1 : Form
                             throw;
                         }
 
-                        candidate.FileSizeBytes = freshResidentData.Length;
+                            candidate.FileSizeBytes = freshResidentData.Length;
 
-                        successes.Add(new RecoveryResult
-                        {
-                            Success = true,
-                            SourcePath = candidate.FullPath,
-                            DestinationPath = destinationPath,
-                            BytesRecovered = freshResidentData.Length,
-                            Evidence =
-                                $"Recovered {freshResidentData.Length:N0} byte(s) from the " +
-                                "resident $DATA stream retained in the deleted file's MFT " +
-                                "record. The filename and parent reference were validated " +
-                                "against the deleted-file reference."
-                        });
+                            successes.Add(new RecoveryResult
+                            {
+                                Success = true,
+                                SourcePath = candidate.FullPath,
+                                DestinationPath = destinationPath,
+                                BytesRecovered = freshResidentData.Length,
+                                Evidence =
+                                    $"Recovered {freshResidentData.Length:N0} byte(s) from the " +
+                                    "resident $DATA stream retained in the deleted file's MFT " +
+                                    "record. The filename and parent reference were validated " +
+                                    "against the deleted-file reference."
+                            });
 
-                        continue;
+                            continue;
+                        }
                     }
-                }
 
                 // A reused MFT segment can still retain the deleted file's resident
                 // $DATA attribute in record slack. Try that forensic source before
@@ -2536,7 +2584,18 @@ public partial class Form1 : Form
                         out var usedHeuristicHistoricalEvidence) &&
                         historicalData.Length > 0)
                     {
-                        var destinationPath =
+                        if (candidate.FileSizeBytes > 0 &&
+                            historicalData.LongLength != candidate.FileSizeBytes)
+                        {
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS historical resident recovery rejected for historical-size mismatch: " +
+                                $"path={candidate.FullPath}, " +
+                                $"candidateSize={candidate.FileSizeBytes:N0}, " +
+                                $"residentBytes={historicalData.LongLength:N0}.");
+                        }
+                        else
+                        {
+                            var destinationPath =
                             RecoveryDestinationPolicy.CreateSafeFilePath(
                                 destinationDirectory,
                                 candidate.Name);
@@ -2559,31 +2618,31 @@ public partial class Form1 : Form
                             throw;
                         }
 
-                        candidate.FileSizeBytes = historicalData.Length;
+                            candidate.FileSizeBytes = historicalData.Length;
 
-                        successes.Add(new RecoveryResult
-                        {
-                            Success = true,
-                            SourcePath = candidate.FullPath,
-                            DestinationPath = destinationPath,
-                            BytesRecovered = historicalData.Length,
-                            Evidence = usedHeuristicHistoricalEvidence
-                                ? $"Recovered {historicalData.Length:N0} byte(s) from " +
-                                  "historical resident $DATA retained in reused MFT record " +
-                                  "slack. The exact historical filename was found near a " +
-                                  "plausible resident $DATA attribute; the parent reference " +
-                                  "could not be structurally validated, so this result is " +
-                                  "heuristic."
-                                : $"Recovered {historicalData.Length:N0} byte(s) from " +
-                                  "historical resident $DATA retained in the reused MFT " +
-                                  "record's slack. The source was matched by historical " +
-                                  "file name and parent reference; the current MFT sequence " +
-                                  "was not treated as the deleted file."
-                        });
+                            successes.Add(new RecoveryResult
+                            {
+                                Success = true,
+                                SourcePath = candidate.FullPath,
+                                DestinationPath = destinationPath,
+                                BytesRecovered = historicalData.Length,
+                                Evidence = usedHeuristicHistoricalEvidence
+                                    ? $"Recovered {historicalData.Length:N0} byte(s) from " +
+                                      "historical resident $DATA retained in reused MFT record " +
+                                      "slack. The exact historical filename was found near a " +
+                                      "plausible resident $DATA attribute; the parent reference " +
+                                      "could not be structurally validated, so this result is " +
+                                      "heuristic."
+                                    : $"Recovered {historicalData.Length:N0} byte(s) from " +
+                                      "historical resident $DATA retained in the reused MFT " +
+                                      "record's slack. The source was matched by historical " +
+                                      "file name and parent reference; the current MFT sequence " +
+                                      "was not treated as the deleted file."
+                            });
 
-                        continue;
+                            continue;
+                        }
                     }
-                }
 
                 // Do not use generic allocated-file slack as a successful recovery source here.
                 // It is not tied strongly enough to the deleted file's identity and can
