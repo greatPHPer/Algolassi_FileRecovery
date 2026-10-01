@@ -1782,6 +1782,7 @@ public partial class Form1 : Form
                                 FullPath: NormalizePath(record.FullPath),
                                 FileReferenceNumber: record.FileReferenceNumber!.Value,
                                 ParentFileReferenceNumber: record.ParentFileReferenceNumber ?? 0,
+                                FileSizeBytes: record.FileSizeBytes ?? 0L,
                                 DeletedAtUtc: record.DeletedAtUtc))
                             .ToList();
 
