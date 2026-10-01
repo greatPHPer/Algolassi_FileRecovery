@@ -2624,6 +2624,34 @@ public partial class Form1 : Form
                               Environment.NewLine +
                               string.Join(Environment.NewLine, result.failures.Take(8));
 
+                var clipboardDiagnostic =
+                    $"AlgoLassi NTFS RECOVERY FAILED/RESULT" +
+                    Environment.NewLine +
+                    $"Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}" +
+                    Environment.NewLine +
+                    $"Destination: {destinationDirectory}" +
+                    Environment.NewLine +
+                    Environment.NewLine +
+                    message;
+
+                System.Diagnostics.Trace.WriteLine(
+                    Environment.NewLine +
+                    "========== ALGOLASSI RECOVERY RESULT ==========" +
+                    Environment.NewLine +
+                    clipboardDiagnostic +
+                    Environment.NewLine +
+                    "========== END ALGOLASSI RECOVERY RESULT ==========");
+
+                try
+                {
+                    Clipboard.SetText(clipboardDiagnostic);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"AlgoLassi recovery clipboard copy failed: {ex.GetType().Name}: {ex.Message}");
+                }
+
                 MessageBox.Show(
                     this,
                     message,
