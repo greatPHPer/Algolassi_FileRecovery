@@ -875,8 +875,10 @@ public partial class Form1 : Form
             var historicalRawMftTargets = targetRecords
                 .Where(target =>
                     !string.IsNullOrWhiteSpace(target.FullPath) &&
-                    target.FileReferenceNumber != 0 &&
-                    target.ParentFileReferenceNumber != 0 &&
+                    target.FileReferenceNumber.HasValue &&
+                    target.FileReferenceNumber.Value != 0 &&
+                    target.ParentFileReferenceNumber.HasValue &&
+                    target.ParentFileReferenceNumber.Value != 0 &&
                     !candidates.Any(candidate =>
                         string.Equals(
                             NormalizePath(candidate.FullPath),
@@ -885,8 +887,8 @@ public partial class Form1 : Form
                         candidate.DataStreamFound))
                 .Select(target => (
                     FullPath: NormalizePath(target.FullPath),
-                    FileReferenceNumber: target.FileReferenceNumber,
-                    ParentFileReferenceNumber: target.ParentFileReferenceNumber,
+                    FileReferenceNumber: target.FileReferenceNumber!.Value,
+                    ParentFileReferenceNumber: target.ParentFileReferenceNumber!.Value,
                     DeletedAtUtc: target.DeletedAtUtc))
                 .GroupBy(
                     target => target.FullPath,
