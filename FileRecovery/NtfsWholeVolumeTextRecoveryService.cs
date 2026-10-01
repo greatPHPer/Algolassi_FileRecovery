@@ -200,8 +200,16 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 previousTail.Length,
                 bytesRead);
 
+            scannedBytes = checked(scannedBytes + buffer.Length);
+
+            if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
+                scannedBytes == totalVolumeBytes)
+            {
+                lastReportedBytes = scannedBytes;
+                progress?.Report(scannedBytes);
+            }
+
             var searchStartOffset = 0;
-            var recoveredThisWindow = false;
 
             while (searchStartOffset < window.Length)
             {
@@ -210,32 +218,42 @@ public sealed class NtfsWholeVolumeTextRecoveryService
 
                 foreach (var markerVariant in markerVariants)
                 {
-                    var searchSpan = window.AsSpan(searchStartOffset);
-                    var candidateOffset = searchSpan.IndexOf(markerVariant.Bytes);
-                    if (candidateOffset < 0)
+                    var variantSearchOffset = searchStartOffset;
+
+                    while (variantSearchOffset < window.Length)
                     {
-                        continue;
-                    }
+                        var relativeOffset = window
+                            .AsSpan(variantSearchOffset)
+                            .IndexOf(markerVariant.Bytes);
 
-                    candidateOffset = checked(searchStartOffset + candidateOffset);
+                        if (relativeOffset < 0)
+                        {
+                            break;
+                        }
 
-                    var absoluteCandidateOffset = checked(
-                        physicalOffset -
-                        previousTail.Length +
-                        candidateOffset);
+                        var candidateOffset = checked(
+                            variantSearchOffset + relativeOffset);
 
-                    if (IsUtf16Encoding(markerVariant.Encoding) &&
-                        (absoluteCandidateOffset & 1L) != 0)
-                    {
-                        searchStartOffset = checked(candidateOffset + 1);
-                        continue;
-                    }
+                        var absoluteCandidateOffset = checked(
+                            physicalOffset -
+                            previousTail.Length +
+                            candidateOffset);
 
-                    if (markerOffsetInWindow < 0 ||
-                        candidateOffset < markerOffsetInWindow)
-                    {
-                        markerOffsetInWindow = candidateOffset;
-                        matchedMarker = markerVariant;
+                        if (IsUtf16Encoding(markerVariant.Encoding) &&
+                            (absoluteCandidateOffset & 1L) != 0)
+                        {
+                            variantSearchOffset = checked(candidateOffset + 1);
+                            continue;
+                        }
+
+                        if (markerOffsetInWindow < 0 ||
+                            candidateOffset < markerOffsetInWindow)
+                        {
+                            markerOffsetInWindow = candidateOffset;
+                            matchedMarker = markerVariant;
+                        }
+
+                        break;
                     }
                 }
 
@@ -243,15 +261,6 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     markerOffsetInWindow < 0)
                 {
                     break;
-                }
-
-                scannedBytes = checked(scannedBytes + bytesRead);
-
-                if (scannedBytes - lastReportedBytes >= ProgressIntervalBytes ||
-                    scannedBytes == totalVolumeBytes)
-                {
-                    lastReportedBytes = scannedBytes;
-                    progress?.Report(scannedBytes);
                 }
 
                 try
@@ -298,15 +307,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                         $"expectedBytes={candidate.FileSizeBytes:N0}.");
 
                     searchStartOffset = checked(markerOffsetInWindow + 1);
-                    recoveredThisWindow = true;
                 }
-            }
-
-            if (recoveredThisWindow)
-            {
-                // The window contained marker hits, but every size-mismatched hit
-                // was rejected. Continue into the next physical scan window so a
-                // later occurrence can identify the real deleted file.
             }
 
             previousTail = buffer.Length <= overlapLength
