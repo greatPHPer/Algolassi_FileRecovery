@@ -751,6 +751,7 @@ public sealed class NtfsMftDataReader
         ulong expectedParentFileReferenceNumber,
         string expectedFileName,
         string? expectedFullPath,
+        DateTime expectedDeletedAtUtc,
         out byte[] data)
     {
         data = [];
@@ -825,7 +826,8 @@ public sealed class NtfsMftDataReader
                     expectedFileName,
                     expectedParentFileReferenceNumber,
                     expectedFullPath,
-                    expectedSequenceNumber: sequenceNumber);
+                    expectedSequenceNumber: sequenceNumber,
+                    expectedDeletedAtUtc: expectedDeletedAtUtc);
 
                 System.Diagnostics.Debug.WriteLine(
                     $"NTFS fresh resident $DATA: relaxed record inspected. " +
@@ -4027,13 +4029,14 @@ public sealed class NtfsMftDataReader
                 continue;
             }
 
-            if (parentReference == expectedParentFileReferenceNumber)
-            {
-                if (expectedDeletedAtUtc == default)
-                {
-                    return true;
-                }
+            // A retained FILE_NAME entry is only evidence for this deleted
+            // instance when its timestamp is compatible with the deletion event.
+            // This applies even when the old parent reference is stale but the
+            // resolved historical/current path happens to match.
+            var timestampMatches = expectedDeletedAtUtc == default;
 
+            if (!timestampMatches)
+            {
                 var modificationTimeFileTime =
                     BinaryPrimitives.ReadInt64LittleEndian(
                         record.AsSpan(valueStart + 16, sizeof(long)));
@@ -4055,21 +4058,35 @@ public sealed class NtfsMftDataReader
                         : Math.Abs(
                             (modificationTimeUtc - expectedDeletedAtUtc).TotalMinutes);
 
-                if (timestampDeltaMinutes <= 5)
+                timestampMatches = timestampDeltaMinutes <= 5;
+
+                if (timestampMatches)
                 {
                     System.Diagnostics.Trace.WriteLine(
                         $"NTFS FILE_NAME match: name={name}, parentRef={parentReference}, " +
                         $"modifiedAt={modificationTimeUtc:O}, " +
                         $"deleteAt={expectedDeletedAtUtc:O}, " +
                         $"deltaMinutes={timestampDeltaMinutes:0.###}.");
-                    return true;
                 }
+                else
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS FILE_NAME rejected by timestamp: name={name}, " +
+                        $"parentRef={parentReference}, modifiedAt={modificationTimeUtc:O}, " +
+                        $"deleteAt={expectedDeletedAtUtc:O}, " +
+                        $"deltaMinutes={timestampDeltaMinutes:0.###}.");
+                }
+            }
 
-                System.Diagnostics.Trace.WriteLine(
-                    $"NTFS FILE_NAME rejected by timestamp: name={name}, " +
-                    $"parentRef={parentReference}, modifiedAt={modificationTimeUtc:O}, " +
-                    $"deleteAt={expectedDeletedAtUtc:O}, " +
-                    $"deltaMinutes={timestampDeltaMinutes:0.###}.");
+            if (parentReference == expectedParentFileReferenceNumber &&
+                timestampMatches)
+            {
+                return true;
+            }
+
+            if (!timestampMatches)
+            {
+                continue;
             }
 
             // The USN parent reference can become stale after the parent
@@ -4106,7 +4123,7 @@ public sealed class NtfsMftDataReader
                     System.Diagnostics.Debug.WriteLine(
                         $"NTFS $DATA lookup: FILE_NAME path validation failed for parentRef={parentReference}: {ex.Message}");
                 }
-            }
+            }            }
         }
 
         return false;
