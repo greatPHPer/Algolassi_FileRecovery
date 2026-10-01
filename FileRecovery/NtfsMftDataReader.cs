@@ -3031,6 +3031,27 @@ public sealed class NtfsMftDataReader
                     historicalFileSize,
                     fileReferenceNumber);
 
+                var rawSlack = record.AsSpan(slackStart);
+                var dataTypeByteHits = 0;
+                for (var i = 0; i + 4 <= rawSlack.Length; i++)
+                {
+                    if (BinaryPrimitives.ReadUInt32LittleEndian(rawSlack.Slice(i, 4)) == NtfsAttributeData)
+                    {
+                        dataTypeByteHits++;
+                    }
+                }
+
+                var nonZeroSlackBytes = rawSlack.Count(value => value != 0);
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical reader CORE SLACK RAW: " +
+                    $"fileRef={fileReferenceNumber}, " +
+                    $"slackStart={slackStart}, " +
+                    $"slackLength={rawSlack.Length}, " +
+                    $"0x80TypeHits={dataTypeByteHits}, " +
+                    $"nonZeroBytes={nonZeroSlackBytes}, " +
+                    $"hex={Convert.ToHexString(rawSlack)}.");
+
                 System.Diagnostics.Trace.WriteLine(
                     $"NTFS historical reader CORE SLACK SEARCH END: " +
                     $"fileRef={fileReferenceNumber}, " +
@@ -3562,7 +3583,7 @@ public sealed class NtfsMftDataReader
             if (fileReferenceNumber != 0)
             {
                 System.Diagnostics.Trace.WriteLine(
-                    $"NTFS historical targeted slack $DATA diagnostic: " +
+                    $"NTFS historical reader SLACK COUNTERS: " +
                     $"fileRef={fileReferenceNumber}, " +
                     $"slackStart={slackStart}, " +
                     $"expectedSize={historicalFileSize:N0}, " +
