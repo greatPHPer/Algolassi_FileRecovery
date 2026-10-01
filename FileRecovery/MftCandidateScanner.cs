@@ -297,6 +297,87 @@ public sealed class MftCandidateScanner
                     fileSignatureCount++;
                 }
 
+                // A historical target can point at an MFT segment whose current
+                // record has already been reused and is now marked IN_USE. In that
+                // case the normal deleted-record parser intentionally rejects it,
+                // but the old nonresident $DATA mapping pairs may still survive in
+                // the record slack. Inspect target segments directly before applying
+                // the deleted-record flag gate.
+                if (historicalTargetsBySegment.TryGetValue(
+                        segmentNumber,
+                        out var directHistoricalTargets))
+                {
+                    var directHistoricalRecord = recordSpan.ToArray();
+
+                    foreach (var historicalTarget in directHistoricalTargets)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        var historicalName = Path.GetFileName(
+                            historicalTarget.FullPath);
+
+                        if (string.IsNullOrWhiteSpace(historicalName))
+                        {
+                            continue;
+                        }
+
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS historical target direct slack probe: " +
+                            $"segment={segmentNumber}, " +
+                            $"historicalFileRef={historicalTarget.FileReferenceNumber}, " +
+                            $"currentFlags=0x{BinaryPrimitives.ReadUInt16LittleEndian(recordSpan.Slice(22, 2)):X4}, " +
+                            $"name={historicalName}, " +
+                            $"parentRef={historicalTarget.ParentFileReferenceNumber}.");
+
+                        var historicalData =
+                            dataReader.ReadDefaultDataStreamFromScannedMftRecord(
+                                volumeInfo,
+                                volumeHandle,
+                                historicalTarget.FileReferenceNumber,
+                                directHistoricalRecord,
+                                historicalName,
+                                historicalTarget.ParentFileReferenceNumber,
+                                historicalSlackOnly: true);
+
+                        if (!historicalData.Found)
+                        {
+                            continue;
+                        }
+
+                        if (!seenReferences.Add(historicalTarget.FileReferenceNumber))
+                        {
+                            continue;
+                        }
+
+                        var historicalDirectory =
+                            Path.GetDirectoryName(historicalTarget.FullPath) ??
+                            string.Empty;
+
+                        results.Add(BuildCandidate(
+                            historicalTarget.FileReferenceNumber,
+                            historicalTarget.ParentFileReferenceNumber,
+                            historicalName,
+                            historicalDirectory,
+                            historicalTarget.DeletedAtUtc,
+                            historicalData,
+                            [],
+                            "Historical USN/MFT segment matched; recovered from a structurally validated nonresident $DATA attribute retained in the reused MFT record's slack."));
+
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS historical target direct slack RECOVERY MATCH: " +
+                            $"segment={segmentNumber}, " +
+                            $"fileRef={historicalTarget.FileReferenceNumber}, " +
+                            $"name={historicalName}, " +
+                            $"size={historicalData.FileSizeBytes:N0}, " +
+                            $"extents={historicalData.Extents.Count:N0}.");
+
+                        if (results.Count >= normalizedTargets.Count)
+                        {
+                            return results;
+                        }
+                    }
+                }
+
                 if (!TryParseDeletedFileNameEntries(
                         recordSpan,
                         volumeInfo.BytesPerSector,
