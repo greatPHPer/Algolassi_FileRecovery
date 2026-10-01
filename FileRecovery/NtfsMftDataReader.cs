@@ -4123,7 +4123,7 @@ public sealed class NtfsMftDataReader
                     System.Diagnostics.Debug.WriteLine(
                         $"NTFS $DATA lookup: FILE_NAME path validation failed for parentRef={parentReference}: {ex.Message}");
                 }
-            }            }
+            }
         }
 
         return false;
