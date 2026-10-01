@@ -2898,11 +2898,26 @@ public sealed class NtfsMftDataReader
         // The scanner already applied the update-sequence fixups while parsing
         // this exact MFT record. Keep that record as the source of truth instead
         // of attempting another lookup using an older USN file-reference sequence.
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS historical preflight reader ENTER: " +
+            $"fileRef={fileReferenceNumber}, " +
+            $"expectedSize={expectedFileSizeBytes:N0}, " +
+            $"historicalSlackOnly={historicalSlackOnly}, " +
+            $"recordLength={record.Length}.");
+
         using var rawMftVolumeHandle = CreateVolumeHandle(
             volumeInfo.RootPath,
             overlapped: true);
 
-        return ReadDefaultDataStreamFromMftRecord(
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS historical preflight reader HANDLE READY: " +
+            $"fileRef={fileReferenceNumber}.");
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS historical preflight reader INNER START: " +
+            $"fileRef={fileReferenceNumber}.");
+
+        var result = ReadDefaultDataStreamFromMftRecord(
             volumeInfo,
             volumeHandle,
             rawMftVolumeHandle,
@@ -2912,6 +2927,16 @@ public sealed class NtfsMftDataReader
             expectedParentFileReferenceNumber,
             expectedFileSizeBytes,
             historicalSlackOnly);
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS historical preflight reader INNER END: " +
+            $"fileRef={fileReferenceNumber}, " +
+            $"found={result.Found}, " +
+            $"size={result.FileSizeBytes:N0}, " +
+            $"extents={result.Extents.Count:N0}, " +
+            $"evidence={result.Evidence}.");
+
+        return result;
     }
 
     private NtfsDataStreamInfo ReadDefaultDataStreamFromMftRecord(
@@ -2925,14 +2950,22 @@ public sealed class NtfsMftDataReader
         long expectedFileSizeBytes = 0,
         bool historicalSlackOnly = false)
     {
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS historical reader CORE ENTER: " +
+            $"fileRef={fileReferenceNumber}, " +
+            $"expectedSize={expectedFileSizeBytes:N0}, " +
+            $"historicalSlackOnly={historicalSlackOnly}, " +
+            $"expectedName={expectedFileName ?? "(none)"}, " +
+            $"expectedParent={expectedParentFileReferenceNumber?.ToString() ?? "(none)"}.");
+
         var flags = BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2));
         var dataAttributes = FindUnnamedDataAttributes(record, volumeInfo);
 
         System.Diagnostics.Trace.WriteLine(
-            $"NTFS $DATA extraction: MFT record flags=0x{flags:X4}, " +
-            $"unnamedDataAttributes={dataAttributes.Count}, " +
-            $"expectedName={expectedFileName ?? "(none)"}, " +
-            $"expectedParent={expectedParentFileReferenceNumber?.ToString() ?? "(none)"}.");
+            $"NTFS historical reader CORE ATTRIBUTES DONE: " +
+            $"fileRef={fileReferenceNumber}, " +
+            $"flags=0x{flags:X4}, " +
+            $"unnamedDataAttributes={dataAttributes.Count}.");
 
         foreach (var dataAttribute in dataAttributes)
         {
@@ -2947,6 +2980,12 @@ public sealed class NtfsMftDataReader
             volumeInfo.TotalClusters * (long)volumeInfo.BytesPerCluster,
             expectedFileName,
             expectedParentFileReferenceNumber);
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS historical reader CORE FILENAME SIZE DONE: " +
+            $"fileRef={fileReferenceNumber}, " +
+            $"recordSize={historicalFileSize:N0}, " +
+            $"expectedSize={expectedFileSizeBytes:N0}.");
 
         // The reused MFT segment may no longer retain the old $FILE_NAME
         // value, but the deletion-history record already captured the exact
@@ -2978,6 +3017,12 @@ public sealed class NtfsMftDataReader
                 !string.IsNullOrWhiteSpace(expectedFileName) &&
                 expectedParentFileReferenceNumber.HasValue)
             {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical reader CORE SLACK SEARCH START: " +
+                    $"fileRef={fileReferenceNumber}, " +
+                    $"slackStart={slackStart}, " +
+                    $"expectedSize={historicalFileSize:N0}.");
+
                 var historicalSlackData = FindHistoricalNonResidentDataAttributes(
                     record,
                     volumeInfo,
@@ -2985,6 +3030,11 @@ public sealed class NtfsMftDataReader
                     historicalFileNameOffset: -1,
                     historicalFileSize,
                     fileReferenceNumber);
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical reader CORE SLACK SEARCH END: " +
+                    $"fileRef={fileReferenceNumber}, " +
+                    $"matches={historicalSlackData.Count:N0}.");
 
                 System.Diagnostics.Trace.WriteLine(
                     $"NTFS historical-only MFT slack $DATA search: " +
