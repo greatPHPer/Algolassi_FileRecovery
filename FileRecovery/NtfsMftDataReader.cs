@@ -3367,8 +3367,7 @@ public sealed class NtfsMftDataReader
                 mappingPairsOffset >= attributeLength ||
                 fileSize <= 0 ||
                 validDataLength < 0 ||
-                validDataLength > fileSize ||
-                allocatedSize < fileSize)
+                validDataLength > fileSize)
             {
                 continue;
             }
