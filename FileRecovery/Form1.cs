@@ -2237,6 +2237,17 @@ public partial class Form1 : Form
             return false;
         }
 
+        if (candidate.FileSizeBytes > 0 &&
+            snapshot.FileSizeBytes != candidate.FileSizeBytes)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS deletion snapshot recovery rejected for historical-size mismatch: " +
+                $"path={candidate.FullPath}, " +
+                $"candidateSize={candidate.FileSizeBytes:N0}, " +
+                $"snapshotSize={snapshot.FileSizeBytes:N0}.");
+            return false;
+        }
+
         if (!string.IsNullOrWhiteSpace(snapshot.Sha256))
         {
             var actualHash = Convert.ToHexString(
