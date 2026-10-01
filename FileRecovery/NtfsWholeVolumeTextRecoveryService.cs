@@ -211,6 +211,21 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     continue;
                 }
 
+                var absoluteCandidateOffset = checked(
+                    physicalOffset -
+                    previousTail.Length +
+                    candidateOffset);
+
+                if (IsUtf16Encoding(markerVariant.Encoding) &&
+                    (absoluteCandidateOffset & 1L) != 0)
+                {
+                    // Reject byte-shifted UTF-16 false positives. A UTF-16 text
+                    // stream recovered from NTFS file data starts on an even byte
+                    // boundary, so the opposite-endian interpretation beginning
+                    // at the adjacent byte is not a valid target hit.
+                    continue;
+                }
+
                 if (markerOffsetInWindow < 0 || candidateOffset < markerOffsetInWindow)
                 {
                     markerOffsetInWindow = candidateOffset;
@@ -233,16 +248,6 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     physicalOffset -
                     previousTail.Length +
                     markerOffsetInWindow);
-
-                if (IsUtf16Encoding(matchedMarker.Value.Encoding) &&
-                    (absoluteMarkerOffset & 1L) != 0)
-                {
-                    // Reject byte-shifted UTF-16 false positives. A UTF-16 text
-                    // stream recovered from NTFS file data starts on an even byte
-                    // boundary, so the opposite-endian interpretation beginning
-                    // at the adjacent byte is not a valid target hit.
-                    continue;
-                }
 
                 var recovery = RecoverTextRegionFromScannedBuffer(
                     candidate,
