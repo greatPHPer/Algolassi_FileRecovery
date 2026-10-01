@@ -1059,22 +1059,40 @@ public partial class Form1 : Form
                 })
                 .ToList();
 
-            var rawMftReferences = exhaustiveMftCandidates
-                .Where(candidate => candidate.FileReferenceNumber != 0)
-                .Select(candidate => (
-                    FullPath: NormalizePath(candidate.FullPath),
-                    FileReferenceNumber: candidate.FileReferenceNumber,
-                    ParentFileReferenceNumber: candidate.ParentFileReferenceNumber,
-                    FileSizeBytes: candidate.FileSizeBytes,
-                    DeletedAtUtc: candidate.LastUsnTimestampUtc))
-                .Concat(historicalRawMftTargets)
+            var rawMftReferences = historicalRawMftTargets
+                .Concat(
+                    exhaustiveMftCandidates
+                        .Where(candidate => candidate.FileReferenceNumber != 0)
+                        .Select(candidate => (
+                            FullPath: NormalizePath(candidate.FullPath),
+                            FileReferenceNumber: candidate.FileReferenceNumber,
+                            ParentFileReferenceNumber: candidate.ParentFileReferenceNumber,
+                            FileSizeBytes: candidate.FileSizeBytes,
+                            DeletedAtUtc: candidate.LastUsnTimestampUtc)))
                 .GroupBy(
                     target => target.FullPath,
                     StringComparer.OrdinalIgnoreCase)
-                .Select(group => group
-                    .OrderByDescending(target => target.DeletedAtUtc)
-                    .ThenByDescending(target => target.FileSizeBytes)
-                    .First())
+                .Select(group =>
+                {
+                    var historicalTarget = group
+                        .Where(target =>
+                            historicalRawMftTargets.Any(historical =>
+                                string.Equals(
+                                    NormalizePath(historical.FullPath),
+                                    target.FullPath,
+                                    StringComparison.OrdinalIgnoreCase) &&
+                                historical.FileReferenceNumber == target.FileReferenceNumber))
+                        .OrderByDescending(target => target.FileSizeBytes)
+                        .ThenByDescending(target => target.DeletedAtUtc)
+                        .FirstOrDefault();
+
+                    return historicalTarget.FileReferenceNumber != 0
+                        ? historicalTarget
+                        : group
+                            .OrderByDescending(target => target.FileSizeBytes)
+                            .ThenByDescending(target => target.DeletedAtUtc)
+                            .First();
+                })
                 .ToList();
 
             System.Diagnostics.Trace.WriteLine(
@@ -1120,7 +1138,7 @@ public partial class Form1 : Form
 
                 if (fallbackCandidates.Count > 0)
                 {
-                    var historicalSizeByPath = rawMftReferences
+                    var fallbackHistoricalSizeByPath = rawMftReferences
                         .Where(target => target.FileSizeBytes > 0)
                         .GroupBy(
                             target => NormalizePath(target.FullPath),
@@ -1139,7 +1157,7 @@ public partial class Form1 : Form
                         {
                             var path = NormalizePath(candidate.FullPath);
 
-                            if (!historicalSizeByPath.TryGetValue(path, out var expectedSize) ||
+                            if (!fallbackHistoricalSizeByPath.TryGetValue(path, out var expectedSize) ||
                                 expectedSize <= 0 ||
                                 candidate.FileSizeBytes <= 0)
                             {
