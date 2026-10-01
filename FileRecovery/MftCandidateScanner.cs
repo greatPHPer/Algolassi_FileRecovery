@@ -165,6 +165,97 @@ public sealed class MftCandidateScanner
 
         var results = new List<RecoveryCandidate>();
         var seenReferences = new HashSet<ulong>();
+
+        // Probe the exact historical MFT segments directly before starting the
+        // sequential raw-$MFT walk. Historical USN references already identify
+        // the exact segment, so this gives reused records a deterministic chance
+        // to expose retained slack without requiring a large forensic scan.
+        foreach (var historicalTarget in historicalTargetsBySegment
+                     .Values
+                     .SelectMany(targets => targets)
+                     .OrderBy(target => target.FileReferenceNumber))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var historicalName = Path.GetFileName(historicalTarget.FullPath);
+            if (string.IsNullOrWhiteSpace(historicalName) ||
+                historicalTarget.ParentFileReferenceNumber == 0 ||
+                historicalTarget.FileSizeBytes <= 0)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical MFT preflight skipped: " +
+                    $"path={historicalTarget.FullPath}, " +
+                    $"fileRef={historicalTarget.FileReferenceNumber}, " +
+                    $"parentRef={historicalTarget.ParentFileReferenceNumber}, " +
+                    $"size={historicalTarget.FileSizeBytes:N0}.");
+                continue;
+            }
+
+            var directHistoricalRecord =
+                dataReader.ReadHistoricalMftRecordForReference(
+                    volumeHandle,
+                    volumeInfo,
+                    historicalTarget.FileReferenceNumber);
+
+            if (directHistoricalRecord is null)
+            {
+                continue;
+            }
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical target preflight slack probe: " +
+                $"path={historicalTarget.FullPath}, " +
+                $"fileRef={historicalTarget.FileReferenceNumber}, " +
+                $"parentRef={historicalTarget.ParentFileReferenceNumber}, " +
+                $"size={historicalTarget.FileSizeBytes:N0}.");
+
+            var historicalData =
+                dataReader.ReadDefaultDataStreamFromScannedMftRecord(
+                    volumeInfo,
+                    volumeHandle,
+                    historicalTarget.FileReferenceNumber,
+                    directHistoricalRecord,
+                    historicalName,
+                    historicalTarget.ParentFileReferenceNumber,
+                    expectedFileSizeBytes: historicalTarget.FileSizeBytes,
+                    historicalSlackOnly: true);
+
+            if (!historicalData.Found)
+            {
+                continue;
+            }
+
+            if (!seenReferences.Add(historicalTarget.FileReferenceNumber))
+            {
+                continue;
+            }
+
+            var historicalDirectory =
+                Path.GetDirectoryName(historicalTarget.FullPath) ??
+                string.Empty;
+
+            results.Add(BuildCandidate(
+                historicalTarget.FileReferenceNumber,
+                historicalTarget.ParentFileReferenceNumber,
+                historicalName,
+                historicalDirectory,
+                historicalTarget.DeletedAtUtc,
+                historicalData,
+                [],
+                "Historical USN/MFT segment matched during exact-segment preflight; recovered from a structurally validated nonresident $DATA attribute retained in the reused MFT record's slack."));
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical target preflight RECOVERY MATCH: " +
+                $"path={historicalTarget.FullPath}, " +
+                $"fileRef={historicalTarget.FileReferenceNumber}, " +
+                $"size={historicalData.FileSizeBytes:N0}, " +
+                $"extents={historicalData.Extents.Count:N0}.");
+
+            if (results.Count >= normalizedTargets.Count)
+            {
+                return results;
+            }
+        }
         var recordSize = checked((int)volumeInfo.BytesPerFileRecordSegment);
         var fileSignatureCount = 0L;
         var deletedRecordCount = 0L;
