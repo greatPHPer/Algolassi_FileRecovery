@@ -470,17 +470,11 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 "The matched marker could not be validated in the scanned NTFS buffer.");
         }
 
-        var start = markerOffsetInWindow;
-        while (start > 0 && IsPlainTextByte(scanWindow[start - 1]))
-        {
-            start--;
-        }
-
-        var end = markerOffsetInWindow + markerBytes.Length;
-        while (end < scanWindow.Length && IsPlainTextByte(scanWindow[end]))
-        {
-            end++;
-        }
+        var (start, end) = FindTextRegionBounds(
+            scanWindow,
+            markerOffsetInWindow,
+            markerBytes.Length,
+            markerEncoding);
 
         var recoveredLength = end - start;
         if (recoveredLength < markerBytes.Length)
@@ -718,3 +712,106 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         out uint lpNumberOfBytesRead,
         IntPtr lpOverlapped);
 }
+
+    private static (int Start, int End) FindTextRegionBounds(
+        byte[] buffer,
+        int markerOffset,
+        int markerLength,
+        string encoding)
+    {
+        if (string.Equals(
+                encoding,
+                "UTF-16LE",
+                StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(
+                encoding,
+                "UTF-16BE",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var littleEndian = string.Equals(
+                encoding,
+                "UTF-16LE",
+                StringComparison.OrdinalIgnoreCase);
+
+            var start = markerOffset;
+
+            // Walk backwards in UTF-16 code units rather than individual bytes.
+            while (start >= 2 &&
+                   IsUtf16TextCodeUnit(
+                       buffer,
+                       start - 2,
+                       littleEndian))
+            {
+                start -= 2;
+            }
+
+            // Include a UTF-16 BOM when it is immediately before the text.
+            if (start >= 2)
+            {
+                var bom1 = buffer[start - 2];
+                var bom2 = buffer[start - 1];
+
+                var hasBom = littleEndian
+                    ? bom1 == 0xFF && bom2 == 0xFE
+                    : bom1 == 0xFE && bom2 == 0xFF;
+
+                if (hasBom)
+                {
+                    start -= 2;
+                }
+            }
+
+            var end = checked(markerOffset + markerLength);
+
+            // Walk forwards in UTF-16 code units.
+            while (end + 2 <= buffer.Length &&
+                   IsUtf16TextCodeUnit(
+                       buffer,
+                       end,
+                       littleEndian))
+            {
+                end += 2;
+            }
+
+            return (start, end);
+        }
+
+        var plainStart = markerOffset;
+
+        while (plainStart > 0 &&
+               IsPlainTextByte(buffer[plainStart - 1]))
+        {
+            plainStart--;
+        }
+
+        var plainEnd = checked(markerOffset + markerLength);
+
+        while (plainEnd < buffer.Length &&
+               IsPlainTextByte(buffer[plainEnd]))
+        {
+            plainEnd++;
+        }
+
+        return (plainStart, plainEnd);
+    }
+
+    private static bool IsUtf16TextCodeUnit(
+        byte[] buffer,
+        int offset,
+        bool littleEndian)
+    {
+        if (offset < 0 || offset + 1 >= buffer.Length)
+        {
+            return false;
+        }
+
+        ushort value = littleEndian
+            ? (ushort)(buffer[offset] |
+                       (buffer[offset + 1] << 8))
+            : (ushort)((buffer[offset] << 8) |
+                       buffer[offset + 1]);
+
+        return value is 0x0009 or 0x000A or 0x000D ||
+               value is >= 0x0020 and <= 0x007E;
+    }
+
