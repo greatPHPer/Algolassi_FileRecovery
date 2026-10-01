@@ -859,15 +859,65 @@ public partial class Form1 : Form
                 .ToList();
 
             // Give every missing-data candidate, including plain-text files, one
-            // targeted raw-MFT pass before falling back to marker-based carving. For
-            // deleted text files, the historical nonresident $DATA mapping pairs may
-            // still survive in the deleted/reused MFT record's slack even though the
-            // normal attribute enumeration no longer exposes them.
+            // targeted raw-MFT pass before falling back to marker-based carving.
+            // Also include deletion references from the USN/history records even
+            // when ScanForFileReferences() failed to produce a current candidate.
+            // This is important when the MFT sequence has already gone stale/reused:
+            // the historical segment may still contain useful $DATA slack even
+            // though it was not returned as a normal deleted candidate.
             var exhaustiveMftCandidates = missingDataCandidates.ToList();
 
-            var missingDataPaths = exhaustiveMftCandidates
-                .Select(candidate => candidate.FullPath)
+            var rawMftTargetPaths = exhaustiveMftCandidates
+                .Select(candidate => NormalizePath(candidate.FullPath))
                 .Where(path => !string.IsNullOrWhiteSpace(path))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var historicalRawMftTargets = targetRecords
+                .Where(target =>
+                    !string.IsNullOrWhiteSpace(target.FullPath) &&
+                    target.FileReferenceNumber != 0 &&
+                    target.ParentFileReferenceNumber != 0 &&
+                    !candidates.Any(candidate =>
+                        string.Equals(
+                            NormalizePath(candidate.FullPath),
+                            NormalizePath(target.FullPath),
+                            StringComparison.OrdinalIgnoreCase) &&
+                        candidate.DataStreamFound))
+                .Select(target => (
+                    FullPath: NormalizePath(target.FullPath),
+                    FileReferenceNumber: target.FileReferenceNumber,
+                    ParentFileReferenceNumber: target.ParentFileReferenceNumber,
+                    DeletedAtUtc: target.DeletedAtUtc))
+                .GroupBy(
+                    target => target.FullPath,
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group => group
+                    .OrderByDescending(target => target.DeletedAtUtc)
+                    .First())
+                .ToList();
+
+            foreach (var historicalTarget in historicalRawMftTargets)
+            {
+                rawMftTargetPaths.Add(historicalTarget.FullPath);
+            }
+
+            var rawMftReferences = exhaustiveMftCandidates
+                .Where(candidate => candidate.FileReferenceNumber != 0)
+                .Select(candidate => (
+                    FullPath: NormalizePath(candidate.FullPath),
+                    FileReferenceNumber: candidate.FileReferenceNumber,
+                    ParentFileReferenceNumber: candidate.ParentFileReferenceNumber,
+                    DeletedAtUtc: candidate.LastUsnTimestampUtc))
+                .Concat(historicalRawMftTargets)
+                .GroupBy(
+                    target => target.FullPath,
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group => group
+                    .OrderByDescending(target => target.DeletedAtUtc)
+                    .First())
+                .ToList();
+
+            var missingDataPaths = rawMftTargetPaths
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
@@ -877,7 +927,7 @@ public partial class Form1 : Form
                     missingDataCandidates.Count - exhaustiveMftCandidates.Count;
 
                 System.Diagnostics.Trace.WriteLine(
-                    $"NTFS exhaustive MFT fallback: {deferredTextCount:N0} plain-text " +
+                    $"NTFS raw MFT fallback: {deferredTextCount:N0} plain-text " +
                     "candidate(s) remain for marker-driven forensic recovery after the raw-MFT pass.");
             }
 
@@ -892,14 +942,7 @@ public partial class Form1 : Form
                         missingDataPaths,
                         CancellationToken.None,
                         maxBytesToScan: long.MaxValue,
-                        targetReferences: exhaustiveMftCandidates
-                            .Where(candidate => candidate.FileReferenceNumber != 0)
-                            .Select(candidate => (
-                                FullPath: candidate.FullPath,
-                                FileReferenceNumber: candidate.FileReferenceNumber,
-                                ParentFileReferenceNumber: candidate.ParentFileReferenceNumber,
-                                DeletedAtUtc: candidate.LastUsnTimestampUtc))
-                            .ToList());
+                        targetReferences: rawMftReferences);
 
                 if (fallbackCandidates.Count > 0)
                 {
