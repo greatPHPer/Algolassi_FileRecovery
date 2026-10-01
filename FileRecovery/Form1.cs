@@ -2212,102 +2212,11 @@ public partial class Form1 : Form
                     }
                 }
 
-                // When the candidate already has a trusted historical file reference,
-                // parent reference, and exact historical byte size, try reconstructing
-                // the file directly from retained NTFS $LogFile history. This must happen
-                // at recovery time as well as during the recent-deletion snapshot pass;
-                // otherwise an older deletion can have a known size but never invoke the
-                // exact LogFile data reader.
-                if (Path.GetExtension(candidate.Name).Equals(
-                        ".txt",
-                        StringComparison.OrdinalIgnoreCase) &&
-                    candidate.FileReferenceNumber != 0 &&
-                    candidate.ParentFileReferenceNumber != 0 &&
-                    candidate.FileSizeBytes > 0)
-                {
-                    var sourceRoot = GetSourceVolumeRoot(candidate.FullPath);
-
-                    if (!string.IsNullOrWhiteSpace(sourceRoot) &&
-                        candidate.FileSizeBytes <= 16L * 1024L * 1024L)
-                    {
-                        try
-                        {
-                            var historicalDataReader =
-                                new NtfsLogFileHistoricalDataService();
-
-                            if (historicalDataReader.TryRecoverFileData(
-                                    sourceRoot,
-                                    candidate.FileReferenceNumber,
-                                    candidate.Name,
-                                    candidate.FileSizeBytes,
-                                    16L * 1024L * 1024L,
-                                    out var historicalData,
-                                    out var historicalDataEvidence))
-                            {
-                                var destinationPath =
-                                    RecoveryDestinationPolicy.CreateSafeFilePath(
-                                        destinationDirectory,
-                                        candidate.Name);
-
-                                try
-                                {
-                                    File.WriteAllBytes(
-                                        destinationPath,
-                                        historicalData);
-                                }
-                                catch
-                                {
-                                    try
-                                    {
-                                        if (File.Exists(destinationPath))
-                                        {
-                                            File.Delete(destinationPath);
-                                        }
-                                    }
-                                    catch
-                                    {
-                                        // Preserve the original write failure.
-                                    }
-
-                                    throw;
-                                }
-
-                                successes.Add(new RecoveryResult
-                                {
-                                    Success = true,
-                                    SourcePath = candidate.FullPath,
-                                    DestinationPath = destinationPath,
-                                    BytesRecovered = historicalData.LongLength,
-                                    Evidence =
-                                        $"Recovered {historicalData.LongLength:N0} byte(s) from exact " +
-                                        $"NTFS $LogFile historical data. {historicalDataEvidence}"
-                                });
-
-                                System.Diagnostics.Debug.WriteLine(
-                                    $"NTFS recovery-time $LogFile historical data recovery succeeded: " +
-                                    $"path={candidate.FullPath}, " +
-                                    $"fileRef={candidate.FileReferenceNumber}, " +
-                                    $"size={historicalData.LongLength:N0}.");
-
-                                continue;
-                            }
-
-                            System.Diagnostics.Debug.WriteLine(
-                                $"NTFS recovery-time $LogFile historical data unavailable: " +
-                                $"path={candidate.FullPath}, " +
-                                $"fileRef={candidate.FileReferenceNumber}, " +
-                                $"size={candidate.FileSizeBytes:N0}, " +
-                                $"reason={historicalDataEvidence}");
-                        }
-                        catch (Exception ex)
-                        {
-                            System.Diagnostics.Debug.WriteLine(
-                                $"NTFS recovery-time $LogFile historical data failed: " +
-                                $"{candidate.FullPath}: {ex.GetType().Name}: {ex.Message}");
-                        }
-                    }
-                }
-
+                                // Plain-text files do not have a filesystem signature, and a historical
+                // $LogFile data reconstruction can produce a full-length buffer without
+                // proving that the bytes belong to this deleted text file. Keep text
+                // recovery marker-driven when the retained $DATA/snapshot sources above
+                // are unavailable.
                 if (TryRecoverFromNtfsSnapshot(
                         candidate,
                         destinationDirectory,
