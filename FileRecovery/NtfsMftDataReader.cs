@@ -3306,10 +3306,12 @@ public sealed class NtfsMftDataReader
         var coverageMatches = 0;
         var sizeMatchDetails = new List<string>();
 
-        for (var attributeOffset = slackStart;
-             attributeOffset + nonResidentMinimumLength <= record.Length;
-             attributeOffset++)
+        try
         {
+            for (var attributeOffset = slackStart;
+                 attributeOffset + nonResidentMinimumLength <= record.Length;
+                 attributeOffset++)
+            {
             if (historicalFileNameOffset >= 0 &&
                 Math.Abs(attributeOffset - historicalFileNameOffset) > maxRelatedSlackDistance)
             {
@@ -3493,21 +3495,38 @@ public sealed class NtfsMftDataReader
             break;
         }
 
-        if (fileReferenceNumber != 0)
+            }
+        }
+        catch (Exception ex)
         {
-            System.Diagnostics.Trace.WriteLine(
-                $"NTFS historical targeted slack $DATA diagnostic: " +
-                $"fileRef={fileReferenceNumber}, " +
-                $"slackStart={slackStart}, " +
-                $"expectedSize={historicalFileSize:N0}, " +
-                $"dataTypeHits={dataTypeHits}, " +
-                $"unnamedNonResidentHits={unnamedNonResidentHits}, " +
-                $"geometryMatches={geometryMatches}, " +
-                $"sizeMatches={sizeMatches}, " +
-                $"mappingParseSuccesses={mappingParseSuccesses}, " +
-                $"coverageMatches={coverageMatches}, " +
-                $"accepted={result.Count}, " +
-                $"sizeMatchDetails={(sizeMatchDetails.Count == 0 ? "(none)" : string.Join(" | ", sizeMatchDetails))}.");
+            if (fileReferenceNumber != 0)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical targeted slack $DATA exception: " +
+                    $"fileRef={fileReferenceNumber}, " +
+                    $"exception={ex.GetType().Name}: {ex.Message}.");
+            }
+
+            throw;
+        }
+        finally
+        {
+            if (fileReferenceNumber != 0)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical targeted slack $DATA diagnostic: " +
+                    $"fileRef={fileReferenceNumber}, " +
+                    $"slackStart={slackStart}, " +
+                    $"expectedSize={historicalFileSize:N0}, " +
+                    $"dataTypeHits={dataTypeHits}, " +
+                    $"unnamedNonResidentHits={unnamedNonResidentHits}, " +
+                    $"geometryMatches={geometryMatches}, " +
+                    $"sizeMatches={sizeMatches}, " +
+                    $"mappingParseSuccesses={mappingParseSuccesses}, " +
+                    $"coverageMatches={coverageMatches}, " +
+                    $"accepted={result.Count}, " +
+                    $"sizeMatchDetails={(sizeMatchDetails.Count == 0 ? "(none)" : string.Join(" | ", sizeMatchDetails))}.");
+            }
         }
 
         return result;
