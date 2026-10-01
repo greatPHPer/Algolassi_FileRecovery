@@ -4151,6 +4151,46 @@ public sealed class NtfsMftDataReader
         return dataAttribute.Extents;
     }
 
+    internal byte[]? ReadHistoricalMftRecordForReference(
+        SafeFileHandle volumeHandle,
+        NtfsVolumeInfo volumeInfo,
+        ulong fileReferenceNumber)
+    {
+        if (fileReferenceNumber == 0)
+        {
+            return null;
+        }
+
+        var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS historical MFT preflight: fileRef={fileReferenceNumber}, " +
+            $"segment={segmentNumber}.");
+
+        var record = ReadMftRecordByExtentMap(
+            volumeHandle,
+            volumeInfo,
+            segmentNumber,
+            expectedSequenceNumber: 0,
+            expectedBaseFileReference: 0);
+
+        if (record is null)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical MFT preflight: segment read failed. " +
+                $"fileRef={fileReferenceNumber}, segment={segmentNumber}.");
+            return null;
+        }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS historical MFT preflight: segment read succeeded. " +
+            $"fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
+            $"currentSequence={BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(16, 2))}, " +
+            $"currentFlags=0x{BinaryPrimitives.ReadUInt16LittleEndian(record.AsSpan(22, 2)):X4}.");
+
+        return record;
+    }
+
     internal int ReadMftLogicalBytes(
         SafeFileHandle volumeHandle,
         NtfsVolumeInfo volumeInfo,
