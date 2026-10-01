@@ -2955,40 +2955,48 @@ public sealed class NtfsMftDataReader
         {
             var slackStart = FindAttributeSlackStart(record);
 
-            if (slackStart >= 0)
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical MFT slack search: " +
+                $"fileRef={fileReferenceNumber}, " +
+                $"fileName={expectedFileName}, " +
+                $"parentRef={expectedParentFileReferenceNumber.Value}, " +
+                $"fileNameSize={historicalFileSize:N0}, " +
+                $"slackStart={slackStart}.");
+
+            if (slackStart >= 0 &&
+                historicalFileSize > 0)
             {
-                var expectedNameBytes = Encoding.Unicode.GetBytes(expectedFileName);
-
-                var historicalFileNameOffset = FindHistoricalFileNameValue(
+                // The retained $FILE_NAME above has already been validated
+                // against the exact filename + parent supplied by the candidate.
+                // Do not require a second $FILE_NAME structure to survive in slack:
+                // the old nonresident $DATA attribute can remain independently in
+                // the unused tail of the reused MFT record.
+                var historicalSlackData = FindHistoricalNonResidentDataAttributes(
                     record,
+                    volumeInfo,
                     slackStart,
-                    expectedNameBytes,
-                    expectedParentFileReferenceNumber.Value,
-                    out var historicalSlackFileSize);
+                    historicalFileNameOffset: -1,
+                    historicalFileSize);
 
-                if (historicalFileNameOffset >= 0 &&
-                    historicalSlackFileSize > 0)
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical MFT slack $DATA search: " +
+                    $"fileRef={fileReferenceNumber}, " +
+                    $"fileName={expectedFileName}, " +
+                    $"expectedSize={historicalFileSize:N0}, " +
+                    $"matches={historicalSlackData.Count:N0}.");
+
+                if (historicalSlackData.Count > 0)
                 {
-                    var historicalSlackData = FindHistoricalNonResidentDataAttributes(
-                        record,
-                        volumeInfo,
-                        slackStart,
-                        historicalFileNameOffset,
-                        historicalSlackFileSize);
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS historical MFT slack $DATA evidence: " +
+                        $"fileRef={fileReferenceNumber}, " +
+                        $"fileName={expectedFileName}, " +
+                        $"fileSize={historicalFileSize:N0}, " +
+                        $"extents={historicalSlackData.Sum(x => x.Extents.Count):N0}.");
 
-                    if (historicalSlackData.Count > 0)
-                    {
-                        System.Diagnostics.Trace.WriteLine(
-                            $"NTFS historical MFT slack $DATA evidence: " +
-                            $"fileRef={fileReferenceNumber}, " +
-                            $"fileName={expectedFileName}, " +
-                            $"fileSize={historicalSlackFileSize:N0}, " +
-                            $"extents={historicalSlackData.Sum(x => x.Extents.Count):N0}.");
-
-                        return BuildDataStream(
-                            historicalSlackData,
-                            1);
-                    }
+                    return BuildDataStream(
+                        historicalSlackData,
+                        1);
                 }
             }
         }
