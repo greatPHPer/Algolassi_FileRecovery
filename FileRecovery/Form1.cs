@@ -2252,6 +2252,7 @@ public partial class Form1 : Form
                         candidate.ParentFileReferenceNumber,
                         candidate.Name,
                         candidate.FullPath,
+                        candidate.LastUsnTimestampUtc,
                         out directDataStream);
 
                     if (directDataFound &&
