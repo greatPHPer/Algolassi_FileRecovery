@@ -3027,7 +3027,6 @@ public sealed class NtfsMftDataReader
                 $"slackStart={slackStart}.");
 
             if (slackStart >= 0 &&
-                historicalFileSize > 0 &&
                 !string.IsNullOrWhiteSpace(expectedFileName) &&
                 expectedParentFileReferenceNumber.HasValue)
             {
@@ -3095,7 +3094,9 @@ public sealed class NtfsMftDataReader
 
             return BuildFileNameSizeOnlyResult(
                 historicalFileSize,
-                "The historical MFT segment was inspected for the deleted file's nonresident $DATA in MFT slack, but no structurally valid size-matched mapping-pair attribute was found.");
+                historicalFileSize > 0
+                    ? "The historical MFT segment was inspected for the deleted file's nonresident $DATA in MFT slack, but no structurally valid size-matched mapping-pair attribute was found."
+                    : "The historical MFT segment was inspected for a structurally valid unnamed nonresident $DATA mapping-pair attribute in MFT slack, but none was found.");
         }
 
         // When the current attribute list no longer exposes the deleted file's
@@ -3382,7 +3383,7 @@ public sealed class NtfsMftDataReader
 
         if (slackStart < 0 ||
             slackStart >= record.Length ||
-            historicalFileSize <= 0)
+            historicalFileSize < 0)
         {
             return result;
         }
@@ -3396,6 +3397,8 @@ public sealed class NtfsMftDataReader
         var sizeMatches = 0;
         var mappingParseSuccesses = 0;
         var coverageMatches = 0;
+        var historicalSizeKnown = historicalFileSize > 0;
+
         var sizeMatchDetails = new List<string>();
 
         try
@@ -3468,7 +3471,7 @@ public sealed class NtfsMftDataReader
 
             geometryMatches++;
 
-            if (fileSize != historicalFileSize)
+            if (historicalSizeKnown && fileSize != historicalFileSize)
             {
                 continue;
             }
@@ -3581,10 +3584,13 @@ public sealed class NtfsMftDataReader
                     Extents = extents
                 });
 
-            // The base $DATA stream must begin at VCN 0. Return the first
-            // structurally valid size-matched attribute; extension-record
-            // reconstruction remains the responsibility of $ATTRIBUTE_LIST.
-            break;
+            // When the historical size is known, return the first exact size match.
+            // When the historical size is unknown, keep scanning so an ambiguous
+            // slack tail does not result in an arbitrary first-match recovery.
+            if (historicalSizeKnown)
+            {
+                break;
+            }
         }
         }
         catch (Exception ex)
@@ -3617,6 +3623,18 @@ public sealed class NtfsMftDataReader
                     $"accepted={result.Count}, " +
                     $"sizeMatchDetails={(sizeMatchDetails.Count == 0 ? "(none)" : string.Join(" | ", sizeMatchDetails))}.");
             }
+        }
+
+        if (!historicalSizeKnown && result.Count != 1)
+        {
+            if (fileReferenceNumber != 0)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical reader unknown-size slack probe rejected: " +
+                    $"fileRef={fileReferenceNumber}, candidateCount={result.Count}.");
+            }
+
+            result.Clear();
         }
 
         return result;
