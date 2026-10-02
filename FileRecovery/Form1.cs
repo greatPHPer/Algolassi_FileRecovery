@@ -1189,10 +1189,35 @@ public partial class Form1 : Form
 
                     candidates = candidates
                         .Select(candidate =>
-                            candidate.DataStreamFound ||
-                            !fallbackByPath.TryGetValue(candidate.FullPath, out var fallback)
-                                ? candidate
-                                : fallback)
+                        {
+                            if (!fallbackByPath.TryGetValue(candidate.FullPath, out var fallback))
+                            {
+                                return candidate;
+                            }
+
+                            if (!candidate.DataStreamFound)
+                            {
+                                return fallback;
+                            }
+
+                            // A structurally validated historical raw-MFT candidate
+                            // must replace a conflicting current/reused stream even
+                            // when the current candidate reports DataStreamFound=true.
+                            if (fallback.FileSizeBytes > 0 &&
+                                candidate.FileSizeBytes > 0 &&
+                                fallback.FileSizeBytes != candidate.FileSizeBytes)
+                            {
+                                System.Diagnostics.Trace.WriteLine(
+                                    $"NTFS raw-MFT fallback candidate replaced conflicting current stream: " +
+                                    $"path={candidate.FullPath}, " +
+                                    $"currentSize={candidate.FileSizeBytes:N0}, " +
+                                    $"historicalSize={fallback.FileSizeBytes:N0}.");
+
+                                return fallback;
+                            }
+
+                            return candidate;
+                        })
                         .ToList();
                 }
             }
