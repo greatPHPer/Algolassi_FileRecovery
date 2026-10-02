@@ -819,8 +819,10 @@ public sealed class NtfsMftDataReader
                     record.AsSpan(22, 2));
                 var currentBaseReference = BinaryPrimitives.ReadUInt64LittleEndian(
                     record.AsSpan(32, 8));
+                var isInUse = (currentFlags & 0x0001) != 0;
 
-                var fileNameMatches = HasMatchingFileNameEntry(
+                var fileNameMatches = !isInUse &&
+                    HasMatchingFileNameEntry(
                     volumeHandle,
                     record,
                     expectedFileName,
@@ -833,7 +835,7 @@ public sealed class NtfsMftDataReader
                     $"NTFS fresh resident $DATA: relaxed record inspected. " +
                     $"segment={segmentNumber}, currentSequence={currentSequence}, " +
                     $"expectedSequence={sequenceNumber}, flags=0x{currentFlags:X4}, " +
-                    $"baseRef={currentBaseReference}, fileNameParentMatch={fileNameMatches}.");
+                    $"inUse={isInUse}, baseRef={currentBaseReference}, fileNameParentMatch={fileNameMatches}.");
 
                 if (!fileNameMatches)
                 {
@@ -2792,7 +2794,12 @@ public sealed class NtfsMftDataReader
                     sequenceNumber,
                     actualSequence);
 
-                var fileNameMatch = sequenceNumber != 0 &&
+                var currentFlags = BinaryPrimitives.ReadUInt16LittleEndian(
+                    relaxedRecord.AsSpan(22, 2));
+                var isInUse = (currentFlags & 0x0001) != 0;
+
+                var fileNameMatch = !isInUse &&
+                    sequenceNumber != 0 &&
                     sequenceAdvance > 0 &&
                     sequenceAdvance <= maxDeleteSequenceAdvance &&
                     HasMatchingFileNameEntry(
@@ -2803,6 +2810,13 @@ public sealed class NtfsMftDataReader
                         expectedFullPath,
                         expectedSequenceNumber: sequenceNumber,
                         expectedDeletedAtUtc: expectedDeletedAtUtc);
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $DATA lookup: bounded delete-transition check: " +
+                    $"fileRef={fileReferenceNumber}, segment={segmentNumber}, " +
+                    $"expectedSequence={sequenceNumber}, actualSequence={actualSequence}, " +
+                    $"sequenceAdvance={sequenceAdvance}, flags=0x{currentFlags:X4}, " +
+                    $"inUse={isInUse}, fileNameMatch={fileNameMatch}.");
 
                 if (fileNameMatch)
                 {
