@@ -165,6 +165,8 @@ public sealed class MftCandidateScanner
 
         var results = new List<RecoveryCandidate>();
         var seenReferences = new HashSet<ulong>();
+        var historicalPreflightReadablePaths =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Probe the exact historical MFT segments directly before starting the
         // sequential raw-$MFT walk. Historical USN references already identify
@@ -209,6 +211,9 @@ public sealed class MftCandidateScanner
             {
                 continue;
             }
+
+            historicalPreflightReadablePaths.Add(
+                NormalizePath(historicalTarget.FullPath));
 
             System.Diagnostics.Trace.WriteLine(
                 $"NTFS historical target preflight slack probe: " +
@@ -280,7 +285,9 @@ public sealed class MftCandidateScanner
 
         var pathsWithoutHistoricalReference =
             normalizedTargets
-                .Where(path => !historicalTargetPaths.Contains(path))
+                .Where(path =>
+                    !historicalTargetPaths.Contains(path) ||
+                    !historicalPreflightReadablePaths.Contains(path))
                 .ToList();
 
         if (historicalTargetsBySegment.Count > 0 &&
