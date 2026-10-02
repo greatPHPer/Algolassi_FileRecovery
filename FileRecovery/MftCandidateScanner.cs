@@ -179,8 +179,7 @@ public sealed class MftCandidateScanner
 
             var historicalName = Path.GetFileName(historicalTarget.FullPath);
             if (string.IsNullOrWhiteSpace(historicalName) ||
-                historicalTarget.ParentFileReferenceNumber == 0 ||
-                historicalTarget.FileSizeBytes <= 0)
+                historicalTarget.ParentFileReferenceNumber == 0)
             {
                 System.Diagnostics.Trace.WriteLine(
                     $"NTFS historical MFT preflight skipped: " +
@@ -189,6 +188,15 @@ public sealed class MftCandidateScanner
                     $"parentRef={historicalTarget.ParentFileReferenceNumber}, " +
                     $"size={historicalTarget.FileSizeBytes:N0}.");
                 continue;
+            }
+
+            if (historicalTarget.FileSizeBytes <= 0)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical MFT preflight: historical size unknown; " +
+                    $"probing structurally valid nonresident $DATA slack: " +
+                    $"path={historicalTarget.FullPath}, " +
+                    $"fileRef={historicalTarget.FileReferenceNumber}.");
             }
 
             var directHistoricalRecord =
