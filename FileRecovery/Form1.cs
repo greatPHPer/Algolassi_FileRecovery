@@ -2617,6 +2617,53 @@ public partial class Form1 : Form
                     }
                 }
 
+                // When the current MFT record has been reused, the deleted file's
+                // nonresident $DATA attribute can still survive in MFT slack. Probe the
+                // exact historical file reference directly before resident/slack fallbacks.
+                if (candidate.FileReferenceNumber != 0 &&
+                    candidate.ParentFileReferenceNumber != 0)
+                {
+                    var historicalNonResidentScanner = new MftCandidateScanner();
+
+                    if (historicalNonResidentScanner.TryReadHistoricalNonResidentDataForReference(
+                        candidate.FullPath,
+                        candidate.FileReferenceNumber,
+                        candidate.ParentFileReferenceNumber,
+                        candidate.Name,
+                        candidate.FileSizeBytes,
+                        out var historicalNonResidentData) &&
+                        historicalNonResidentData.Found &&
+                        !historicalNonResidentData.IsResident &&
+                        historicalNonResidentData.Extents.Count > 0)
+                    {
+                        var historicalCandidate = new RecoveryCandidate
+                        {
+                            FileReferenceNumber = candidate.FileReferenceNumber,
+                            ParentFileReferenceNumber = candidate.ParentFileReferenceNumber,
+                            Name = candidate.Name,
+                            DirectoryPath = candidate.DirectoryPath,
+                            LastUsnTimestampUtc = candidate.LastUsnTimestampUtc,
+                            Strength = candidate.Strength,
+                            Evidence = candidate.Evidence,
+                            DataStreamFound = true,
+                            DataStreamResident = false,
+                            FileSizeBytes = historicalNonResidentData.FileSizeBytes,
+                            ValidDataLengthBytes = historicalNonResidentData.ValidDataLengthBytes,
+                            ResidentData = null,
+                            DataExtents = historicalNonResidentData.Extents,
+                            ExtentAllocations = [],
+                            FreeDataClusterCount = 0,
+                            AllocatedDataClusterCount = 0,
+                            DataEvidence = historicalNonResidentData.Evidence
+                        };
+
+                        successes.Add(_ntfsRecoveryService.Recover(
+                            historicalCandidate,
+                            destinationDirectory));
+                        continue;
+                    }
+                }
+
                 // A fresh deletion can leave the resident $DATA stream in the
                 // normal MFT record even when the regular data-stream lookup did not
                 // promote that record to DataStreamFound. Try that source before
