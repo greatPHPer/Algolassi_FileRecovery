@@ -19,6 +19,7 @@ public sealed class NtfsLogFileHistoricalDataService
     private const ushort OpenNonresidentAttribute = 0x001C;
     private const ushort UpdateResidentValue = 0x0007;
     private const ushort UpdateMappingPairs = 0x0009;
+    private const ushort SetNewAttributeSizes = 0x000B;
     private const ushort DeallocateFileRecordSegment = 0x0003;
     private const ushort SetBitsInNonresidentBitmap = 0x0015;
     private const ushort ClearBitsInNonresidentBitmap = 0x0016;
@@ -45,7 +46,7 @@ public sealed class NtfsLogFileHistoricalDataService
         if (string.IsNullOrWhiteSpace(rootPath) ||
             fileReferenceNumber == 0 ||
             string.IsNullOrWhiteSpace(expectedFileName) ||
-            fileSizeBytes <= 0 ||
+            fileSizeBytes < 0 ||
             fileSizeBytes > maxCaptureBytes ||
             fileSizeBytes > int.MaxValue)
         {
@@ -118,6 +119,49 @@ public sealed class NtfsLogFileHistoricalDataService
                 logData,
                 geometry,
                 volumeInfo.BytesPerSector);
+
+            // When the retained $FILE_NAME size is unavailable, recover the size
+            // from the exact historical MFT generation in $LogFile. A retained
+            // InitializeFileRecordSegment gives us the original unnamed nonresident
+            // $DATA definition, while SetNewAttributeSizes records can carry the
+            // later data_size after the file grew.
+            if (fileSizeBytes <= 0)
+            {
+                if (!TryInferHistoricalFileSize(
+                        records,
+                        fileReferenceNumber,
+                        volumeInfo.BytesPerCluster,
+                        volumeInfo.BytesPerFileRecordSegment,
+                        maxCaptureBytes,
+                        out var inferredSize,
+                        out var sizeInferenceEvidence))
+                {
+                    evidence =
+                        $"The retained $LogFile did not expose a trusted historical " +
+                        $"size for exact file reference {fileReferenceNumber} " +
+                        $"('{expectedFileName}'). {sizeInferenceEvidence}";
+                    return false;
+                }
+
+                fileSizeBytes = inferredSize;
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile historical size inferred from MFT generation: " +
+                    $"fileRef={fileReferenceNumber}, " +
+                    $"name={expectedFileName}, " +
+                    $"size={fileSizeBytes:N0}, " +
+                    $"evidence={sizeInferenceEvidence}");
+            }
+
+            if (fileSizeBytes <= 0 ||
+                fileSizeBytes > maxCaptureBytes ||
+                fileSizeBytes > int.MaxValue)
+            {
+                evidence =
+                    $"The inferred historical file size {fileSizeBytes:N0} bytes " +
+                    "is outside the supported $LogFile recovery range.";
+                return false;
+            }
 
             // Small plain-text files normally keep their $DATA value resident
             // inside the MFT record. UpdateMappingPairs only covers nonresident
@@ -306,6 +350,199 @@ public sealed class NtfsLogFileHistoricalDataService
 
             return false;
         }
+    }
+
+    private static bool TryInferHistoricalFileSize(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetFileReference,
+        uint bytesPerCluster,
+        uint bytesPerFileRecordSegment,
+        long maxCaptureBytes,
+        out long fileSizeBytes,
+        out string evidence)
+    {
+        fileSizeBytes = 0;
+        evidence = string.Empty;
+
+        if (bytesPerCluster == 0 ||
+            bytesPerFileRecordSegment == 0)
+        {
+            evidence = "NTFS cluster/record geometry was unavailable.";
+            return false;
+        }
+
+        var targetSegment =
+            targetFileReference &
+            0x0000FFFFFFFFFFFFUL;
+
+        var targetSequence =
+            checked((ushort)(targetFileReference >> 48));
+
+        var initializations =
+            records
+                .Where(record =>
+                    record.RedoOperation == 0x0002 &&
+                    CalculateTargetMftSegment(
+                        record,
+                        bytesPerCluster,
+                        bytesPerFileRecordSegment) == targetSegment)
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
+
+        if (initializations.Count == 0)
+        {
+            evidence =
+                $"No retained InitializeFileRecordSegment record matched " +
+                $"MFT segment {targetSegment:N0}.";
+            return false;
+        }
+
+        var candidates = new List<(ulong Lsn, long Size, string Source)>();
+
+        for (var i = 0; i < initializations.Count; i++)
+        {
+            var initialization = initializations[i];
+
+            if (!TryFindUnnamedNonresidentDataAttributes(
+                    initialization.RedoData,
+                    targetSequence,
+                    expectedSize: 0,
+                    out var definitions))
+            {
+                continue;
+            }
+
+            ulong? nextGenerationLsn = null;
+
+            for (var j = i + 1; j < initializations.Count; j++)
+            {
+                if (initializations[j].Lsn > initialization.Lsn)
+                {
+                    nextGenerationLsn = initializations[j].Lsn;
+                    break;
+                }
+            }
+
+            foreach (var definition in definitions
+                         .Where(item =>
+                             item.StartingVcn == 0 &&
+                             item.FileSizeBytes > 0 &&
+                             item.FileSizeBytes <= maxCaptureBytes &&
+                             item.FileSizeBytes <= int.MaxValue))
+            {
+                candidates.Add(
+                    (
+                        initialization.Lsn,
+                        definition.FileSizeBytes,
+                        "InitializeFileRecordSegment"));
+
+                var sizeUpdates =
+                    records
+                        .Where(record =>
+                            record.Lsn > initialization.Lsn &&
+                            (!nextGenerationLsn.HasValue ||
+                             record.Lsn < nextGenerationLsn.Value) &&
+                            (record.RedoOperation == SetNewAttributeSizes ||
+                             record.UndoOperation == SetNewAttributeSizes) &&
+                            CalculateTargetMftSegment(
+                                record,
+                                bytesPerCluster,
+                                bytesPerFileRecordSegment) == targetSegment &&
+                            record.AttributeOffset == definition.AttributeOffset)
+                        .OrderBy(record => record.Lsn)
+                        .ThenBy(record => record.PhysicalOrder)
+                        .ToList();
+
+                foreach (var sizeUpdate in sizeUpdates)
+                {
+                    var sizePayload =
+                        sizeUpdate.RedoOperation == SetNewAttributeSizes
+                            ? sizeUpdate.RedoData
+                            : sizeUpdate.UndoData;
+
+                    if (sizePayload.Length < 24)
+                    {
+                        continue;
+                    }
+
+                    var allocatedSize =
+                        BinaryPrimitives.ReadInt64LittleEndian(
+                            sizePayload.AsSpan(0, 8));
+
+                    var dataSize =
+                        BinaryPrimitives.ReadInt64LittleEndian(
+                            sizePayload.AsSpan(8, 8));
+
+                    var validSize =
+                        BinaryPrimitives.ReadInt64LittleEndian(
+                            sizePayload.AsSpan(16, 8));
+
+                    if (allocatedSize < 0 ||
+                        dataSize <= 0 ||
+                        validSize < 0 ||
+                        dataSize > allocatedSize ||
+                        validSize > dataSize ||
+                        dataSize > maxCaptureBytes ||
+                        dataSize > int.MaxValue)
+                    {
+                        continue;
+                    }
+
+                    candidates.Add(
+                        (
+                            sizeUpdate.Lsn,
+                            dataSize,
+                            "SetNewAttributeSizes"));
+
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS $LogFile historical size candidate: " +
+                        $"fileRef={targetFileReference}, " +
+                        $"segment={targetSegment:N0}, " +
+                        $"sequence={targetSequence}, " +
+                        $"lsn=0x{sizeUpdate.Lsn:X16}, " +
+                        $"attributeOffset=0x{definition.AttributeOffset:X}, " +
+                        $"allocatedSize={allocatedSize:N0}, " +
+                        $"dataSize={dataSize:N0}, " +
+                        $"validSize={validSize:N0}.");
+                }
+            }
+        }
+
+        if (candidates.Count == 0)
+        {
+            evidence =
+                $"Retained MFT initialization records existed for segment " +
+                $"{targetSegment:N0}, but no exact-sequence unnamed nonresident " +
+                "$DATA definition carried a safe historical size.";
+            return false;
+        }
+
+        var selected = candidates
+            .OrderByDescending(candidate => candidate.Lsn)
+            .ThenByDescending(candidate => candidate.Size)
+            .First();
+
+        fileSizeBytes = selected.Size;
+
+        var distinctSizes =
+            candidates
+                .Select(candidate => candidate.Size)
+                .Distinct()
+                .OrderByDescending(size => size)
+                .ToArray();
+
+        var sizeSummary =
+            string.Join(
+                ", ",
+                distinctSizes.Select(size => size.ToString("N0")));
+
+        evidence =
+            $"Selected the latest exact-generation historical size from " +
+            $"{selected.Source} at LSN 0x{selected.Lsn:X16}. " +
+            $"Retained size candidates: {sizeSummary} byte(s).";
+
+        return true;
     }
 
     private static bool TryRecoverResidentFileData(
@@ -1093,7 +1330,8 @@ public sealed class NtfsLogFileHistoricalDataService
 
                             if (extents.Count > 0 &&
                                 expectedEndingVcn == endingVcn &&
-                                (declaredFileSize == expectedSize ||
+                                (expectedSize <= 0 ||
+                                 declaredFileSize == expectedSize ||
                                  declaredFileSize == 0))
                             {
                                 definitions.Add(
