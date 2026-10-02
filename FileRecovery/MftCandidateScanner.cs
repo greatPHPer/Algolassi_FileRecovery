@@ -264,6 +264,35 @@ public sealed class MftCandidateScanner
                 return results;
             }
         }
+
+        // When every requested path already has an exact historical USN file
+        // reference, the deterministic segment preflight above is the complete
+        // identity lookup needed for this pass. Do not fall through into a
+        // sequential whole-$MFT walk: that scan can consume minutes and several
+        // gigabytes while providing no additional identity evidence for these
+        // exact historical references.
+        var historicalTargetPaths =
+            historicalTargetsBySegment
+                .Values
+                .SelectMany(targets => targets)
+                .Select(target => NormalizePath(target.FullPath))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var pathsWithoutHistoricalReference =
+            normalizedTargets
+                .Where(path => !historicalTargetPaths.Contains(path))
+                .ToList();
+
+        if (historicalTargetsBySegment.Count > 0 &&
+            pathsWithoutHistoricalReference.Count == 0)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"Raw MFT directory scan skipped after exact historical preflight: " +
+                $"all {normalizedTargets.Count:N0} target path(s) had exact historical " +
+                $"file references; no sequential whole-MFT walk was required.");
+            return results;
+        }
+
         var recordSize = checked((int)volumeInfo.BytesPerFileRecordSegment);
         var fileSignatureCount = 0L;
         var deletedRecordCount = 0L;
