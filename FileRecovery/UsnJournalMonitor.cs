@@ -1074,21 +1074,28 @@ public sealed class UsnJournalMonitor : IDisposable
         try
         {
             var sizeReader = new NtfsLogFileHistoricalSizeService();
+            var maximumHistoricalFileSize =
+                new DriveInfo(root).TotalSize;
 
-            if (!sizeReader.TryRecoverFileSize(
+            var historicalSizeKnown =
+                sizeReader.TryRecoverFileSize(
                     root,
                     deletion.FileName,
                     deletion.ParentFileReferenceNumber!.Value,
-                    new DriveInfo(root).TotalSize,
+                    maximumHistoricalFileSize,
                     out var historicalSize,
-                    out var sizeEvidence) ||
-                historicalSize <= 0 ||
-                historicalSize > DeleteSnapshotMaxBytes)
+                    out var sizeEvidence) &&
+                historicalSize > 0 &&
+                historicalSize <= DeleteSnapshotMaxBytes;
+
+            if (!historicalSizeKnown)
             {
+                historicalSize = 0;
+
                 System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $LogFile historical snapshot: size lookup failed for " +
-                    $"{deletion.FullPath}: {sizeEvidence}");
-                return false;
+                    $"NTFS $LogFile historical snapshot: $FILE_NAME size lookup unavailable; " +
+                    $"attempting exact-generation data reconstruction for {deletion.FullPath}: " +
+                    $"{sizeEvidence}");
             }
 
             var dataReader =
@@ -1107,6 +1114,11 @@ public sealed class UsnJournalMonitor : IDisposable
                     $"NTFS $LogFile historical snapshot: data lookup failed for " +
                     $"{deletion.FullPath}: {dataEvidence}");
                 return false;
+            }
+
+            if (historicalSize <= 0)
+            {
+                historicalSize = recoveredData.LongLength;
             }
 
             if (recoveredData.LongLength != historicalSize)
@@ -1140,15 +1152,18 @@ public sealed class UsnJournalMonitor : IDisposable
                 Sha256 = sha256,
                 CapturedAtUtc = DateTime.UtcNow,
                 Evidence =
-                    $"Recovered from exact NTFS $LogFile mapping pairs. " +
-                    $"{dataEvidence} Historical-size evidence: {sizeEvidence}"
+                    historicalSizeKnown
+                        ? $"Recovered from exact NTFS $LogFile mapping pairs. " +
+                          $"{dataEvidence} Historical-size evidence: {sizeEvidence}"
+                        : $"Recovered from exact NTFS $LogFile mapping history with the file size " +
+                          $"inferred from the exact historical MFT generation. {dataEvidence} " +
+                          $"$FILE_NAME size evidence: {sizeEvidence}"
             };
 
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS $LogFile historical snapshot saved: " +
                 $"path={deletion.FullPath}, fileRef={fileReferenceNumber}, " +
-                $"size={recoveredData.LongLength:N0}, " +
-                $"dataFile={dataFileName}, sha256={sha256}.");
+                $"size={recoveredData.LongLength:N0}, dataFile={dataFileName}, sha256={sha256}.");
 
             return true;
         }
