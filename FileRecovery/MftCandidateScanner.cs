@@ -1316,6 +1316,117 @@ public sealed class MftCandidateScanner
         string Name,
         DateTime TimestampUtc);
 
+    internal bool TryReadHistoricalNonResidentDataForReference(
+        string sourcePath,
+        ulong fileReferenceNumber,
+        ulong parentFileReferenceNumber,
+        string expectedFileName,
+        long expectedFileSizeBytes,
+        out NtfsDataStreamInfo dataStream)
+    {
+        dataStream = new NtfsDataStreamInfo();
+
+        if (fileReferenceNumber == 0 ||
+            parentFileReferenceNumber == 0 ||
+            string.IsNullOrWhiteSpace(expectedFileName))
+        {
+            return false;
+        }
+
+        var root = GetNtfsVolumeRoot(sourcePath);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!string.Equals(
+                    new DriveInfo(root).DriveFormat,
+                    "NTFS",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var fullRoot = Path.GetFullPath(root);
+            var volumeInfo = new NtfsVolumeInspector().Inspect(fullRoot);
+
+            using var volumeHandle = CreateVolumeHandle(fullRoot);
+            var reader = new NtfsMftDataReader();
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical nonresident recovery probe ENTER: " +
+                $"path={sourcePath}, " +
+                $"fileRef={fileReferenceNumber}, " +
+                $"parentRef={parentFileReferenceNumber}, " +
+                $"expectedSize={expectedFileSizeBytes:N0}.");
+
+            var historicalRecord = reader.ReadHistoricalMftRecordForReference(
+                volumeHandle,
+                volumeInfo,
+                fileReferenceNumber);
+
+            if (historicalRecord is null)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical nonresident recovery probe: " +
+                    $"historical MFT segment could not be read, " +
+                    $"path={sourcePath}, fileRef={fileReferenceNumber}.");
+                return false;
+            }
+
+            var result = reader.ReadDefaultDataStreamFromScannedMftRecord(
+                volumeInfo,
+                volumeHandle,
+                fileReferenceNumber,
+                historicalRecord,
+                expectedFileName,
+                parentFileReferenceNumber,
+                expectedFileSizeBytes,
+                historicalSlackOnly: true);
+
+            if (!result.Found ||
+                result.IsResident ||
+                result.Extents.Count == 0)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS historical nonresident recovery probe MISS: " +
+                    $"path={sourcePath}, " +
+                    $"fileRef={fileReferenceNumber}, " +
+                    $"found={result.Found}, " +
+                    $"resident={result.IsResident}, " +
+                    $"size={result.FileSizeBytes:N0}, " +
+                    $"extents={result.Extents.Count:N0}, " +
+                    $"evidence={result.Evidence}.");
+                return false;
+            }
+
+            dataStream = result;
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical nonresident recovery probe MATCH: " +
+                $"path={sourcePath}, " +
+                $"fileRef={fileReferenceNumber}, " +
+                $"size={result.FileSizeBytes:N0}, " +
+                $"validLength={result.ValidDataLengthBytes:N0}, " +
+                $"extents={result.Extents.Count:N0}, " +
+                $"evidence={result.Evidence}.");
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical nonresident recovery probe FAILED: " +
+                $"path={sourcePath}, " +
+                $"fileRef={fileReferenceNumber}, " +
+                $"expectedSize={expectedFileSizeBytes:N0}, " +
+                $"exception={ex.GetType().Name}: {ex.Message}.");
+            return false;
+        }
+    }
+
     private static string NormalizePath(string path) =>
         path.Trim().Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
 
