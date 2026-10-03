@@ -1032,6 +1032,30 @@ public sealed class NtfsLogFileHistoricalDataService
                 .OrderBy(item => item.Lsn)
                 .ToList();
 
+        var allOpenAttributeCount = targetAttributeOpens.Count;
+
+        var nonresidentValueUpdates =
+            records
+                .Where(record =>
+                    record.RedoOperation == UpdateNonresidentValue &&
+                    record.RedoData.Length > 0)
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
+
+        var targetSegment =
+            targetFileReference &
+            0x0000FFFFFFFFFFFFUL;
+
+        var sameSegmentOpenReferences =
+            targetAttributeOpens
+                .Where(item =>
+                    (item.FileReference & 0x0000FFFFFFFFFFFFUL) == targetSegment)
+                .Select(item => item.FileReference)
+                .Distinct()
+                .Take(20)
+                .ToList();
+
         var candidateUpdates = new List<ParsedLogRecord>();
 
         foreach (var record in records
@@ -1062,9 +1086,13 @@ public sealed class NtfsLogFileHistoricalDataService
         System.Diagnostics.Trace.WriteLine(
             $"NTFS $LogFile historical nonresident value scan: " +
             $"fileRef={targetFileReference}, " +
+            $"segment={targetSegment:N0}, " +
             $"size={fileSizeBytes:N0}, " +
+            $"allOpenAttributes={allOpenAttributeCount:N0}, " +
             $"exactOpenAttributes={exactOpens.Count:N0}, " +
-            $"candidateUpdates={candidateUpdates.Count:N0}.");
+            $"allUpdateNonresidentValue={nonresidentValueUpdates.Count:N0}, " +
+            $"candidateUpdates={candidateUpdates.Count:N0}, " +
+            $"sameSegmentOpenRefs={string.Join(",", sameSegmentOpenReferences)}.");
 
         if (candidateUpdates.Count == 0)
         {
