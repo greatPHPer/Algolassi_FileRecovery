@@ -3186,7 +3186,7 @@ public partial class Form1 : Form
                             {
                                 MessageBox.Show(
                                     this,
-                                    $"The marker was found inside the retained NTFS $LogFile.\\r\\n\\r\\n" +
+                                    $"The marker was found inside the retained NTFS $LogFile.\r\n\r\n" +
                                     logMarkerEvidence,
                                     "NTFS $LogFile Marker Found",
                                     MessageBoxButtons.OK,
@@ -3202,9 +3202,9 @@ public partial class Form1 : Form
 
                             var proceedWithFullVolume = MessageBox.Show(
                                 this,
-                                $"The marker was not found in the retained NTFS $LogFile.\\r\\n\\r\\n" +
+                                $"The marker was not found in the retained NTFS $LogFile.\r\n\r\n" +
                                 "Starting the raw-volume forensic scan will read the entire source volume. " +
-                                "For the current 1 MB test this is approximately 122 GB.\\r\\n\\r\\n" +
+                                "For the current 1 MB test this is approximately 122 GB.\r\n\r\n" +
                                 "Start the full-volume scan now?",
                                 "Start Full-Volume Forensic Scan",
                                 MessageBoxButtons.YesNo,
@@ -3223,7 +3223,7 @@ public partial class Form1 : Form
                         {
                             var proceedWithFullVolume = MessageBox.Show(
                                 this,
-                                $"The NTFS $LogFile marker diagnostic failed:\\r\\n\\r\\n{ex.Message}\\r\\n\\r\\n" +
+                                $"The NTFS $LogFile marker diagnostic failed:\r\n\r\n{ex.Message}\r\n\r\n" +
                                 "Start the raw-volume forensic scan anyway?",
                                 "NTFS $LogFile Marker Diagnostic Failed",
                                 MessageBoxButtons.YesNo,
