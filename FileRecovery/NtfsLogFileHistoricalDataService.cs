@@ -1032,6 +1032,11 @@ public sealed class NtfsLogFileHistoricalDataService
                 .OrderBy(item => item.Lsn)
                 .ToList();
 
+        var openAttributeDumpMatches =
+            FindOpenAttributeTableDumpMatches(
+                records,
+                targetFileReference);
+
         var allOpenAttributeCount = targetAttributeOpens.Count;
 
         var nonresidentValueUpdates =
@@ -1092,7 +1097,8 @@ public sealed class NtfsLogFileHistoricalDataService
             $"exactOpenAttributes={exactOpens.Count:N0}, " +
             $"allUpdateNonresidentValue={nonresidentValueUpdates.Count:N0}, " +
             $"candidateUpdates={candidateUpdates.Count:N0}, " +
-            $"sameSegmentOpenRefs={string.Join(",", sameSegmentOpenReferences)}.");
+            $"sameSegmentOpenRefs={string.Join(",", sameSegmentOpenReferences)}, " +
+            $"openAttributeDumpMatches={openAttributeDumpMatches.Count:N0}.");
 
         if (candidateUpdates.Count == 0)
         {
@@ -1226,6 +1232,121 @@ public sealed class NtfsLogFileHistoricalDataService
         }
 
         return references.ToArray();
+    }
+
+    private static List<string> FindOpenAttributeTableDumpMatches(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetFileReference)
+    {
+        var matches = new List<string>();
+
+        foreach (var record in records
+                     .Where(item =>
+                         item.RedoOperation == 0x001D &&
+                         item.RedoData.Length >= 24)
+                     .OrderBy(item => item.Lsn)
+                     .ThenBy(item => item.PhysicalOrder))
+        {
+            try
+            {
+                var entrySize =
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        record.RedoData.AsSpan(0, 2));
+
+                var entryCount =
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        record.RedoData.AsSpan(2, 2));
+
+                const int tableHeaderLength = 24;
+
+                if (entrySize < 24 ||
+                    entryCount == 0 ||
+                    entrySize > 4096)
+                {
+                    continue;
+                }
+
+                var tableBytes =
+                    checked((long)entrySize * entryCount);
+
+                if (tableHeaderLength + tableBytes > record.RedoData.Length)
+                {
+                    continue;
+                }
+
+                for (var index = 0; index < entryCount; index++)
+                {
+                    var entryOffset =
+                        checked(tableHeaderLength + index * entrySize);
+
+                    var entry =
+                        record.RedoData.AsSpan(
+                            entryOffset,
+                            entrySize);
+
+                    var candidateReferences = new List<(int Offset, ulong FileReference)>();
+
+                    if (entry.Length >= 16)
+                    {
+                        var v0Reference =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                entry.Slice(8, 8));
+
+                        if (v0Reference != 0)
+                        {
+                            candidateReferences.Add((8, v0Reference));
+                        }
+                    }
+
+                    if (entry.Length >= 24)
+                    {
+                        var v1Reference =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                entry.Slice(16, 8));
+
+                        if (v1Reference != 0)
+                        {
+                            candidateReferences.Add((16, v1Reference));
+                        }
+                    }
+
+                    foreach (var candidate in candidateReferences)
+                    {
+                        if (candidate.FileReference != targetFileReference)
+                        {
+                            continue;
+                        }
+
+                        var tableAttributeOffset = entryOffset;
+
+                        matches.Add(
+                            $"lsn=0x{record.Lsn:X16}, " +
+                            $"entryIndex={index:N0}, " +
+                            $"entrySize={entrySize:N0}, " +
+                            $"referenceOffset=0x{candidate.Offset:X}, " +
+                            $"targetAttributeOffset=0x{tableAttributeOffset:X}.");
+
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS $LogFile open-attribute table dump TARGET MATCH: " +
+                            $"fileRef={targetFileReference}, " +
+                            matches[^1]);
+                    }
+                }
+            }
+            catch
+            {
+                // A malformed or incompatible historical dump must never
+                // interfere with ordinary recovery diagnostics.
+            }
+        }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile open-attribute table dump scan: " +
+            $"fileRef={targetFileReference}, " +
+            $"dumpRecords={records.Count(item => item.RedoOperation == 0x001D):N0}, " +
+            $"targetMatches={matches.Count:N0}.");
+
+        return matches;
     }
 
     private static bool TryRecoverNonresidentDataFromHistoricalMftInitialization(
