@@ -2039,7 +2039,53 @@ public partial class Form1 : Form
                             }
                             else
                             {
-                                unavailable.Add(record);
+                                // Keep the exact historical reference even when the reused
+                                // current MFT record no longer produces a normal candidate.
+                                // This lets recovery-time $LogFile reconstruction operate
+                                // without another whole-volume/history scan.
+                                var metadataCandidate = new RecoveryCandidate
+                                {
+                                    FileReferenceNumber = record.FileReferenceNumber!.Value,
+                                    ParentFileReferenceNumber =
+                                        record.ParentFileReferenceNumber ?? 0,
+                                    Name = record.FileName,
+                                    DirectoryPath = string.IsNullOrWhiteSpace(record.DirectoryPath)
+                                        ? Path.GetDirectoryName(record.FullPath) ?? string.Empty
+                                        : NormalizePath(record.DirectoryPath),
+                                    LastUsnTimestampUtc = record.DeletedAtUtc,
+                                    Strength = RecoveryStrength.Weak,
+                                    Evidence =
+                                        "The historical deletion record retained the exact NTFS " +
+                                        "file reference, but the current MFT no longer exposes " +
+                                        "a matching live record. Historical NTFS evidence will " +
+                                        "be attempted before marker-driven fallback.",
+                                    DataStreamFound = false,
+                                    DataStreamResident = false,
+                                    FileSizeBytes = record.FileSizeBytes ?? 0L,
+                                    ValidDataLengthBytes = 0,
+                                    ResidentData = null,
+                                    DataExtents = [],
+                                    ExtentAllocations = [],
+                                    FreeDataClusterCount = 0,
+                                    AllocatedDataClusterCount = 0,
+                                    DataEvidence =
+                                        "No current NTFS $DATA stream was retained under the " +
+                                        "historical file reference."
+                                };
+
+                                if (record.NtfsDataSnapshot?.IsComplete == true)
+                                {
+                                    metadataCandidate.NtfsDataSnapshot =
+                                        record.NtfsDataSnapshot.Clone();
+
+                                    if (metadataCandidate.FileSizeBytes <= 0)
+                                    {
+                                        metadataCandidate.FileSizeBytes =
+                                            metadataCandidate.NtfsDataSnapshot.FileSizeBytes;
+                                    }
+                                }
+
+                                ntfsCandidates.Add(metadataCandidate);
                             }
                         }
                     }
@@ -2425,6 +2471,107 @@ public partial class Form1 : Form
         return true;
     }
 
+    private static bool TryRecoverFromHistoricalLogFileData(
+        RecoveryCandidate candidate,
+        string destinationDirectory,
+        out RecoveryResult result)
+    {
+        result = new RecoveryResult();
+
+        if (candidate.FileReferenceNumber == 0 ||
+            candidate.ParentFileReferenceNumber == 0 ||
+            string.IsNullOrWhiteSpace(candidate.FullPath) ||
+            string.IsNullOrWhiteSpace(candidate.Name))
+        {
+            return false;
+        }
+
+        var sourceRoot = Path.GetPathRoot(candidate.FullPath);
+        if (string.IsNullOrWhiteSpace(sourceRoot))
+        {
+            return false;
+        }
+
+        try
+        {
+            var service = new NtfsLogFileHistoricalDataService();
+            const long maxCaptureBytes = int.MaxValue;
+
+            if (!service.TryRecoverFileData(
+                    sourceRoot,
+                    candidate.FileReferenceNumber,
+                    candidate.Name,
+                    candidate.FileSizeBytes,
+                    maxCaptureBytes,
+                    out var data,
+                    out var evidence) ||
+                data.Length == 0)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS recovery-time $LogFile historical data MISS: " +
+                    $"path={candidate.FullPath}, " +
+                    $"fileRef={candidate.FileReferenceNumber}, " +
+                    $"expectedSize={candidate.FileSizeBytes:N0}, " +
+                    $"evidence={evidence}");
+                return false;
+            }
+
+            if (candidate.FileSizeBytes > 0 &&
+                data.LongLength != candidate.FileSizeBytes)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS recovery-time $LogFile historical data rejected for size mismatch: " +
+                    $"path={candidate.FullPath}, " +
+                    $"fileRef={candidate.FileReferenceNumber}, " +
+                    $"candidateSize={candidate.FileSizeBytes:N0}, " +
+                    $"recoveredSize={data.LongLength:N0}.");
+                return false;
+            }
+
+            RecoveryDestinationPolicy.Validate(
+                candidate.FullPath,
+                destinationDirectory);
+
+            var destinationPath =
+                RecoveryDestinationPolicy.CreateSafeFilePath(
+                    destinationDirectory,
+                    candidate.Name);
+
+            File.WriteAllBytes(destinationPath, data);
+
+            candidate.FileSizeBytes = data.LongLength;
+
+            result = new RecoveryResult
+            {
+                Success = true,
+                SourcePath = candidate.FullPath,
+                DestinationPath = destinationPath,
+                BytesRecovered = data.LongLength,
+                Evidence =
+                    $"Recovered {data.LongLength:N0} byte(s) from exact NTFS $LogFile " +
+                    $"historical reconstruction. {evidence}"
+            };
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS recovery-time $LogFile historical data recovery succeeded: " +
+                $"path={candidate.FullPath}, " +
+                $"fileRef={candidate.FileReferenceNumber}, " +
+                $"size={data.LongLength:N0}, " +
+                $"destination={destinationPath}.");
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS recovery-time $LogFile historical data recovery failed: " +
+                $"path={candidate.FullPath}, " +
+                $"fileRef={candidate.FileReferenceNumber}, " +
+                $"exception={ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
     private async Task<(List<RecoveryResult> successes, List<string> failures)> recvr(
         IReadOnlyList<RecoveryCandidate> candidates,
         string? destinationDirectory)
@@ -2521,11 +2668,24 @@ public partial class Form1 : Form
                     }
                 }
 
-                                // Plain-text files do not have a filesystem signature, and a historical
-                // $LogFile data reconstruction can produce a full-length buffer without
-                // proving that the bytes belong to this deleted text file. Keep text
-                // recovery marker-driven when the retained $DATA/snapshot sources above
-                // are unavailable.
+                                // The current MFT can be reused while exact historical
+                                // $LogFile transaction evidence still retains the original bytes.
+                                // Try that evidence before asking for a text marker. The historical
+                                // service validates the exact file reference and can infer the file
+                                // size from the same historical MFT generation when the normal
+                                // $FILE_NAME size is unavailable.
+                                if (!candidate.DataStreamFound &&
+                                    candidate.FileReferenceNumber != 0 &&
+                                    candidate.ParentFileReferenceNumber != 0 &&
+                                    TryRecoverFromHistoricalLogFileData(
+                                        candidate,
+                                        destinationDirectory,
+                                        out var historicalLogFileRecovery))
+                                {
+                                    successes.Add(historicalLogFileRecovery);
+                                    continue;
+                                }
+
                 if (TryRecoverFromNtfsSnapshot(
                         candidate,
                         destinationDirectory,
