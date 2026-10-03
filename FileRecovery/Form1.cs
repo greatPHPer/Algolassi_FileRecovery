@@ -3175,6 +3175,69 @@ public partial class Form1 : Form
                             continue;
                         }
 
+                        var logMarkerService = new NtfsLogFileHistoricalDataService();
+
+                        try
+                        {
+                            if (logMarkerService.TryFindMarkerInHistoricalLogFile(
+                                    wholeVolumeRoot,
+                                    forensicMarker,
+                                    out var logMarkerEvidence))
+                            {
+                                MessageBox.Show(
+                                    this,
+                                    $"The marker was found inside the retained NTFS $LogFile.\\r\\n\\r\\n" +
+                                    logMarkerEvidence,
+                                    "NTFS $LogFile Marker Found",
+                                    MessageBoxButtons.OK,
+                                    MessageBoxIcon.Information);
+
+                                failures.Add(
+                                    $"{candidate.Name}: the supplied marker is retained in NTFS $LogFile. " +
+                                    "The 122 GB whole-volume scan was not started because the journal contains a possible historical content fragment. " +
+                                    logMarkerEvidence);
+
+                                continue;
+                            }
+
+                            var proceedWithFullVolume = MessageBox.Show(
+                                this,
+                                $"The marker was not found in the retained NTFS $LogFile.\\r\\n\\r\\n" +
+                                "Starting the raw-volume forensic scan will read the entire source volume. " +
+                                "For the current 1 MB test this is approximately 122 GB.\\r\\n\\r\\n" +
+                                "Start the full-volume scan now?",
+                                "Start Full-Volume Forensic Scan",
+                                MessageBoxButtons.YesNo,
+                                MessageBoxIcon.Question,
+                                MessageBoxDefaultButton.Button2);
+
+                            if (proceedWithFullVolume != DialogResult.Yes)
+                            {
+                                failures.Add(
+                                    $"{candidate.Name}: marker was not found in the retained NTFS $LogFile and the full-volume forensic scan was skipped. " +
+                                    logMarkerEvidence);
+                                continue;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            var proceedWithFullVolume = MessageBox.Show(
+                                this,
+                                $"The NTFS $LogFile marker diagnostic failed:\\r\\n\\r\\n{ex.Message}\\r\\n\\r\\n" +
+                                "Start the raw-volume forensic scan anyway?",
+                                "NTFS $LogFile Marker Diagnostic Failed",
+                                MessageBoxButtons.YesNo,
+                                MessageBoxIcon.Warning,
+                                MessageBoxDefaultButton.Button2);
+
+                            if (proceedWithFullVolume != DialogResult.Yes)
+                            {
+                                failures.Add(
+                                    $"{candidate.Name}: the NTFS $LogFile marker diagnostic failed and the full-volume forensic scan was skipped: {ex.Message}");
+                                continue;
+                            }
+                        }
+
                         var totalVolumeBytes = new DriveInfo(wholeVolumeRoot).TotalSize;
                         var forensicProgress = new SynchronousProgress<long>(
                             this,
