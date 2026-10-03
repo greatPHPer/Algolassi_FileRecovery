@@ -2468,7 +2468,8 @@ public sealed class NtfsMftDataReader
                 expectedFileName,
                 expectedParentFileReferenceNumber,
                 expectedFullPath,
-                expectedDeletedAtUtc);
+                expectedDeletedAtUtc,
+                allowBoundedDeleteTransition);
 
             if (!stream.Found)
             {
@@ -2638,11 +2639,13 @@ public sealed class NtfsMftDataReader
                 expectedFileName,
                 expectedParentFileReferenceNumber,
                 expectedFullPath,
-                expectedDeletedAtUtc);
+                expectedDeletedAtUtc,
+                allowBoundedDeleteTransition);
 
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS recovery-time $DATA lookup: fileRef={fileReferenceNumber}, " +
                 $"path={expectedFullPath}, found={stream.Found}, resident={stream.IsResident}, " +
+                $"allowBoundedDeleteTransition={allowBoundedDeleteTransition}, " +
                 $"size={stream.FileSizeBytes:N0}, extents={stream.Extents.Count:N0}, " +
                 $"evidence={stream.Evidence}");
 
@@ -2760,6 +2763,14 @@ public sealed class NtfsMftDataReader
                 $"segment={segmentNumber}, expectedSequence={sequenceNumber}, " +
                 $"expectedName={expectedFileName ?? "(none)"}, " +
                 $"expectedParent={expectedParentFileReferenceNumber?.ToString() ?? "(none)"}.");
+        }
+
+        if (record is null &&
+            !allowBoundedDeleteTransition)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $DATA lookup: bounded delete-transition fallback DISABLED for " +
+                $"fileRef={fileReferenceNumber}, segment={segmentNumber}, expectedSequence={sequenceNumber}.");
         }
 
         if (record is null &&
