@@ -2431,7 +2431,8 @@ public sealed class NtfsMftDataReader
         long maxCaptureBytes,
         out NtfsDataStreamInfo stream,
         out byte[] capturedData,
-        DateTime expectedDeletedAtUtc = default)
+        DateTime expectedDeletedAtUtc = default,
+        bool allowBoundedDeleteTransition = true)
     {
         stream = NotFound("The deleted file's NTFS $DATA stream could not be read.");
         capturedData = [];
@@ -2667,7 +2668,8 @@ public sealed class NtfsMftDataReader
         string? expectedFileName = null,
         ulong? expectedParentFileReferenceNumber = null,
         string? expectedFullPath = null,
-        DateTime expectedDeletedAtUtc = default)
+        DateTime expectedDeletedAtUtc = default,
+        bool allowBoundedDeleteTransition = true)
     {
         var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
         var sequenceNumber = (ushort)(fileReferenceNumber >> 48);
@@ -2761,6 +2763,7 @@ public sealed class NtfsMftDataReader
         }
 
         if (record is null &&
+            allowBoundedDeleteTransition &&
             !string.IsNullOrWhiteSpace(expectedFileName) &&
             expectedParentFileReferenceNumber.HasValue)
         {
