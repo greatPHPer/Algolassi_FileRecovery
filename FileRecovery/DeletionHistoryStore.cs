@@ -77,7 +77,13 @@ public sealed class DeletionHistoryStore
                 // the later USN record can upgrade the earlier watcher-only row.
                 if (index < 0)
                 {
+                    // A path alone is not a safe identity once either side has an
+                    // authoritative NTFS file reference. The same path can be deleted
+                    // repeatedly and receive a new MFT generation each time.
+                    // Only merge by path/time when neither record has a file reference.
                     index = _records.FindIndex(x =>
+                        !x.FileReferenceNumber.HasValue &&
+                        !record.FileReferenceNumber.HasValue &&
                         string.Equals(
                             x.FullPath,
                             record.FullPath,
