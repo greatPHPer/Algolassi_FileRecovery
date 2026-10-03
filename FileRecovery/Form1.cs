@@ -439,6 +439,134 @@ public partial class Form1 : Form
         }
     }
 
+    private async void btnTargetedHistorical_Click(object? sender, EventArgs e)
+    {
+        var fullPath = Microsoft.VisualBasic.Interaction.InputBox(
+            "Enter the full path of the deleted file.",
+            "Targeted Historical NTFS Recovery",
+            @"E:\TestRecovery\SizeTests\testlast-v7-utf16-1mb.txt");
+
+        if (string.IsNullOrWhiteSpace(fullPath))
+        {
+            return;
+        }
+
+        if (!File.Exists(fullPath))
+        {
+            // The deleted file is normally absent. We only require that its path
+            // contains a valid Windows volume root; existence of the source file
+            // would defeat the purpose of this historical-recovery diagnostic.
+            var root = Path.GetPathRoot(fullPath);
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                MessageBox.Show(
+                    this,
+                    "Enter a valid Windows path, for example E:\\TestRecovery\\SizeTests\\deleted.txt.",
+                    "Targeted Historical NTFS Recovery",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+        }
+
+        var fileReferenceText = Microsoft.VisualBasic.Interaction.InputBox(
+            "Enter the exact historical NTFS file reference number.",
+            "Targeted Historical NTFS Recovery",
+            "3940649674375817");
+
+        if (!ulong.TryParse(fileReferenceText, out var fileReferenceNumber) ||
+            fileReferenceNumber == 0)
+        {
+            MessageBox.Show(
+                this,
+                "The NTFS file reference number is invalid.",
+                "Targeted Historical NTFS Recovery",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        var parentReferenceText = Microsoft.VisualBasic.Interaction.InputBox(
+            "Enter the exact historical NTFS parent file reference number.",
+            "Targeted Historical NTFS Recovery",
+            "6473924465786916");
+
+        if (!ulong.TryParse(parentReferenceText, out var parentFileReferenceNumber) ||
+            parentFileReferenceNumber == 0)
+        {
+            MessageBox.Show(
+                this,
+                "The NTFS parent file reference number is invalid.",
+                "Targeted Historical NTFS Recovery",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        var fileName = Path.GetFileName(fullPath);
+        var directory = Path.GetDirectoryName(fullPath) ?? string.Empty;
+
+        var candidate = new RecoveryCandidate
+        {
+            FileReferenceNumber = fileReferenceNumber,
+            ParentFileReferenceNumber = parentFileReferenceNumber,
+            Name = fileName,
+            DirectoryPath = directory,
+            LastUsnTimestampUtc = DateTime.MinValue,
+            Strength = RecoveryStrength.Weak,
+            Evidence =
+                "Targeted historical NTFS recovery using an exact historical " +
+                "file reference and parent reference supplied for diagnostic recovery.",
+            DataStreamFound = false,
+            DataStreamResident = false,
+            FileSizeBytes = 0,
+            ValidDataLengthBytes = 0,
+            ResidentData = null,
+            DataExtents = [],
+            ExtentAllocations = [],
+            FreeDataClusterCount = 0,
+            AllocatedDataClusterCount = 0,
+            DataEvidence =
+                "The target is being recovered directly from historical NTFS evidence " +
+                "without scanning the USN journal or current deleted-file candidate list."
+        };
+
+        var rootPath = Path.GetPathRoot(fullPath);
+        if (string.IsNullOrWhiteSpace(rootPath) ||
+            !string.Equals(
+                new DriveInfo(rootPath).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(
+                this,
+                "The target path must be on an NTFS volume.",
+                "Targeted Historical NTFS Recovery",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        var confirmation = MessageBox.Show(
+            this,
+            $"Targeted historical recovery will use:{Environment.NewLine}{Environment.NewLine}" +
+            $"File: {fullPath}{Environment.NewLine}" +
+            $"File reference: {fileReferenceNumber}{Environment.NewLine}" +
+            $"Parent reference: {parentFileReferenceNumber}{Environment.NewLine}{Environment.NewLine}" +
+            "This skips the historical USN-directory scan and goes directly to " +
+            "historical NTFS recovery sources.",
+            "Confirm Targeted Historical Recovery",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+
+        if (confirmation != DialogResult.Yes)
+        {
+            return;
+        }
+
+        await RecoverNtfsCandidatesAsync([candidate]);
+    }
+
     private void btnBrowseScanPath_Click(object? sender, EventArgs e)
     {
         using var dialog = new FolderBrowserDialog
