@@ -2632,6 +2632,11 @@ public sealed class NtfsMftDataReader
                 volumeInfo.RootPath,
                 overlapped: false);
 
+            // Recovery-time lookup is used for retained historical/pre-start
+            // references. Never fall back to a later reused MFT generation here:
+            // the current $DATA stream can belong to a different file incarnation.
+            const bool allowBoundedDeleteTransition = false;
+
             stream = ReadDefaultDataStream(
                 volumeInfo,
                 volumeHandle,
