@@ -672,7 +672,8 @@ public sealed class UsnJournalMonitor : IDisposable
                     record.FileReferenceNumber,
                     record.ParentFileReferenceNumber,
                     record.FileName,
-                    cachedDirectory ?? string.Empty);
+                    cachedDirectory ?? string.Empty,
+                    allowBoundedDeleteTransition: false);
 
                 var directory = cachedDirectory ??
                     ResolveParentDirectory(volumeHandle, record.ParentFileReferenceNumber);
@@ -737,7 +738,8 @@ public sealed class UsnJournalMonitor : IDisposable
         ulong fileReferenceNumber,
         ulong parentFileReferenceNumber,
         string fileName,
-        string directoryPath)
+        string directoryPath,
+        bool allowBoundedDeleteTransition = true)
     {
         try
         {
@@ -761,7 +763,8 @@ public sealed class UsnJournalMonitor : IDisposable
                     DeleteSnapshotMaxBytes,
                     out var stream,
                     out var capturedData,
-                    expectedDeletedAtUtc: deletion.DeletedAtUtc))
+                    expectedDeletedAtUtc: deletion.DeletedAtUtc,
+                    allowBoundedDeleteTransition: allowBoundedDeleteTransition))
             {
                 return;
             }
@@ -1019,16 +1022,21 @@ public sealed class UsnJournalMonitor : IDisposable
 
         var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
 
-        // The historical USN record already gives us the exact file and parent
-        // references. Do not perform another name/path lookup here; use those
-        // references directly while the deleted MFT data is still retained.
+        // This method is used for historical/pre-start deletions. The current MFT
+        // record may already have advanced to a later generation, so never treat a
+        // bounded sequence-transition match as a delete-time data snapshot.
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS historical deletion snapshot: current-MFT content capture is restricted to the exact " +
+            $"historical MFT sequence for fileRef={record.FileReferenceNumber}.");
+
         CaptureNtfsDeletionSnapshot(
             deletion,
             volumeKey,
             record.FileReferenceNumber,
             record.ParentFileReferenceNumber,
             record.FileName,
-            record.DirectoryPath);
+            record.DirectoryPath,
+            allowBoundedDeleteTransition: false);
 
         if (deletion.NtfsDataSnapshot is not null)
         {
