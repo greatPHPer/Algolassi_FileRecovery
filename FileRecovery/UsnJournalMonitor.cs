@@ -1020,14 +1020,42 @@ public sealed class UsnJournalMonitor : IDisposable
 
         var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
 
-        // This method is for historical/pre-start deletions. There is no trustworthy
-        // delete-time content snapshot once the application was not present to observe
-        // the deletion. Never read the current MFT $DATA stream here and call it a
-        // snapshot: its runlist can point at clusters that were later reused.
+        // A pre-start deletion can still be safely recovered when the exact deleted
+        // MFT generation is still physically present. The USN file reference contains
+        // the original sequence number, so this path must require an exact-generation
+        // MFT match and must NEVER accept the bounded sequence-transition fallback.
         //
-        // For plain text, the only historical content source attempted here is
-        // exact-generation $LogFile mapping history. Other formats continue through
-        // their normal historical metadata/recovery paths.
+        // This is materially different from accepting a later reused MFT record:
+        // ReadDefaultDataStream(..., allowBoundedDeleteTransition: false) validates the
+        // exact sequence/base reference before exposing the historical $DATA runlist.
+        CaptureNtfsDeletionSnapshot(
+            deletion,
+            volumeKey,
+            record.FileReferenceNumber,
+            record.ParentFileReferenceNumber,
+            record.FileName,
+            record.DirectoryPath,
+            allowBoundedDeleteTransition: false);
+
+        if (deletion.NtfsDataSnapshot is not null)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS historical exact-MFT snapshot: path={deletion.FullPath}, " +
+                $"fileRef={record.FileReferenceNumber}, " +
+                $"size={deletion.NtfsDataSnapshot.FileSizeBytes:N0}, " +
+                $"captured={deletion.NtfsDataSnapshot.IsComplete}, " +
+                $"snapshotFile={deletion.NtfsDataSnapshot.DataFileName ?? "(none)"}.");
+
+            if (deletion.NtfsDataSnapshot.IsComplete ||
+                deletion.NtfsDataSnapshot.FileSizeBytes > DeleteSnapshotMaxBytes)
+            {
+                return true;
+            }
+        }
+
+        // If the exact deleted MFT generation has already been reused or is otherwise
+        // unavailable, plain-text recovery falls through to exact file-reference
+        // $LogFile history. Do not substitute current-MFT data for either path.
         if (Path.GetExtension(record.FileName).Equals(
                 ".txt",
                 StringComparison.OrdinalIgnoreCase) &&
