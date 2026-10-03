@@ -18,6 +18,7 @@ public sealed class NtfsLogFileHistoricalDataService
 
     private const ushort OpenNonresidentAttribute = 0x001C;
     private const ushort UpdateResidentValue = 0x0007;
+    private const ushort UpdateNonresidentValue = 0x0008;
     private const ushort UpdateMappingPairs = 0x0009;
     private const ushort SetNewAttributeSizes = 0x000B;
     private const ushort DeallocateFileRecordSegment = 0x0003;
@@ -176,6 +177,23 @@ public sealed class NtfsLogFileHistoricalDataService
                     out var residentEvidence))
             {
                 evidence = residentEvidence;
+                return true;
+            }
+
+            // The open-attribute table can identify nonresident data updates
+            // even when the file-record initialization and mapping-pair records have
+            // already wrapped out of $LogFile. Reconstruct the file only when the
+            // logged write ranges are tied to this exact historical file reference
+            // and together cover the complete historical file size.
+            if (TryRecoverFromHistoricalNonresidentValueUpdates(
+                    records,
+                    fileReferenceNumber,
+                    fileSizeBytes,
+                    volumeInfo.BytesPerCluster,
+                    out data,
+                    out var nonresidentValueEvidence))
+            {
+                evidence = nonresidentValueEvidence;
                 return true;
             }
 
@@ -963,6 +981,218 @@ public sealed class NtfsLogFileHistoricalDataService
         }
 
         return definitions.Count > 0;
+    }
+
+    private static bool TryRecoverFromHistoricalNonresidentValueUpdates(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetFileReference,
+        long fileSizeBytes,
+        uint bytesPerCluster,
+        out byte[] data,
+        out string evidence)
+    {
+        data = [];
+        evidence = string.Empty;
+
+        if (fileSizeBytes <= 0 ||
+            fileSizeBytes > int.MaxValue ||
+            bytesPerCluster == 0)
+        {
+            return false;
+        }
+
+        var targetAttributeOpens =
+            new List<(ushort AttributeIndex, ulong FileReference, string AttributeName, ulong Lsn)>();
+
+        foreach (var record in records
+                     .Where(record => record.RedoOperation == OpenNonresidentAttribute &&
+                                      record.RedoData.Length > 0)
+                     .OrderBy(record => record.Lsn)
+                     .ThenBy(record => record.PhysicalOrder))
+        {
+            var references = ReadPossibleOpenAttributeFileReferences(
+                record.RedoData);
+
+            foreach (var fileReference in references)
+            {
+                targetAttributeOpens.Add(
+                    (
+                        record.TargetAttribute,
+                        fileReference,
+                        DecodeUnicodeString(record.UndoData),
+                        record.Lsn));
+            }
+        }
+
+        var exactOpens =
+            targetAttributeOpens
+                .Where(item =>
+                    item.FileReference == targetFileReference &&
+                    string.IsNullOrWhiteSpace(item.AttributeName))
+                .OrderBy(item => item.Lsn)
+                .ToList();
+
+        var candidateUpdates = new List<ParsedLogRecord>();
+
+        foreach (var record in records
+                     .Where(record =>
+                         record.RedoOperation == UpdateNonresidentValue &&
+                         record.RedoData.Length > 0)
+                     .OrderBy(record => record.Lsn)
+                     .ThenBy(record => record.PhysicalOrder))
+        {
+            var matchingOpen = exactOpens
+                .Where(open =>
+                    open.AttributeIndex == record.TargetAttribute &&
+                    open.Lsn <= record.Lsn)
+                .OrderByDescending(open => open.Lsn)
+                .FirstOrDefault();
+
+            if (matchingOpen != default)
+            {
+                candidateUpdates.Add(record);
+            }
+        }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile historical nonresident value scan: " +
+            $"fileRef={targetFileReference}, " +
+            $"size={fileSizeBytes:N0}, " +
+            $"exactOpenAttributes={exactOpens.Count:N0}, " +
+            $"candidateUpdates={candidateUpdates.Count:N0}.");
+
+        if (candidateUpdates.Count == 0)
+        {
+            evidence =
+                $"No exact-file OpenNonresidentAttribute mapping was retained for " +
+                $"file reference {targetFileReference}, or no UpdateNonresidentValue " +
+                "records were retained for that attribute.";
+            return false;
+        }
+
+        var recovered = new byte[checked((int)fileSizeBytes)];
+        var covered = new bool[recovered.Length];
+        var appliedUpdates = 0;
+
+        foreach (var record in candidateUpdates
+                     .OrderBy(item => item.Lsn)
+                     .ThenBy(item => item.PhysicalOrder))
+        {
+            var fileOffset =
+                checked(
+                    record.TargetVcn *
+                    (long)bytesPerCluster +
+                    record.ClusterBlockOffset * 512L);
+
+            if (fileOffset < 0 ||
+                fileOffset >= fileSizeBytes)
+            {
+                continue;
+            }
+
+            var bytesToCopy =
+                Math.Min(
+                    (long)record.RedoData.Length,
+                    fileSizeBytes - fileOffset);
+
+            if (bytesToCopy <= 0)
+            {
+                continue;
+            }
+
+            Buffer.BlockCopy(
+                record.RedoData,
+                0,
+                recovered,
+                checked((int)fileOffset),
+                checked((int)bytesToCopy));
+
+            Array.Fill(
+                covered,
+                true,
+                checked((int)fileOffset),
+                checked((int)bytesToCopy));
+
+            appliedUpdates++;
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile historical nonresident value candidate: " +
+                $"fileRef={targetFileReference}, " +
+                $"lsn=0x{record.Lsn:X16}, " +
+                $"targetAttribute=0x{record.TargetAttribute:X4}, " +
+                $"targetVcn={record.TargetVcn:N0}, " +
+                $"clusterBlockOffset={record.ClusterBlockOffset}, " +
+                $"fileOffset={fileOffset:N0}, " +
+                $"bytes={bytesToCopy:N0}.");
+        }
+
+        var uncovered = 0;
+        foreach (var value in covered)
+        {
+            if (!value)
+            {
+                uncovered++;
+                if (uncovered > 0)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (uncovered != 0)
+        {
+            evidence =
+                $"Found {candidateUpdates.Count:N0} exact-file UpdateNonresidentValue " +
+                $"record(s) and applied {appliedUpdates:N0}, but they did not cover " +
+                $"the complete {fileSizeBytes:N0}-byte historical file.";
+            return false;
+        }
+
+        data = recovered;
+        evidence =
+            $"Recovered {data.LongLength:N0} byte(s) entirely from exact-file NTFS " +
+            $"$LogFile UpdateNonresidentValue records. " +
+            $"Applied {appliedUpdates:N0} logged write range(s) with complete byte coverage.";
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile historical nonresident value recovery succeeded: " +
+            $"fileRef={targetFileReference}, " +
+            $"size={data.LongLength:N0}, " +
+            $"updates={appliedUpdates:N0}.");
+
+        return true;
+    }
+
+    private static IReadOnlyList<ulong> ReadPossibleOpenAttributeFileReferences(
+        byte[] redoData)
+    {
+        var references = new HashSet<ulong>();
+
+        if (redoData.Length >= 24)
+        {
+            var x64Reference =
+                BinaryPrimitives.ReadUInt64LittleEndian(
+                    redoData.AsSpan(16, 8));
+
+            if (x64Reference != 0)
+            {
+                references.Add(x64Reference);
+            }
+        }
+
+        if (redoData.Length >= 16)
+        {
+            var x86Reference =
+                BinaryPrimitives.ReadUInt64LittleEndian(
+                    redoData.AsSpan(8, 8));
+
+            if (x86Reference != 0)
+            {
+                references.Add(x86Reference);
+            }
+        }
+
+        return references.ToArray();
     }
 
     private static bool TryRecoverNonresidentDataFromHistoricalMftInitialization(
