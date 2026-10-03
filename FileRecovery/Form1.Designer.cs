@@ -12,6 +12,7 @@ partial class Form1
     private Button btnScanDirectory = null!;
     private Button btnScanNtfs = null!;
     private Button btnRawVolumeMarker = null!;
+    private Button btnTargetedHistorical = null!;
     private TextBox txtScanPath = null!;
     private Button btnBrowseScanPath = null!;
     private CheckBox chkScanSubdirectories = null!;
@@ -48,6 +49,7 @@ partial class Form1
         btnScanDirectory = new Button();
         btnScanNtfs = new Button();
         btnRawVolumeMarker = new Button();
+        btnTargetedHistorical = new Button();
         txtScanPath = new TextBox();
         btnBrowseScanPath = new Button();
         chkScanSubdirectories = new CheckBox();
@@ -137,6 +139,12 @@ partial class Form1
         btnRawVolumeMarker.Text = "Raw Volume Marker Test";
         btnRawVolumeMarker.UseVisualStyleBackColor = true;
         btnRawVolumeMarker.Click += btnRawVolumeMarker_Click;
+
+        btnTargetedHistorical.Location = new Point(870, 158);
+        btnTargetedHistorical.Size = new Size(150, 36);
+        btnTargetedHistorical.Text = "Targeted Historical";
+        btnTargetedHistorical.UseVisualStyleBackColor = true;
+        btnTargetedHistorical.Click += btnTargetedHistorical_Click;
 
         chkScanSubdirectories.AutoSize = true;
         chkScanSubdirectories.Checked = true;
@@ -230,6 +238,7 @@ partial class Form1
         Controls.Add(chkScanSubdirectories);
         Controls.Add(btnScanNtfs);
         Controls.Add(btnRawVolumeMarker);
+        Controls.Add(btnTargetedHistorical);
         Controls.Add(btnBrowseScanPath);
         Controls.Add(txtScanPath);
         Controls.Add(btnClearHistory);
