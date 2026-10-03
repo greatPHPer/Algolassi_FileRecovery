@@ -19,6 +19,7 @@ internal sealed class RecoveryDiagnosticTraceListener : TraceListener
         "NTFS raw-MFT target:",
         "NTFS historical",
         "NTFS $LogFile historical",
+        "NTFS $LogFile marker diagnostic",
         "NTFS recovery-time $LogFile",
         "UpdateNonresidentValue",
         "historical nonresident value",
