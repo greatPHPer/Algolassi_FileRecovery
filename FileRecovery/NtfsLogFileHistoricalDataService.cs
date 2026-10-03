@@ -32,6 +32,185 @@ public sealed class NtfsLogFileHistoricalDataService
     private const int RecordHeaderMinimumLength = 48;
     private const long MaxLogBytesToRead = 128L * 1024L * 1024L;
 
+    public bool TryFindMarkerInHistoricalLogFile(
+        string rootPath,
+        string marker,
+        out string evidence)
+    {
+        evidence = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(rootPath) ||
+            string.IsNullOrWhiteSpace(marker))
+        {
+            evidence = "A source volume and marker are required.";
+            return false;
+        }
+
+        var normalizedRoot = GetNtfsVolumeRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(normalizedRoot))
+        {
+            evidence = "The source path is not on a valid NTFS volume.";
+            return false;
+        }
+
+        try
+        {
+            WindowsPrivilege.EnableSeBackupPrivilege();
+
+            var volumeInfo = new NtfsVolumeInspector().Inspect(normalizedRoot);
+
+            using var metadataHandle = CreateVolumeHandle(
+                normalizedRoot,
+                overlapped: false);
+
+            using var rawHandle = CreateVolumeHandle(
+                normalizedRoot,
+                overlapped: true);
+
+            var reader = new NtfsMftDataReader();
+            var logStream = reader.ReadMetadataFileDataStream(
+                volumeInfo,
+                metadataHandle,
+                2);
+
+            if (!logStream.Found ||
+                logStream.IsResident ||
+                logStream.Extents.Count == 0 ||
+                logStream.FileSizeBytes <= 0)
+            {
+                evidence = "NTFS $LogFile did not expose a usable nonresident $DATA stream.";
+                return false;
+            }
+
+            var logicalLength = Math.Min(
+                logStream.FileSizeBytes,
+                MaxLogBytesToRead);
+
+            var logData = ReadMappedLogicalFile(
+                rawHandle,
+                volumeInfo.BytesPerCluster,
+                logStream.Extents,
+                logicalLength);
+
+            var markerVariants = new[]
+            {
+                (
+                    Encoding: "UTF-8",
+                    Bytes: System.Text.Encoding.UTF8.GetBytes(marker)),
+                (
+                    Encoding: "UTF-16LE",
+                    Bytes: System.Text.Encoding.Unicode.GetBytes(marker)),
+                (
+                    Encoding: "UTF-16BE",
+                    Bytes: System.Text.Encoding.BigEndianUnicode.GetBytes(marker))
+            };
+
+            var rawMatches = new List<string>();
+            foreach (var variant in markerVariants)
+            {
+                var offset = logData.AsSpan().IndexOf(variant.Bytes);
+                if (offset >= 0)
+                {
+                    rawMatches.Add(
+                        $"{variant.Encoding}@{offset:N0}");
+                }
+            }
+
+            var geometryOk = TryReadGeometry(
+                logData,
+                volumeInfo.BytesPerSector,
+                out var geometry,
+                out _);
+
+            var redoMatches = new List<string>();
+            var undoMatches = new List<string>();
+
+            if (geometryOk)
+            {
+                ApplyFastPages(
+                    logData,
+                    geometry,
+                    volumeInfo.BytesPerSector);
+
+                var records = ParseRecords(
+                    logData,
+                    geometry,
+                    volumeInfo.BytesPerSector);
+
+                foreach (var record in records)
+                {
+                    foreach (var variant in markerVariants)
+                    {
+                        var redoOffset = record.RedoData.AsSpan().IndexOf(variant.Bytes);
+                        if (redoOffset >= 0)
+                        {
+                            redoMatches.Add(
+                                $"encoding={variant.Encoding}, " +
+                                $"lsn=0x{record.Lsn:X16}, " +
+                                $"targetAttribute=0x{record.TargetAttribute:X4}, " +
+                                $"targetVcn={record.TargetVcn:N0}, " +
+                                $"clusterBlockOffset={record.ClusterBlockOffset}, " +
+                                $"recordOffset={record.RecordOffset}, " +
+                                $"redoOffset={redoOffset:N0}, " +
+                                $"bytes={record.RedoData.Length:N0}");
+                        }
+
+                        var undoOffset = record.UndoData.AsSpan().IndexOf(variant.Bytes);
+                        if (undoOffset >= 0)
+                        {
+                            undoMatches.Add(
+                                $"encoding={variant.Encoding}, " +
+                                $"lsn=0x{record.Lsn:X16}, " +
+                                $"targetAttribute=0x{record.TargetAttribute:X4}, " +
+                                $"targetVcn={record.TargetVcn:N0}, " +
+                                $"clusterBlockOffset={record.ClusterBlockOffset}, " +
+                                $"recordOffset={record.RecordOffset}, " +
+                                $"undoOffset={undoOffset:N0}, " +
+                                $"bytes={record.UndoData.Length:N0}");
+                        }
+                    }
+                }
+            }
+
+            var found =
+                rawMatches.Count > 0 ||
+                redoMatches.Count > 0 ||
+                undoMatches.Count > 0;
+
+            evidence =
+                $"$LogFile bytes={logData.LongLength:N0}; " +
+                $"rawMarkerMatches={rawMatches.Count:N0}" +
+                (rawMatches.Count > 0
+                    ? $" [{string.Join("; ", rawMatches.Take(6))}]"
+                    : string.Empty) +
+                $"; redoMarkerMatches={redoMatches.Count:N0}" +
+                (redoMatches.Count > 0
+                    ? $" [{string.Join("; ", redoMatches.Take(6))}]"
+                    : string.Empty) +
+                $"; undoMarkerMatches={undoMatches.Count:N0}" +
+                (undoMatches.Count > 0
+                    ? $" [{string.Join("; ", undoMatches.Take(6))}]"
+                    : string.Empty);
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile marker diagnostic: markerLength={marker.Length:N0}, " +
+                $"found={found}, {evidence}");
+
+            return found;
+        }
+        catch (Exception ex)
+        {
+            evidence =
+                $"$LogFile marker diagnostic failed: " +
+                $"{ex.GetType().Name}: {ex.Message}";
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile marker diagnostic exception: {evidence}");
+
+            return false;
+        }
+    }
+
     public bool TryRecoverFileData(
         string rootPath,
         ulong fileReferenceNumber,
