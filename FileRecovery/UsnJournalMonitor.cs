@@ -47,6 +47,7 @@ public sealed class UsnJournalMonitor : IDisposable
 
     private Task? _worker;
     private bool _started;
+    private DateTime _monitorStartedAtUtc;
 
     public event EventHandler<DeletionDetectedEventArgs>? DeletionDetected;
     public event EventHandler<string>? StatusChanged;
@@ -90,6 +91,12 @@ public sealed class UsnJournalMonitor : IDisposable
             // Shift+Deleted before the background USN worker had established its
             // first cursor, leaving the history row without an NTFS reference.
             ArmInitialCursors();
+
+            // Only deletions occurring after this point are eligible for a
+            // delete-time snapshot. A file deleted before the application started
+            // is historical/pre-start data and must not be captured from a later
+            // reused MFT record and mislabeled as a live snapshot.
+            _monitorStartedAtUtc = DateTime.UtcNow;
 
             _started = true;
             _worker = Task.Run(MonitorAllVolumesAsync);
@@ -666,15 +673,6 @@ public sealed class UsnJournalMonitor : IDisposable
                     RecoveryStrength = "Weak"
                 };
 
-                CaptureNtfsDeletionSnapshot(
-                    deletion,
-                    volumeKey,
-                    record.FileReferenceNumber,
-                    record.ParentFileReferenceNumber,
-                    record.FileName,
-                    cachedDirectory ?? string.Empty,
-                    allowBoundedDeleteTransition: false);
-
                 var directory = cachedDirectory ??
                     ResolveParentDirectory(volumeHandle, record.ParentFileReferenceNumber);
 
@@ -1022,44 +1020,14 @@ public sealed class UsnJournalMonitor : IDisposable
 
         var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
 
-        // This method is used for historical/pre-start deletions. The current MFT
-        // record may already have advanced to a later generation, so never treat a
-        // bounded sequence-transition match as a delete-time data snapshot.
-        System.Diagnostics.Debug.WriteLine(
-            $"NTFS historical deletion snapshot: current-MFT content capture is restricted to the exact " +
-            $"historical MFT sequence for fileRef={record.FileReferenceNumber}.");
-
-        CaptureNtfsDeletionSnapshot(
-            deletion,
-            volumeKey,
-            record.FileReferenceNumber,
-            record.ParentFileReferenceNumber,
-            record.FileName,
-            record.DirectoryPath,
-            allowBoundedDeleteTransition: false);
-
-        if (deletion.NtfsDataSnapshot is not null)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"NTFS historical deletion snapshot: path={deletion.FullPath}, " +
-                $"fileRef={record.FileReferenceNumber}, " +
-                $"size={deletion.NtfsDataSnapshot.FileSizeBytes:N0}, " +
-                $"captured={deletion.NtfsDataSnapshot.IsComplete}, " +
-                $"snapshotFile={deletion.NtfsDataSnapshot.DataFileName ?? "(none)"}.");
-
-            if (deletion.NtfsDataSnapshot.IsComplete ||
-                deletion.NtfsDataSnapshot.FileSizeBytes > DeleteSnapshotMaxBytes)
-            {
-                return true;
-            }
-        }
-
-        // Once the deleted MFT segment has been reused, the exact $DATA stream may
-        // no longer be available from the MFT. For plain text, use the exact USN
-        // file reference as the identity anchor and follow that file reference into
-        // NTFS $LogFile open-attribute and UpdateMappingPairs records. This is not
-        // size-only carving: the historical cluster chain must belong to this exact
-        // deleted file reference before any bytes are returned.
+        // This method is for historical/pre-start deletions. There is no trustworthy
+        // delete-time content snapshot once the application was not present to observe
+        // the deletion. Never read the current MFT $DATA stream here and call it a
+        // snapshot: its runlist can point at clusters that were later reused.
+        //
+        // For plain text, the only historical content source attempted here is
+        // exact-generation $LogFile mapping history. Other formats continue through
+        // their normal historical metadata/recovery paths.
         if (Path.GetExtension(record.FileName).Equals(
                 ".txt",
                 StringComparison.OrdinalIgnoreCase) &&
@@ -1190,6 +1158,16 @@ public sealed class UsnJournalMonitor : IDisposable
             string.IsNullOrWhiteSpace(deletion.FullPath) ||
             string.IsNullOrWhiteSpace(deletion.FileName))
         {
+            return false;
+        }
+
+        if (deletion.DeletedAtUtc != default &&
+            _monitorStartedAtUtc != default &&
+            deletion.DeletedAtUtc < _monitorStartedAtUtc)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: skipped pre-start deletion path={deletion.FullPath}, " +
+                $"historyTime={deletion.DeletedAtUtc:O}, monitorStarted={_monitorStartedAtUtc:O}.");
             return false;
         }
 
