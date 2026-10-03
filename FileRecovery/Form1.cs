@@ -503,6 +503,24 @@ public partial class Form1 : Form
             return;
         }
 
+        var fileSizeText = Microsoft.VisualBasic.Interaction.InputBox(
+            "Enter the exact historical file size in bytes.",
+            "Targeted Historical NTFS Recovery",
+            "1048576");
+
+        if (!long.TryParse(fileSizeText, out var historicalFileSize) ||
+            historicalFileSize <= 0 ||
+            historicalFileSize > int.MaxValue)
+        {
+            MessageBox.Show(
+                this,
+                "The historical file size is invalid.",
+                "Targeted Historical NTFS Recovery",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
         var fileName = Path.GetFileName(fullPath);
         var directory = Path.GetDirectoryName(fullPath) ?? string.Empty;
 
@@ -519,8 +537,8 @@ public partial class Form1 : Form
                 "file reference and parent reference supplied for diagnostic recovery.",
             DataStreamFound = false,
             DataStreamResident = false,
-            FileSizeBytes = 0,
-            ValidDataLengthBytes = 0,
+            FileSizeBytes = historicalFileSize,
+            ValidDataLengthBytes = historicalFileSize,
             ResidentData = null,
             DataExtents = [],
             ExtentAllocations = [],
@@ -552,7 +570,8 @@ public partial class Form1 : Form
             $"Targeted historical recovery will use:{Environment.NewLine}{Environment.NewLine}" +
             $"File: {fullPath}{Environment.NewLine}" +
             $"File reference: {fileReferenceNumber}{Environment.NewLine}" +
-            $"Parent reference: {parentFileReferenceNumber}{Environment.NewLine}{Environment.NewLine}" +
+            $"Parent reference: {parentFileReferenceNumber}{Environment.NewLine}" +
+            $"Historical size: {historicalFileSize:N0} bytes{Environment.NewLine}{Environment.NewLine}" +
             "This skips the historical USN-directory scan and goes directly to " +
             "historical NTFS recovery sources.",
             "Confirm Targeted Historical Recovery",
