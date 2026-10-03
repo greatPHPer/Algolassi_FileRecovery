@@ -1041,14 +1041,19 @@ public sealed class NtfsLogFileHistoricalDataService
                      .OrderBy(record => record.Lsn)
                      .ThenBy(record => record.PhysicalOrder))
         {
-            var matchingOpen = exactOpens
+            // The open-attribute table index is reusable. Resolve the most recent
+            // OpenNonresidentAttribute for this exact index, then require that the
+            // currently opened attribute still belongs to the target file reference.
+            var latestOpen = targetAttributeOpens
                 .Where(open =>
                     open.AttributeIndex == record.TargetAttribute &&
                     open.Lsn <= record.Lsn)
                 .OrderByDescending(open => open.Lsn)
                 .FirstOrDefault();
 
-            if (matchingOpen != default)
+            if (latestOpen != default &&
+                latestOpen.FileReference == targetFileReference &&
+                string.IsNullOrWhiteSpace(latestOpen.AttributeName))
             {
                 candidateUpdates.Add(record);
             }
