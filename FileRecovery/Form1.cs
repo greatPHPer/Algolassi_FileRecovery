@@ -1456,6 +1456,10 @@ public partial class Form1 : Form
             // The snapshot was captured at delete time, before MFT sequence reuse.
             foreach (var candidate in candidates)
             {
+                // When the candidate has an authoritative NTFS file reference,
+                // require the deletion snapshot to belong to that exact reference.
+                // Falling back to path/time here can attach a snapshot from another
+                // deletion of the same filename.
                 var snapshotMatch = candidate.FileReferenceNumber != 0
                     ? historyRecords
                         .Where(record =>
@@ -1467,20 +1471,19 @@ public partial class Form1 : Form
                                 (record.DeletedAtUtc - candidate.LastUsnTimestampUtc)
                                     .TotalMinutes))
                         .FirstOrDefault()
-                    : null;
-
-                snapshotMatch ??= historyRecords
-                    .Where(record =>
-                        record.NtfsDataSnapshot is not null &&
-                        string.Equals(
-                            NormalizeForComparison(record.FullPath),
-                            NormalizeForComparison(candidate.FullPath),
-                            StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(record =>
-                        Math.Abs(
-                            (record.DeletedAtUtc - candidate.LastUsnTimestampUtc)
-                                .TotalMinutes))
-                    .FirstOrDefault();
+                    : historyRecords
+                        .Where(record =>
+                            !record.FileReferenceNumber.HasValue &&
+                            record.NtfsDataSnapshot is not null &&
+                            string.Equals(
+                                NormalizeForComparison(record.FullPath),
+                                NormalizeForComparison(candidate.FullPath),
+                                StringComparison.OrdinalIgnoreCase))
+                        .OrderBy(record =>
+                            Math.Abs(
+                                (record.DeletedAtUtc - candidate.LastUsnTimestampUtc)
+                                    .TotalMinutes))
+                        .FirstOrDefault();
 
                 if (snapshotMatch?.NtfsDataSnapshot is not null &&
                     (candidate.LastUsnTimestampUtc == default ||
