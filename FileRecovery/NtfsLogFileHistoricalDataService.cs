@@ -30,7 +30,12 @@ public sealed class NtfsLogFileHistoricalDataService
     private const uint NtfsAttributeTypeData = 0x00000080;
     private const uint LfsClientRecord = 0x0001;
     private const int RecordHeaderMinimumLength = 48;
-    // Marker searches intentionally stay bounded. Targeted historical recovery\n    // must read the complete retained $LogFile because the deletion transaction\n    // may be anywhere in the circular journal. The known-good V10 run required\n    // the full 671,088,640-byte logical $LogFile.\n    private const long MaxLogBytesToRead = 128L * 1024L * 1024L;\n    private const long MaxHistoricalRecoveryLogBytes = 1L * 1024L * 1024L * 1024L;
+    // Marker searches intentionally stay bounded. Targeted historical recovery
+    // must read the complete retained $LogFile because the deletion transaction
+    // may be anywhere in the circular journal. The known-good V10 run required
+    // the full 671,088,640-byte logical $LogFile.
+    private const long MaxLogBytesToRead = 128L * 1024L * 1024L;
+    private const long MaxHistoricalRecoveryLogBytes = 1L * 1024L * 1024L * 1024L;
 
     // Only retain operations that can contribute to targeted historical recovery.
     // The marker diagnostic intentionally uses the unfiltered parser because it is
