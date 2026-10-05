@@ -2931,46 +2931,10 @@ public partial class Form1 : Form
                         $"reason={vssEvidence}");
                 }
 
-                // The current MFT can be reused while exact historical
-                                // $LogFile transaction evidence still retains the original bytes.
-                                // Try that evidence before asking for a text marker. The historical
-                                // service validates the exact file reference and can infer the file
-                                // size from the same historical MFT generation when the normal
-                                // $FILE_NAME size is unavailable.
-                                if (!candidate.DataStreamFound &&
-                                    candidate.FileReferenceNumber != 0 &&
-                                    candidate.ParentFileReferenceNumber != 0)
-                                {
-                                    var historicalLogProgress =
-                                        new Progress<string>(message =>
-                                            SetBusy(
-                                                true,
-                                                message));
-
-                                    var historicalLogResult =
-                                        await Task.Run(
-                                            () =>
-                                            {
-                                                var recovered =
-                                                    TryRecoverFromHistoricalLogFileData(
-                                                        candidate,
-                                                        destinationDirectory,
-                                                        historicalLogProgress,
-                                                        CancellationToken.None,
-                                                        out var recoveryResult);
-
-                                                return (Recovered: recovered, Result: recoveryResult);
-                                            },
-                                            CancellationToken.None)
-                                            .ConfigureAwait(true);
-
-                                    if (historicalLogResult.Recovered)
-                                    {
-                                        successes.Add(historicalLogResult.Result);
-                                        continue;
-                                    }
-                                }
-
+                // A complete delete-time NTFS snapshot is the highest-fidelity source for
+                // a freshly deleted file. It was captured before later MFT generation reuse or
+                // cluster reuse could change the bytes, so Recovery Center must consume it before
+                // attempting any reconstructive source such as $LogFile.
                 if (TryRecoverFromNtfsSnapshot(
                         candidate,
                         destinationDirectory,
@@ -2978,6 +2942,46 @@ public partial class Form1 : Form
                 {
                     successes.Add(snapshotRecovery);
                     continue;
+                }
+
+                // The current MFT can be reused while exact historical
+                // $LogFile transaction evidence still retains the original bytes.
+                // Try that evidence before asking for a text marker. The historical
+                // service validates the exact file reference and can infer the file
+                // size from the same historical MFT generation when the normal
+                // $FILE_NAME size is unavailable.
+                if (!candidate.DataStreamFound &&
+                    candidate.FileReferenceNumber != 0 &&
+                    candidate.ParentFileReferenceNumber != 0)
+                {
+                    var historicalLogProgress =
+                        new Progress<string>(message =>
+                            SetBusy(
+                                true,
+                                message));
+
+                    var historicalLogResult =
+                        await Task.Run(
+                            () =>
+                            {
+                                var recovered =
+                                    TryRecoverFromHistoricalLogFileData(
+                                        candidate,
+                                        destinationDirectory,
+                                        historicalLogProgress,
+                                        CancellationToken.None,
+                                        out var recoveryResult);
+
+                                return (Recovered: recovered, Result: recoveryResult);
+                            },
+                            CancellationToken.None)
+                            .ConfigureAwait(true);
+
+                    if (historicalLogResult.Recovered)
+                    {
+                        successes.Add(historicalLogResult.Result);
+                        continue;
+                    }
                 }
 
                 if (candidate.DataStreamFound)
