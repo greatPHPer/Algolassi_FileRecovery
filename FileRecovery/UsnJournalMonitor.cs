@@ -2760,6 +2760,7 @@ public sealed class UsnJournalMonitor : IDisposable
     public void Dispose()
     {
         Stop();
+        _historicalLogFileSnapshotGate.Dispose();
         _cts.Dispose();
     }
 
