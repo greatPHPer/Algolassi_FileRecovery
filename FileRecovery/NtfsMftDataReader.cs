@@ -59,15 +59,7 @@ public sealed class NtfsMftDataReader
                 volumeInfo.RootPath,
                 overlapped: true);
 
-            // expectedFileSizeBytes is captured before the live delete event reaches
-        // this reader. Preserve it through the MFT path so a reused record whose
-        // historical $FILE_NAME size has already been lost can still use the
-        // authoritative deletion-time size for narrow historical/slack validation.
-        if (expectedFileSizeBytes < 0)
-        {
-            expectedFileSizeBytes = 0;
-        }
-        var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
+            var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
 
             // This is deliberately a forensic slack read. We do not accept the
             // current MFT sequence as the historical record because the USN sequence
@@ -2687,8 +2679,16 @@ public sealed class NtfsMftDataReader
         ulong? expectedParentFileReferenceNumber = null,
         string? expectedFullPath = null,
         DateTime expectedDeletedAtUtc = default,
-        bool allowBoundedDeleteTransition = true)
+        bool allowBoundedDeleteTransition = true,
+        long expectedFileSizeBytes = 0)
     {
+        // A deletion-time size captured before the file disappeared can remain
+        // authoritative even when the current/reused MFT $FILE_NAME size is gone.
+        if (expectedFileSizeBytes < 0)
+        {
+            expectedFileSizeBytes = 0;
+        }
+
         var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
         var sequenceNumber = (ushort)(fileReferenceNumber >> 48);
 
