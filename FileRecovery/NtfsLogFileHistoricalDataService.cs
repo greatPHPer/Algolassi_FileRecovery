@@ -217,6 +217,8 @@ public sealed class NtfsLogFileHistoricalDataService
         string expectedFileName,
         long fileSizeBytes,
         long maxCaptureBytes,
+        IProgress<string>? progress = null,
+        CancellationToken cancellationToken = default,
         out byte[] data,
         out string evidence)
     {
@@ -274,11 +276,22 @@ public sealed class NtfsLogFileHistoricalDataService
                 logStream.FileSizeBytes,
                 MaxLogBytesToRead);
 
+            progress?.Report(
+                $"Reading historical NTFS $LogFile for {expectedFileName}... " +
+                $"{logicalLength / (1024d * 1024d):0} MB journal data");
+
             var logData = ReadMappedLogicalFile(
                 rawHandle,
                 volumeInfo.BytesPerCluster,
                 logStream.Extents,
-                logicalLength);
+                logicalLength,
+                progress,
+                cancellationToken);
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            progress?.Report(
+                $"Parsing historical NTFS $LogFile for {expectedFileName}...");
 
             if (!TryReadGeometry(
                     logData,
@@ -299,6 +312,11 @@ public sealed class NtfsLogFileHistoricalDataService
                 logData,
                 geometry,
                 volumeInfo.BytesPerSector);
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            progress?.Report(
+                $"Searching historical NTFS transactions for {expectedFileName}...");
 
             // When the retained $FILE_NAME size is unavailable, recover the size
             // from the exact historical MFT generation in $LogFile. A retained
@@ -325,6 +343,9 @@ public sealed class NtfsLogFileHistoricalDataService
 
                 fileSizeBytes = inferredSize;
 
+                progress?.Report(
+                    $"Historical size recovered for {expectedFileName}: {fileSizeBytes:N0} bytes.");
+
                 System.Diagnostics.Trace.WriteLine(
                     $"NTFS $LogFile historical size inferred from MFT generation: " +
                     $"fileRef={fileReferenceNumber}, " +
@@ -346,6 +367,9 @@ public sealed class NtfsLogFileHistoricalDataService
             // Small plain-text files normally keep their $DATA value resident
             // inside the MFT record. UpdateMappingPairs only covers nonresident
             // data, so try the exact historical UpdateResidentValue records first.
+            progress?.Report(
+                $"Checking historical resident $DATA for {expectedFileName}...");
+
             if (TryRecoverResidentFileData(
                     records,
                     fileReferenceNumber,
@@ -364,6 +388,9 @@ public sealed class NtfsLogFileHistoricalDataService
             // already wrapped out of $LogFile. Reconstruct the file only when the
             // logged write ranges are tied to this exact historical file reference
             // and together cover the complete historical file size.
+            progress?.Report(
+                $"Checking historical nonresident data updates for {expectedFileName}...");
+
             if (TryRecoverFromHistoricalNonresidentValueUpdates(
                     records,
                     fileReferenceNumber,
@@ -381,6 +408,9 @@ public sealed class NtfsLogFileHistoricalDataService
             // $LogFile journal window contains no later UpdateMappingPairs record.
             // For reused deleted MFT segments this is still an exact identity link:
             // the FILE record sequence must match the original USN file reference.
+            progress?.Report(
+                $"Checking historical MFT initialization for {expectedFileName}...");
+
             if (TryRecoverNonresidentDataFromHistoricalMftInitialization(
                     records,
                     fileReferenceNumber,
@@ -399,6 +429,9 @@ public sealed class NtfsLogFileHistoricalDataService
             // released by a deletion even when the historical MFT $DATA runlist
             // is no longer present. Accept only an exact single-range match tied
             // to the same MFT deallocation transaction and still free now.
+            progress?.Report(
+                $"Checking historical bitmap deallocation for {expectedFileName}...");
+
             if (TryRecoverFromHistoricalBitmapClear(
                     records,
                     fileReferenceNumber,
@@ -414,6 +447,9 @@ public sealed class NtfsLogFileHistoricalDataService
                 evidence = bitmapEvidence;
                 return true;
             }
+
+            progress?.Report(
+                $"Checking historical mapping pairs for {expectedFileName}...");
 
             var mappingCandidates =
                 FindTargetMappingCandidates(
@@ -3037,7 +3073,9 @@ public sealed class NtfsLogFileHistoricalDataService
         SafeFileHandle volumeHandle,
         uint bytesPerCluster,
         IReadOnlyList<NtfsDataExtent> extents,
-        long logicalLength)
+        long logicalLength,
+        IProgress<string>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         if (logicalLength <= 0 ||
             logicalLength > int.MaxValue)
@@ -3051,6 +3089,9 @@ public sealed class NtfsLogFileHistoricalDataService
         var destinationOffset = 0;
         var remaining = logicalLength;
 
+        const int ioChunkBytes = 8 * 1024 * 1024;
+        long totalRead = 0;
+
         foreach (var extent in extents.OrderBy(
                      item => item.VirtualClusterNumber))
         {
@@ -3059,34 +3100,60 @@ public sealed class NtfsLogFileHistoricalDataService
                     extent.ClusterCount *
                     (long)bytesPerCluster);
 
-            var bytesToRead =
+            var extentRemaining =
                 Math.Min(
                     extentBytes,
                     remaining);
 
-            if (bytesToRead <= 0)
+            if (extentRemaining <= 0)
             {
                 break;
             }
 
-            if (!extent.IsSparse)
+            var extentOffset = 0L;
+
+            while (extentRemaining > 0)
             {
-                ReadRawExact(
-                    volumeHandle,
-                    checked(
-                        extent.LogicalClusterNumber *
-                        (long)bytesPerCluster),
-                    result,
-                    destinationOffset,
-                    checked((int)bytesToRead));
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var chunkBytes = checked(
+                    (int)Math.Min(
+                        extentRemaining,
+                        ioChunkBytes));
+
+                if (!extent.IsSparse)
+                {
+                    ReadRawExact(
+                        volumeHandle,
+                        checked(
+                            extent.LogicalClusterNumber *
+                            (long)bytesPerCluster +
+                            extentOffset),
+                        result,
+                        destinationOffset,
+                        chunkBytes);
+                }
+
+                destinationOffset = checked(
+                    destinationOffset + chunkBytes);
+
+                extentOffset = checked(
+                    extentOffset + chunkBytes);
+
+                extentRemaining -= chunkBytes;
+                remaining -= chunkBytes;
+                totalRead += chunkBytes;
+
+                progress?.Report(
+                    $"Reading historical NTFS $LogFile... " +
+                    $"{totalRead / (1024d * 1024d):0} / " +
+                    $"{logicalLength / (1024d * 1024d):0} MB");
+
+                if (remaining == 0)
+                {
+                    break;
+                }
             }
-
-            destinationOffset =
-                checked(
-                    destinationOffset +
-                    (int)bytesToRead);
-
-            remaining -= bytesToRead;
 
             if (remaining == 0)
             {
