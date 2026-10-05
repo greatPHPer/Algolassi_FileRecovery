@@ -111,14 +111,14 @@ public sealed class DeletionMonitor : IDisposable
     {
         long? originalSize = null;
 
-        if (!string.IsNullOrWhiteSpace(e.OldFullPath) &&
-            _knownSizes.TryRemove(e.OldFullPath, out var cachedSize))
+        var oldPath = NormalizePath(e.OldFullPath);
+        var newPath = NormalizePath(e.FullPath);
+
+        if (!string.IsNullOrWhiteSpace(oldPath) &&
+            _knownSizes.TryRemove(oldPath, out var cachedSize))
         {
             originalSize = cachedSize;
         }
-
-        var oldPath = NormalizePath(e.OldFullPath);
-        var newPath = NormalizePath(e.FullPath);
 
         // A normal Delete performed through Windows Explorer commonly moves the
         // file into the volume's Recycle Bin rather than generating a direct
@@ -189,11 +189,11 @@ public sealed class DeletionMonitor : IDisposable
 
     private void OnDeleted(object sender, FileSystemEventArgs e)
     {
-        long? size = _knownSizes.TryRemove(e.FullPath, out var cachedSize)
+        var fullPath = NormalizePath(e.FullPath);
+
+        long? size = _knownSizes.TryRemove(fullPath, out var cachedSize)
             ? cachedSize
             : null;
-
-        var fullPath = NormalizePath(e.FullPath);
         if (RecoveryMonitoringExclusions.IsExcludedPath(fullPath))
         {
             return;
@@ -298,8 +298,9 @@ public sealed class DeletionMonitor : IDisposable
                 return;
             }
 
-            var info = new FileInfo(path);
-            _knownSizes[path] = info.Length;
+            var normalizedPath = NormalizePath(path);
+            var info = new FileInfo(normalizedPath);
+            _knownSizes[normalizedPath] = info.Length;
         }
         catch
         {
