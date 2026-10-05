@@ -124,13 +124,25 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        if (!e.Historical &&
-            !e.Record.FileReferenceNumber.HasValue &&
+        // FileSystemWatcher normally gives us the first live event, but the
+        // USN monitor can be the first/only source when the watcher buffer is busy.
+        // A fresh USN delete (known file reference and very recent timestamp) must
+        // receive the same deletion-time snapshot treatment without turning an old
+        // historical directory scan into hundreds of expensive captures.
+        var isFreshUsnDelete =
+            e.Record.FileReferenceNumber.HasValue &&
+            e.Record.ParentFileReferenceNumber.HasValue &&
+            e.Record.DeletedAtUtc != default &&
+            Math.Abs((DateTime.UtcNow - e.Record.DeletedAtUtc).TotalSeconds) <= 30;
+
+        if ((!e.Historical && !e.Record.FileReferenceNumber.HasValue || isFreshUsnDelete) &&
             !string.IsNullOrWhiteSpace(e.Record.FullPath))
         {
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS immediate live path triggered: path={e.Record.FullPath}, " +
                 $"historyTime={e.Record.DeletedAtUtc:O}, " +
+                $"historical={e.Historical}, " +
+                $"fileRef={e.Record.FileReferenceNumber?.ToString() ?? "(unknown)"}, " +
                 $"knownSize={e.Record.FileSizeBytes?.ToString("N0") ?? "(unknown)"}.");
 
             _ = Task.Run(async () =>
