@@ -2745,7 +2745,7 @@ public sealed class NtfsLogFileHistoricalDataService
                     if (operationFilter is not null &&
                         !operationFilter.Contains(
                             BinaryPrimitives.ReadUInt16LittleEndian(
-                                clientDataSpan.Slice(0, 2)) &&
+                                clientDataSpan.Slice(0, 2))) &&
                         !operationFilter.Contains(
                             BinaryPrimitives.ReadUInt16LittleEndian(
                                 clientDataSpan.Slice(2, 2))))
