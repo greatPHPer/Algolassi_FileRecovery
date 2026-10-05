@@ -103,6 +103,11 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private async void OnDeletionDetected(object? sender, DeletionDetectedEventArgs e)
     {
+        if (RecoveryMonitoringExclusions.IsExcludedPath(e.Record.FullPath))
+        {
+            return;
+        }
+
         bool wasExisting;
 
         try
