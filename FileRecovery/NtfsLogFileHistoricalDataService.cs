@@ -344,6 +344,15 @@ public sealed class NtfsLogFileHistoricalDataService
 
             cancellationToken.ThrowIfCancellationRequested();
 
+            // Emit a compact target-file evidence inventory before any recovery
+            // decision is made. This is diagnostic only: it deliberately does not
+            // relax MFT sequence validation or infer bytes from an ambiguous record.
+            TraceTargetHistoricalEvidence(
+                records,
+                fileReferenceNumber,
+                volumeInfo.BytesPerCluster,
+                volumeInfo.BytesPerFileRecordSegment);
+
             progress?.Report(
                 $"Searching historical NTFS transactions for {expectedFileName}...");
 
@@ -1225,6 +1234,176 @@ public sealed class NtfsLogFileHistoricalDataService
         }
 
         return definitions.Count > 0;
+    }
+
+    private static void TraceTargetHistoricalEvidence(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetFileReference,
+        uint bytesPerCluster,
+        uint bytesPerFileRecordSegment)
+    {
+        var targetSegment =
+            targetFileReference &
+            0x0000FFFFFFFFFFFFUL;
+
+        var targetSequence =
+            checked((ushort)(targetFileReference >> 48));
+
+        var segmentRecords =
+            records
+                .Where(record =>
+                    CalculateTargetMftSegment(
+                        record,
+                        bytesPerCluster,
+                        bytesPerFileRecordSegment) == targetSegment)
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
+
+        var initializationRecords =
+            segmentRecords
+                .Where(record =>
+                    record.RedoOperation == 0x0002 ||
+                    record.UndoOperation == 0x0002)
+                .ToList();
+
+        var deallocationRecords =
+            segmentRecords
+                .Where(record =>
+                    record.RedoOperation == DeallocateFileRecordSegment ||
+                    record.UndoOperation == DeallocateFileRecordSegment)
+                .ToList();
+
+        var sizeRecords =
+            segmentRecords
+                .Where(record =>
+                    record.RedoOperation == SetNewAttributeSizes ||
+                    record.UndoOperation == SetNewAttributeSizes)
+                .ToList();
+
+        var bitmapRecords =
+            records
+                .Where(record =>
+                    record.RedoOperation == ClearBitsInNonresidentBitmap ||
+                    record.UndoOperation == ClearBitsInNonresidentBitmap ||
+                    record.RedoOperation == SetBitsInNonresidentBitmap ||
+                    record.UndoOperation == SetBitsInNonresidentBitmap)
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
+
+        var targetOpenAttributes =
+            records
+                .Where(record =>
+                    record.RedoOperation == OpenNonresidentAttribute &&
+                    record.RedoData.Length > 0)
+                .SelectMany(record =>
+                    ReadPossibleOpenAttributeFileReferences(record.RedoData)
+                        .Where(reference => reference == targetFileReference)
+                        .Select(_ => record))
+                .ToList();
+
+        var targetOpenAttributeDumpMatches =
+            FindOpenAttributeTableDumpMatches(
+                records,
+                targetFileReference);
+
+        var exactInitializationSequences =
+            initializationRecords
+                .Select(record => record.RedoData)
+                .Where(data => data.Length >= 24 &&
+                               EncodingAscii(data, 0, Math.Min(4, data.Length)) == "FILE")
+                .Select(data =>
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        data.AsSpan(16, 2)))
+                .Distinct()
+                .OrderBy(sequence => sequence)
+                .ToArray();
+
+        var exactSequenceInitializations =
+            exactInitializationSequences.Contains(targetSequence);
+
+        var targetTransactionIds =
+            deallocationRecords
+                .Select(record => record.TransactionId)
+                .Where(transaction => transaction != 0)
+                .Distinct()
+                .OrderBy(transaction => transaction)
+                .ToArray();
+
+        var bitmapTransactionSummary =
+            bitmapRecords
+                .Where(record =>
+                    targetTransactionIds.Contains(record.TransactionId))
+                .GroupBy(record => record.TransactionId)
+                .Select(group =>
+                    $"0x{group.Key:X8}:{group.Count():N0}")
+                .ToArray();
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile target evidence inventory: " +
+            $"fileRef={targetFileReference}, " +
+            $"segment={targetSegment:N0}, " +
+            $"expectedSequence={targetSequence}, " +
+            $"segmentRecords={segmentRecords.Count:N0}, " +
+            $"initializations={initializationRecords.Count:N0}, " +
+            $"initializationSequences=[{string.Join(",", exactInitializationSequences)}], " +
+            $"exactSequenceInitializationPresent={exactSequenceInitializations}, " +
+            $"deallocations={deallocationRecords.Count:N0}, " +
+            $"sizeUpdates={sizeRecords.Count:N0}, " +
+            $"exactOpenNonresidentAttributes={targetOpenAttributes.Count:N0}, " +
+            $"openAttributeDumpTargetMatches={targetOpenAttributeDumpMatches.Count:N0}, " +
+            $"bitmapRecords={bitmapRecords.Count:N0}, " +
+            $"bitmapRecordsInDeletionTransactions=[{string.Join(",", bitmapTransactionSummary)}].");
+
+        foreach (var record in initializationRecords)
+        {
+            var actualSequence =
+                record.RedoData.Length >= 24
+                    ? BinaryPrimitives.ReadUInt16LittleEndian(
+                        record.RedoData.AsSpan(16, 2))
+                    : (ushort)0;
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile target initialization evidence: " +
+                $"fileRef={targetFileReference}, " +
+                $"segment={targetSegment:N0}, " +
+                $"expectedSequence={targetSequence}, " +
+                $"actualSequence={actualSequence}, " +
+                $"lsn=0x{record.Lsn:X16}, " +
+                $"transaction=0x{record.TransactionId:X8}, " +
+                $"redoOperation=0x{record.RedoOperation:X4}, " +
+                $"undoOperation=0x{record.UndoOperation:X4}, " +
+                $"redoBytes={record.RedoData.Length:N0}, " +
+                $"undoBytes={record.UndoData.Length:N0}.");
+        }
+
+        foreach (var record in sizeRecords)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile target size-update evidence: " +
+                $"fileRef={targetFileReference}, " +
+                $"segment={targetSegment:N0}, " +
+                $"lsn=0x{record.Lsn:X16}, " +
+                $"transaction=0x{record.TransactionId:X8}, " +
+                $"attributeOffset=0x{record.AttributeOffset:X}, " +
+                $"redoOperation=0x{record.RedoOperation:X4}, " +
+                $"undoOperation=0x{record.UndoOperation:X4}, " +
+                $"redoBytes={record.RedoData.Length:N0}, " +
+                $"undoBytes={record.UndoData.Length:N0}.");
+        }
+
+        foreach (var record in deallocationRecords)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile target deallocation evidence: " +
+                $"fileRef={targetFileReference}, " +
+                $"segment={targetSegment:N0}, " +
+                $"lsn=0x{record.Lsn:X16}, " +
+                $"transaction=0x{record.TransactionId:X8}, " +
+                $"redoOperation=0x{record.RedoOperation:X4}, " +
+                $"undoOperation=0x{record.UndoOperation:X4}.");
+        }
     }
 
     private static bool TryRecoverFromHistoricalNonresidentValueUpdates(
