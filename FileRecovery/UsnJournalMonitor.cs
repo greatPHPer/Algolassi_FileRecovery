@@ -1084,15 +1084,23 @@ public sealed class UsnJournalMonitor : IDisposable
             var dataReader =
                 new NtfsLogFileHistoricalDataService();
 
-            // TryRecoverFileData performs exact-size inference from the retained
-            // $FILE_NAME/MFT-generation records when the size is not yet known.
-            // Passing zero here therefore keeps the live fallback to one complete
-            // $LogFile read/parse instead of first running a separate size scan.
+            // FileSystemWatcher normally records the original byte length before
+            // deletion. Pass that trusted size through so $LogFile reconstruction can
+            // validate the target without depending on a fragile historical-size
+            // inference from the reused MFT generation.
+            var knownSize = deletion.FileSizeBytes.GetValueOrDefault();
+
+            if (knownSize < 0 ||
+                knownSize > DeleteSnapshotMaxBytes)
+            {
+                knownSize = 0;
+            }
+
             if (!dataReader.TryRecoverFileData(
                     root,
                     fileReferenceNumber,
                     deletion.FileName,
-                    fileSizeBytes: 0,
+                    fileSizeBytes: knownSize,
                     maxCaptureBytes: DeleteSnapshotMaxBytes,
                     out var recoveredData,
                     out var dataEvidence))
