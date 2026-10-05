@@ -59,7 +59,15 @@ public sealed class NtfsMftDataReader
                 volumeInfo.RootPath,
                 overlapped: true);
 
-            var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
+            // expectedFileSizeBytes is captured before the live delete event reaches
+        // this reader. Preserve it through the MFT path so a reused record whose
+        // historical $FILE_NAME size has already been lost can still use the
+        // authoritative deletion-time size for narrow historical/slack validation.
+        if (expectedFileSizeBytes < 0)
+        {
+            expectedFileSizeBytes = 0;
+        }
+        var segmentNumber = fileReferenceNumber & 0x0000FFFFFFFFFFFFUL;
 
             // This is deliberately a forensic slack read. We do not accept the
             // current MFT sequence as the historical record because the USN sequence
@@ -2432,7 +2440,8 @@ public sealed class NtfsMftDataReader
         out NtfsDataStreamInfo stream,
         out byte[] capturedData,
         DateTime expectedDeletedAtUtc = default,
-        bool allowBoundedDeleteTransition = true)
+        bool allowBoundedDeleteTransition = true,
+        long expectedFileSizeBytes = 0)
     {
         stream = NotFound("The deleted file's NTFS $DATA stream could not be read.");
         capturedData = [];
@@ -2469,7 +2478,8 @@ public sealed class NtfsMftDataReader
                 expectedParentFileReferenceNumber,
                 expectedFullPath,
                 expectedDeletedAtUtc,
-                allowBoundedDeleteTransition);
+                allowBoundedDeleteTransition,
+                expectedFileSizeBytes);
 
             if (!stream.Found)
             {
@@ -2907,7 +2917,8 @@ public sealed class NtfsMftDataReader
             fileReferenceNumber,
             record,
             expectedFileName,
-            expectedParentFileReferenceNumber);
+            expectedParentFileReferenceNumber,
+            expectedFileSizeBytes);
     }
 
     internal NtfsDataStreamInfo ReadDefaultDataStreamFromScannedMftRecord(
