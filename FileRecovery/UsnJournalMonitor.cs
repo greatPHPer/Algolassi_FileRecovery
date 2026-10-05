@@ -775,7 +775,8 @@ public sealed class UsnJournalMonitor : IDisposable
                     out var stream,
                     out var capturedData,
                     expectedDeletedAtUtc: deletion.DeletedAtUtc,
-                    allowBoundedDeleteTransition: allowBoundedDeleteTransition))
+                    allowBoundedDeleteTransition: allowBoundedDeleteTransition,
+                    expectedFileSizeBytes: deletion.FileSizeBytes ?? 0))
             {
                 return;
             }
