@@ -350,6 +350,11 @@ public sealed class UsnJournalMonitor : IDisposable
                 var fullPath = NormalizePath(
                     Path.Combine(directory, record.FileName));
 
+                if (RecoveryMonitoringExclusions.IsExcludedPath(fullPath))
+                {
+                    continue;
+                }
+
                 var candidate = new UsnDeletedFileRecord(
                     fullPath,
                     record.FileReferenceNumber,
@@ -689,6 +694,11 @@ public sealed class UsnJournalMonitor : IDisposable
                 deletion.DirectoryPath = directory;
                 deletion.FullPath = NormalizePath(Path.Combine(directory, record.FileName));
 
+                if (RecoveryMonitoringExclusions.IsExcludedPath(deletion.FullPath))
+                {
+                    continue;
+                }
+
                 _recentDeletedRecords.Enqueue(
                     new RecentDeletedRecord(
                         record.FileReferenceNumber,
@@ -1003,6 +1013,7 @@ public sealed class UsnJournalMonitor : IDisposable
 
         if (string.IsNullOrWhiteSpace(record.FullPath) ||
             string.IsNullOrWhiteSpace(record.FileName) ||
+            RecoveryMonitoringExclusions.IsExcludedPath(record.FullPath) ||
             !IsAdministrator())
         {
             return false;
@@ -1184,6 +1195,7 @@ public sealed class UsnJournalMonitor : IDisposable
     {
         if (deletion is null ||
             string.IsNullOrWhiteSpace(deletion.FullPath) ||
+            RecoveryMonitoringExclusions.IsExcludedPath(deletion.FullPath) ||
             string.IsNullOrWhiteSpace(deletion.FileName))
         {
             return false;
