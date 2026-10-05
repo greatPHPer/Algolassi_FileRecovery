@@ -2658,10 +2658,10 @@ public partial class Form1 : Form
                     candidate.Name,
                     candidate.FileSizeBytes,
                     maxCaptureBytes,
-                    progress,
-                    cancellationToken,
                     out var data,
-                    out var evidence) ||
+                    out var evidence,
+                    progress,
+                    cancellationToken) ||
                 data.Length == 0)
             {
                 System.Diagnostics.Trace.WriteLine(
