@@ -127,7 +127,8 @@ public sealed class DeletionMonitor : IDisposable
         // snapshot path can capture the file before its metadata/data become
         // harder to recover.
         if (IsRecycleBinPath(newPath) &&
-            !IsRecycleBinPath(oldPath))
+            !IsRecycleBinPath(oldPath) &&
+            !RecoveryMonitoringExclusions.IsExcludedPath(oldPath))
         {
             var directory = Path.GetDirectoryName(oldPath) ?? string.Empty;
             var fileName = Path.GetFileName(oldPath);
@@ -193,6 +194,11 @@ public sealed class DeletionMonitor : IDisposable
             : null;
 
         var fullPath = NormalizePath(e.FullPath);
+        if (RecoveryMonitoringExclusions.IsExcludedPath(fullPath))
+        {
+            return;
+        }
+
         var directory = Path.GetDirectoryName(fullPath) ?? string.Empty;
         var fileName = Path.GetFileName(fullPath);
 
@@ -280,6 +286,11 @@ public sealed class DeletionMonitor : IDisposable
 
     private void RememberSize(string path)
     {
+        if (RecoveryMonitoringExclusions.IsExcludedPath(path))
+        {
+            return;
+        }
+
         try
         {
             if (!File.Exists(path))
