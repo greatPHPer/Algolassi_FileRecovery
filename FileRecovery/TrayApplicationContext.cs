@@ -130,7 +130,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS immediate live path triggered: path={e.Record.FullPath}, " +
-                $"historyTime={e.Record.DeletedAtUtc:O}.");
+                $"historyTime={e.Record.DeletedAtUtc:O}, " +
+                $"knownSize={e.Record.FileSizeBytes?.ToString("N0") ?? "(unknown)"}.");
 
             _ = Task.Run(async () =>
             {
