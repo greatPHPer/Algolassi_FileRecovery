@@ -217,10 +217,10 @@ public sealed class NtfsLogFileHistoricalDataService
         string expectedFileName,
         long fileSizeBytes,
         long maxCaptureBytes,
-        IProgress<string>? progress = null,
-        CancellationToken cancellationToken = default,
         out byte[] data,
-        out string evidence)
+        out string evidence,
+        IProgress<string>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         data = [];
         evidence = string.Empty;
