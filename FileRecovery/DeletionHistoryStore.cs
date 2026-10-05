@@ -21,7 +21,9 @@ public sealed class DeletionHistoryStore
 
         Directory.CreateDirectory(folder);
         _path = Path.Combine(folder, "deletions.json");
-        _records = Load();
+        _records = Load()
+            .Where(record => !RecoveryMonitoringExclusions.IsExcludedPath(record.FullPath))
+            .ToList();
     }
 
     public IReadOnlyList<DeletionRecord> GetRecent(int count = 500)
@@ -52,6 +54,11 @@ public sealed class DeletionHistoryStore
 
     public bool Upsert(DeletionRecord record)
     {
+        if (RecoveryMonitoringExclusions.IsExcludedPath(record.FullPath))
+        {
+            return false;
+        }
+
         bool existed;
 
         // Serialize persistence operations without holding _gate during disk I/O.
