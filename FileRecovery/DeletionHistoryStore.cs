@@ -68,15 +68,22 @@ public sealed class DeletionHistoryStore
 
             lock (_gate)
             {
-                var index = _records.FindIndex(x => x.Id == record.Id);
+                // Once a USN file reference is known, it is the strongest
+                // identity available for this deletion. Prefer it over the transient
+                // Guid assigned independently by FileSystemWatcher/USN event sources.
+                // This collapses the duplicate-row race between the two monitors.
+                var index = -1;
 
-                // A USN record carries the authoritative NTFS file reference.
-                // Prefer that identifier when merging asynchronous monitor events.
-                if (index < 0 && record.FileReferenceNumber.HasValue)
+                if (record.FileReferenceNumber.HasValue)
                 {
                     index = _records.FindIndex(x =>
                         x.FileReferenceNumber.HasValue &&
                         x.FileReferenceNumber.Value == record.FileReferenceNumber.Value);
+                }
+
+                if (index < 0)
+                {
+                    index = _records.FindIndex(x => x.Id == record.Id);
                 }
 
                 // FileSystemWatcher and USN can report the same deletion at slightly
@@ -126,8 +133,18 @@ public sealed class DeletionHistoryStore
                         record.FileSizeBytes = existing.FileSizeBytes;
                     }
 
-                    if (record.NtfsDataSnapshot is null &&
-                        existing.NtfsDataSnapshot is not null)
+                    // A complete delete-time snapshot is immutable forensic
+                    // evidence. Do not replace an already-complete snapshot merely
+                    // because a later monitor retry/reused-MFT read produced another
+                    // byte stream for the same file reference.
+                    if (existing.NtfsDataSnapshot?.IsComplete == true)
+                    {
+                        record.NtfsDataSnapshot = existing.NtfsDataSnapshot.Clone();
+                        record.FileSizeBytes = existing.FileSizeBytes;
+                        record.RecoveryStrength = existing.RecoveryStrength;
+                    }
+                    else if (record.NtfsDataSnapshot is null &&
+                             existing.NtfsDataSnapshot is not null)
                     {
                         record.NtfsDataSnapshot = existing.NtfsDataSnapshot.Clone();
                     }
