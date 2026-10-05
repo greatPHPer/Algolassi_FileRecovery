@@ -32,6 +32,27 @@ public sealed class NtfsLogFileHistoricalDataService
     private const int RecordHeaderMinimumLength = 48;
     private const long MaxLogBytesToRead = 128L * 1024L * 1024L;
 
+    // Only retain operations that can contribute to targeted historical recovery.
+    // The marker diagnostic intentionally uses the unfiltered parser because it is
+    // a generic content search. Targeted recovery must not materialize unrelated
+    // transaction payloads into memory.
+    private static readonly HashSet<ushort> RecoveryRelevantOperations =
+    [
+        0x0002, // InitializeFileRecordSegment
+        DeallocateFileRecordSegment,
+        UpdateResidentValue,
+        UpdateNonresidentValue,
+        UpdateMappingPairs,
+        SetNewAttributeSizes,
+        SetBitsInNonresidentBitmap,
+        ClearBitsInNonresidentBitmap,
+        PrepareTransaction,
+        CommitTransaction,
+        ForgetTransaction,
+        OpenNonresidentAttribute,
+        0x001D // Open-attribute table dump
+    ];
+
     public bool TryFindMarkerInHistoricalLogFile(
         string rootPath,
         string marker,
@@ -311,7 +332,10 @@ public sealed class NtfsLogFileHistoricalDataService
             var records = ParseRecords(
                 logData,
                 geometry,
-                volumeInfo.BytesPerSector);
+                volumeInfo.BytesPerSector,
+                RecoveryRelevantOperations,
+                progress,
+                cancellationToken);
 
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -2603,7 +2627,10 @@ public sealed class NtfsLogFileHistoricalDataService
     private static List<ParsedLogRecord> ParseRecords(
         byte[] logData,
         LogGeometry geometry,
-        uint bytesPerSector)
+        uint bytesPerSector,
+        IReadOnlySet<ushort>? operationFilter = null,
+        IProgress<string>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         var result = new List<ParsedLogRecord>();
         var pageCount = logData.Length / geometry.LogPageSize;
@@ -2613,6 +2640,18 @@ public sealed class NtfsLogFileHistoricalDataService
              pageIndex < pageCount;
              pageIndex++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (progress is not null &&
+                (pageIndex == geometry.WrappedStartPage ||
+                 (pageIndex - geometry.WrappedStartPage) % 128 == 0))
+            {
+                progress.Report(
+                    $"Parsing historical NTFS $LogFile... page " +
+                    $"{pageIndex - geometry.WrappedStartPage + 1:N0} / " +
+                    $"{pageCount - geometry.WrappedStartPage:N0}");
+            }
+
             var pageStart = checked(
                 pageIndex * geometry.LogPageSize);
 
@@ -2699,11 +2738,23 @@ public sealed class NtfsLogFileHistoricalDataService
 
                 if (recordType == LfsClientRecord)
                 {
-                    var clientData =
-                        page.AsSpan(
-                                clientStart,
-                                (int)clientDataLength)
-                            .ToArray();
+                    var clientDataSpan = page.AsSpan(
+                        clientStart,
+                        (int)clientDataLength);
+
+                    if (operationFilter is not null &&
+                        !operationFilter.Contains(
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                clientDataSpan.Slice(0, 2)) &&
+                        !operationFilter.Contains(
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                clientDataSpan.Slice(2, 2))))
+                    {
+                        recordOffset += alignedLength;
+                        continue;
+                    }
+
+                    var clientData = clientDataSpan.ToArray();
 
                     var thisLsn =
                         BinaryPrimitives.ReadUInt64LittleEndian(
@@ -2777,6 +2828,9 @@ public sealed class NtfsLogFileHistoricalDataService
                 recordOffset += alignedLength;
             }
         }
+
+        progress?.Report(
+            $"Parsed historical NTFS $LogFile: {result.Count:N0} retained recovery record(s).");
 
         return result;
     }
