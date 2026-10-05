@@ -2624,6 +2624,8 @@ public partial class Form1 : Form
     private static bool TryRecoverFromHistoricalLogFileData(
         RecoveryCandidate candidate,
         string destinationDirectory,
+        IProgress<string>? progress,
+        CancellationToken cancellationToken,
         out RecoveryResult result)
     {
         result = new RecoveryResult();
@@ -2647,12 +2649,17 @@ public partial class Form1 : Form
             var service = new NtfsLogFileHistoricalDataService();
             const long maxCaptureBytes = int.MaxValue;
 
+            progress?.Report(
+                $"Preparing historical NTFS $LogFile recovery for {candidate.Name}...");
+
             if (!service.TryRecoverFileData(
                     sourceRoot,
                     candidate.FileReferenceNumber,
                     candidate.Name,
                     candidate.FileSizeBytes,
                     maxCaptureBytes,
+                    progress,
+                    cancellationToken,
                     out var data,
                     out var evidence) ||
                 data.Length == 0)
@@ -2769,56 +2776,7 @@ public partial class Form1 : Form
                         $"reason={vssEvidence}");
                 }
 
-                // If the live and historical MFT views are already reused, inspect
-                // the NTFS transaction journal before asking the user for a content marker.
-                // $LogFile is finite and may have wrapped, so failure here is expected for
-                // older or high-activity deletions.
-                if (candidate.FileSizeBytes <= 0 &&
-                    candidate.FileReferenceNumber != 0 &&
-                    candidate.ParentFileReferenceNumber != 0)
-                {
-                    var sourceRoot = GetSourceVolumeRoot(candidate.FullPath);
-
-                    if (!string.IsNullOrWhiteSpace(sourceRoot))
-                    {
-                        try
-                        {
-                            var logFileSizeReader = new NtfsLogFileHistoricalSizeService();
-
-                            if (logFileSizeReader.TryRecoverFileSize(
-                                sourceRoot,
-                                candidate.Name,
-                                candidate.ParentFileReferenceNumber,
-                                new DriveInfo(sourceRoot).TotalSize,
-                                out var historicalLogFileSize,
-                                out var logFileEvidence) &&
-                                historicalLogFileSize > 0)
-                            {
-                                candidate.FileSizeBytes = historicalLogFileSize;
-
-                                System.Diagnostics.Debug.WriteLine(
-                                    $"NTFS candidate size enrichment: match=$LogFile, " +
-                                    $"path={candidate.FullPath}, fileRef={candidate.FileReferenceNumber}, " +
-                                    $"size={historicalLogFileSize:N0} bytes, " +
-                                    $"evidence={logFileEvidence}");
-                            }
-                            else
-                            {
-                                System.Diagnostics.Debug.WriteLine(
-                                    $"NTFS candidate $LogFile size lookup: no match for " +
-                                    $"{candidate.FullPath}. {logFileEvidence}");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            System.Diagnostics.Debug.WriteLine(
-                                $"NTFS candidate $LogFile size lookup failed: " +
-                                $"{ex.GetType().Name}: {ex.Message}");
-                        }
-                    }
-                }
-
-                                // The current MFT can be reused while exact historical
+                // The current MFT can be reused while exact historical
                                 // $LogFile transaction evidence still retains the original bytes.
                                 // Try that evidence before asking for a text marker. The historical
                                 // service validates the exact file reference and can infer the file
@@ -2826,14 +2784,30 @@ public partial class Form1 : Form
                                 // $FILE_NAME size is unavailable.
                                 if (!candidate.DataStreamFound &&
                                     candidate.FileReferenceNumber != 0 &&
-                                    candidate.ParentFileReferenceNumber != 0 &&
-                                    TryRecoverFromHistoricalLogFileData(
-                                        candidate,
-                                        destinationDirectory,
-                                        out var historicalLogFileRecovery))
+                                    candidate.ParentFileReferenceNumber != 0)
                                 {
-                                    successes.Add(historicalLogFileRecovery);
-                                    continue;
+                                    var historicalLogProgress =
+                                        new Progress<string>(message =>
+                                            SetBusy(
+                                                true,
+                                                message));
+
+                                    var historicalLogRecovered =
+                                        await Task.Run(
+                                            () => TryRecoverFromHistoricalLogFileData(
+                                                candidate,
+                                                destinationDirectory,
+                                                historicalLogProgress,
+                                                CancellationToken.None,
+                                                out var historicalLogFileRecovery),
+                                            CancellationToken.None)
+                                            .ConfigureAwait(true);
+
+                                    if (historicalLogRecovered)
+                                    {
+                                        successes.Add(historicalLogFileRecovery);
+                                        continue;
+                                    }
                                 }
 
                 if (TryRecoverFromNtfsSnapshot(
