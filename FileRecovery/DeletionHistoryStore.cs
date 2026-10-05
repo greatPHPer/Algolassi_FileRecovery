@@ -87,23 +87,22 @@ public sealed class DeletionHistoryStore
                 }
 
                 // FileSystemWatcher and USN can report the same deletion at slightly
-                // different times. Merge matching paths within a bounded window so
-                // the later USN record can upgrade the earlier watcher-only row.
+                // different times. A watcher row may have no NTFS reference while the
+                // authoritative USN row already has one. When the path and timestamps
+                // identify the same live deletion, upgrade that watcher row instead of
+                // creating a second history entry.
                 if (index < 0)
                 {
-                    // A path alone is not a safe identity once either side has an
-                    // authoritative NTFS file reference. The same path can be deleted
-                    // repeatedly and receive a new MFT generation each time.
-                    // Only merge by path/time when neither record has a file reference.
                     index = _records.FindIndex(x =>
-                        !x.FileReferenceNumber.HasValue &&
-                        !record.FileReferenceNumber.HasValue &&
                         string.Equals(
                             x.FullPath,
                             record.FullPath,
                             StringComparison.OrdinalIgnoreCase) &&
                         Math.Abs(
-                            (x.DeletedAtUtc - record.DeletedAtUtc).TotalMinutes) <= 5);
+                            (x.DeletedAtUtc - record.DeletedAtUtc).TotalSeconds) <= 10 &&
+                        (!x.FileReferenceNumber.HasValue ||
+                         !record.FileReferenceNumber.HasValue ||
+                         x.FileReferenceNumber.Value == record.FileReferenceNumber.Value));
                 }
 
                 existed = index >= 0;
