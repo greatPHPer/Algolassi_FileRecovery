@@ -583,7 +583,162 @@ public partial class Form1 : Form
             return;
         }
 
-        await RecoverNtfsCandidatesAsync([candidate]);
+        await RunTargetedHistoricalRecoveryAsync(candidate);
+    }
+
+    private async Task RunTargetedHistoricalRecoveryAsync(
+        RecoveryCandidate candidate)
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Choose the recovery destination for this targeted historical recovery.",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = true
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK ||
+            string.IsNullOrWhiteSpace(dialog.SelectedPath))
+        {
+            return;
+        }
+
+        var destinationDirectory = dialog.SelectedPath;
+        SetBusy(true, $"Recovering {candidate.Name} directly from historical NTFS $LogFile...");
+
+        try
+        {
+            // This diagnostic path is intentionally isolated from the generic
+            // NTFS candidate pipeline. It must not scan unrelated MFT records,
+            // enumerate candidate paths, or run the broad historical enrichment
+            // stages before testing the targeted $LogFile reconstruction.
+            var progress = new Progress<string>(message =>
+                SetBusy(true, message));
+
+            var recovered = await Task.Run(
+                () =>
+                {
+                    return TryRecoverFromHistoricalLogFileData(
+                        candidate,
+                        destinationDirectory,
+                        progress,
+                        CancellationToken.None,
+                        out var result)
+                        ? result
+                        : null;
+                },
+                CancellationToken.None).ConfigureAwait(true);
+
+            if (recovered is not null)
+            {
+                MessageBox.Show(
+                    this,
+                    $"Recovered {recovered.BytesRecovered:N0} byte(s) to:{Environment.NewLine}{recovered.DestinationPath}{Environment.NewLine}{Environment.NewLine}" +
+                    recovered.Evidence,
+                    "Targeted Historical NTFS Recovery",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            var marker = Microsoft.VisualBasic.Interaction.InputBox(
+                $"The targeted historical $LogFile reconstruction did not recover '{candidate.Name}'.\r\n\r\n" +
+                "Enter a distinctive marker from the deleted text file to test the retained $LogFile and, only if necessary, the raw volume.",
+                "Targeted Historical Recovery — Marker Fallback",
+                "");
+
+            if (string.IsNullOrWhiteSpace(marker))
+            {
+                MessageBox.Show(
+                    this,
+                    "Targeted $LogFile recovery did not produce a file. Marker fallback was skipped.",
+                    "Targeted Historical NTFS Recovery",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            var root = Path.GetPathRoot(candidate.FullPath);
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                throw new InvalidOperationException(
+                    "The targeted file path does not have a valid source volume root.");
+            }
+
+            var markerService = new NtfsLogFileHistoricalDataService();
+            if (markerService.TryFindMarkerInHistoricalLogFile(
+                    root,
+                    marker,
+                    out var logMarkerEvidence))
+            {
+                MessageBox.Show(
+                    this,
+                    "The marker was found in the retained NTFS $LogFile, but targeted reconstruction still did not produce the complete file.\r\n\r\n" +
+                    logMarkerEvidence,
+                    "Targeted Historical NTFS Recovery",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            var proceed = MessageBox.Show(
+                this,
+                "The marker was not found in the retained NTFS $LogFile.\r\n\r\n" +
+                "A raw-volume marker scan would read the entire source volume.",
+                "Targeted Historical Recovery",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question,
+                MessageBoxDefaultButton.Button2);
+
+            if (proceed != DialogResult.Yes)
+            {
+                return;
+            }
+
+            var totalVolumeBytes = new DriveInfo(root).TotalSize;
+            var forensicProgress = new SynchronousProgress<long>(
+                this,
+                bytesScanned =>
+                {
+                    lblStatus.Text =
+                        $"Targeted raw-volume marker scan... " +
+                        $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
+                        $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
+                });
+
+            var forensicResult =
+                _ntfsWholeVolumeTextRecoveryService.FindMarkerOnVolume(
+                    candidate.FullPath,
+                    marker,
+                    CancellationToken.None,
+                    forensicProgress);
+
+            MessageBox.Show(
+                this,
+                forensicResult.Found
+                    ? $"Marker FOUND at byte offset {forensicResult.Offset:N0}.\r\nEncoding: {forensicResult.Encoding}"
+                    : $"Marker was NOT found in the raw source volume.\r\nScanned: {forensicResult.ScannedBytes:N0} bytes.",
+                "Targeted Raw-Volume Marker Test",
+                forensicResult.Found
+                    ? MessageBoxButtons.OK
+                    : MessageBoxButtons.OK,
+                forensicResult.Found
+                    ? MessageBoxIcon.Information
+                    : MessageBoxIcon.Warning);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                this,
+                $"{ex.GetType().Name}: {ex.Message}",
+                "Targeted Historical Recovery Failed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+            UpdateRecoverButton();
+        }
     }
 
     private void btnBrowseScanPath_Click(object? sender, EventArgs e)
