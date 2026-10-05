@@ -42,6 +42,9 @@ public sealed class UsnJournalMonitor : IDisposable
     private readonly ConcurrentQueue<RecentDeletedRecord> _recentDeletedRecords = new();
     private const long DeleteSnapshotMaxBytes = 16L * 1024L * 1024L;
     private readonly NtfsDeletionSnapshotStore _snapshotStore = new();
+    // Only one live $LogFile fallback is allowed at a time. A burst of browser/editor
+    // deletions must not start multiple 640 MB journal parses concurrently.
+    private readonly SemaphoreSlim _historicalLogFileSnapshotGate = new(1, 1);
 
     private const int RecentDeletedRecordLimit = 512;
 
@@ -1064,20 +1067,10 @@ public sealed class UsnJournalMonitor : IDisposable
             }
         }
 
-        // If the exact deleted MFT generation has already been reused or is otherwise
-        // unavailable, plain-text recovery falls through to exact file-reference
-        // $LogFile history. Do not substitute current-MFT data for either path.
-        if (Path.GetExtension(record.FileName).Equals(
-                ".txt",
-                StringComparison.OrdinalIgnoreCase) &&
-            TryCaptureHistoricalLogFileSnapshot(
-                deletion,
-                root,
-                record.FileReferenceNumber))
-        {
-            return true;
-        }
-
+        // Do not parse the full circular $LogFile for every item returned by a
+        // historical directory scan. The $LogFile fallback is reserved for the
+        // live-deletion path and for explicit Targeted Historical recovery, where
+        // there is a single known file reference to investigate.
         return false;
     }
 
@@ -1088,60 +1081,34 @@ public sealed class UsnJournalMonitor : IDisposable
     {
         try
         {
-            var sizeReader = new NtfsLogFileHistoricalSizeService();
-            var maximumHistoricalFileSize =
-                new DriveInfo(root).TotalSize;
-
-            var historicalSizeKnown =
-                sizeReader.TryRecoverFileSize(
-                    root,
-                    deletion.FileName,
-                    deletion.ParentFileReferenceNumber!.Value,
-                    maximumHistoricalFileSize,
-                    out var historicalSize,
-                    out var sizeEvidence) &&
-                historicalSize > 0 &&
-                historicalSize <= DeleteSnapshotMaxBytes;
-
-            if (!historicalSizeKnown)
-            {
-                historicalSize = 0;
-
-                System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $LogFile historical snapshot: $FILE_NAME size lookup unavailable; " +
-                    $"attempting exact-generation data reconstruction for {deletion.FullPath}: " +
-                    $"{sizeEvidence}");
-            }
-
             var dataReader =
                 new NtfsLogFileHistoricalDataService();
 
+            // TryRecoverFileData performs exact-size inference from the retained
+            // $FILE_NAME/MFT-generation records when the size is not yet known.
+            // Passing zero here therefore keeps the live fallback to one complete
+            // $LogFile read/parse instead of first running a separate size scan.
             if (!dataReader.TryRecoverFileData(
                     root,
                     fileReferenceNumber,
                     deletion.FileName,
-                    historicalSize,
-                    DeleteSnapshotMaxBytes,
+                    fileSizeBytes: 0,
+                    maxCaptureBytes: DeleteSnapshotMaxBytes,
                     out var recoveredData,
                     out var dataEvidence))
             {
                 System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $LogFile historical snapshot: data lookup failed for " +
+                    $"NTFS $LogFile live snapshot: data lookup failed for " +
                     $"{deletion.FullPath}: {dataEvidence}");
                 return false;
             }
 
-            if (historicalSize <= 0)
-            {
-                historicalSize = recoveredData.LongLength;
-            }
-
-            if (recoveredData.LongLength != historicalSize)
+            if (recoveredData.LongLength <= 0 ||
+                recoveredData.LongLength > DeleteSnapshotMaxBytes)
             {
                 System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $LogFile historical snapshot: size mismatch for " +
-                    $"{deletion.FullPath}: expected={historicalSize:N0}, " +
-                    $"actual={recoveredData.LongLength:N0}.");
+                    $"NTFS $LogFile live snapshot: recovered size is outside the " +
+                    $"live snapshot limit for {deletion.FullPath}: {recoveredData.LongLength:N0}.");
                 return false;
             }
 
@@ -1151,41 +1118,42 @@ public sealed class UsnJournalMonitor : IDisposable
                     out var dataFileName,
                     out var sha256))
             {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile live snapshot: could not persist recovered data for " +
+                    $"{deletion.FullPath}.");
                 return false;
             }
 
-            deletion.FileSizeBytes = historicalSize;
+            deletion.FileSizeBytes = recoveredData.LongLength;
             deletion.RecoveryStrength = "Strong";
             deletion.NtfsDataSnapshot = new NtfsDeletionDataSnapshot
             {
                 DataCaptured = true,
                 IsResident = false,
-                FileSizeBytes = historicalSize,
-                ValidDataLengthBytes = historicalSize,
+                FileSizeBytes = recoveredData.LongLength,
+                ValidDataLengthBytes = recoveredData.LongLength,
                 CapturedByteCount = recoveredData.LongLength,
                 DataFileName = dataFileName,
                 Sha256 = sha256,
                 CapturedAtUtc = DateTime.UtcNow,
                 Evidence =
-                    historicalSizeKnown
-                        ? $"Recovered from exact NTFS $LogFile mapping pairs. " +
-                          $"{dataEvidence} Historical-size evidence: {sizeEvidence}"
-                        : $"Recovered from exact NTFS $LogFile mapping history with the file size " +
-                          $"inferred from the exact historical MFT generation. {dataEvidence} " +
-                          $"$FILE_NAME size evidence: {sizeEvidence}"
+                    "Recovered immediately from the current NTFS $LogFile before the " +
+                    "circular journal could overwrite the deletion transaction. " +
+                    dataEvidence
             };
 
             System.Diagnostics.Debug.WriteLine(
-                $"NTFS $LogFile historical snapshot saved: " +
+                $"NTFS $LogFile live snapshot saved: " +
                 $"path={deletion.FullPath}, fileRef={fileReferenceNumber}, " +
-                $"size={recoveredData.LongLength:N0}, dataFile={dataFileName}, sha256={sha256}.");
+                $"size={recoveredData.LongLength:N0}, dataFile={dataFileName}, " +
+                $"sha256={sha256}.");
 
             return true;
         }
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine(
-                $"NTFS $LogFile historical snapshot failed: " +
+                $"NTFS $LogFile live snapshot failed: " +
                 $"{deletion.FullPath}: {ex.GetType().Name}: {ex.Message}");
             return false;
         }
@@ -1254,16 +1222,44 @@ public sealed class UsnJournalMonitor : IDisposable
             deletion.FileName,
             directoryPath);
 
-        if (deletion.NtfsDataSnapshot is not null)
+        if (deletion.NtfsDataSnapshot is not null &&
+            (deletion.NtfsDataSnapshot.IsComplete ||
+             deletion.NtfsDataSnapshot.FileSizeBytes > DeleteSnapshotMaxBytes))
         {
-            if (deletion.NtfsDataSnapshot.IsComplete ||
-                deletion.NtfsDataSnapshot.FileSizeBytes > DeleteSnapshotMaxBytes)
-            {
-                return true;
-            }
+            return true;
         }
 
-        return false;
+        // A just-deleted text file can lose its exact MFT generation during the
+        // FileSystemWatcher/USN race. Preserve the file immediately from the current
+        // circular $LogFile before later NTFS activity can overwrite its transaction.
+        // Serialize this expensive fallback so deletion bursts cannot multiply the
+        // journal memory/IO footprint.
+        if (!Path.GetExtension(deletion.FileName).Equals(
+                ".txt",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!_historicalLogFileSnapshotGate.Wait(0))
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile live snapshot deferred because another journal capture is active: " +
+                $"path={deletion.FullPath}, fileRef={fileReferenceNumber}.");
+            return false;
+        }
+
+        try
+        {
+            return TryCaptureHistoricalLogFileSnapshot(
+                deletion,
+                root,
+                fileReferenceNumber);
+        }
+        finally
+        {
+            _historicalLogFileSnapshotGate.Release();
+        }
     }
     public bool TryResolveRecentDeletedFile(
         string fullPath,
