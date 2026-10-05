@@ -2792,20 +2792,26 @@ public partial class Form1 : Form
                                                 true,
                                                 message));
 
-                                    var historicalLogRecovered =
+                                    var historicalLogResult =
                                         await Task.Run(
-                                            () => TryRecoverFromHistoricalLogFileData(
-                                                candidate,
-                                                destinationDirectory,
-                                                historicalLogProgress,
-                                                CancellationToken.None,
-                                                out var historicalLogFileRecovery),
+                                            () =>
+                                            {
+                                                var recovered =
+                                                    TryRecoverFromHistoricalLogFileData(
+                                                        candidate,
+                                                        destinationDirectory,
+                                                        historicalLogProgress,
+                                                        CancellationToken.None,
+                                                        out var recoveryResult);
+
+                                                return (Recovered: recovered, Result: recoveryResult);
+                                            },
                                             CancellationToken.None)
                                             .ConfigureAwait(true);
 
-                                    if (historicalLogRecovered)
+                                    if (historicalLogResult.Recovered)
                                     {
-                                        successes.Add(historicalLogFileRecovery);
+                                        successes.Add(historicalLogResult.Result);
                                         continue;
                                     }
                                 }
