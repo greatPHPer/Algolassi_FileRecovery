@@ -2749,25 +2749,31 @@ public sealed class NtfsLogFileHistoricalDataService
 
         var candidates = new List<MappingCandidate>();
 
-        // Only ordering the two operation types needed by this search avoids
-        // sorting the entire retained historical record set.
-        var orderedRelevantRecords =
-            records
-                .Where(record =>
-                    record.RedoOperation == OpenNonresidentAttribute ||
-                    record.RedoOperation == UpdateMappingPairs ||
-                    record.UndoOperation == UpdateMappingPairs)
-                .OrderBy(item => item.Lsn)
-                .ThenBy(item => item.PhysicalOrder)
-                .ToList();
+        // ParseTargetRecordsFromFile already walks the journal from the
+        // wrapped start page forward and assigns PhysicalOrder in that same
+        // journal order. Do not perform another O(n log n) sort here; on a
+        // large retained journal that sort can take many minutes even though
+        // memory remains low.
+        var relevantOpenOrMappingCount =
+            records.Count(record =>
+                record.RedoOperation == OpenNonresidentAttribute ||
+                record.RedoOperation == UpdateMappingPairs ||
+                record.UndoOperation == UpdateMappingPairs);
 
         System.Diagnostics.Trace.WriteLine(
             $"NTFS $LogFile mapping search: " +
             $"fileRef={targetFileReference}, " +
             $"retainedRecords={records.Count:N0}, " +
-            $"relevantOpenOrMappingRecords={orderedRelevantRecords.Count:N0}.");
+            $"relevantOpenOrMappingRecords={relevantOpenOrMappingCount:N0}.");
 
-        foreach (var record in orderedRelevantRecords)
+        foreach (var record in records)
+        {
+            if (record.RedoOperation != OpenNonresidentAttribute &&
+                record.RedoOperation != UpdateMappingPairs &&
+                record.UndoOperation != UpdateMappingPairs)
+            {
+                continue;
+            }
         {
             if (record.RedoOperation == OpenNonresidentAttribute)
             {
