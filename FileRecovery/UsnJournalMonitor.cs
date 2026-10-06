@@ -2511,3 +2511,425 @@ public sealed class UsnJournalMonitor : IDisposable
         path.Trim().Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
 
     private static List<UsnRecord> ReadRecords(
+        SafeFileHandle volumeHandle,
+        ulong journalId,
+        long startUsn,
+        out long nextUsn,
+        uint reasonMask = UsnReasonFileDelete)
+    {
+        // Use the V0 NTFS input layout. Modern NTFS volumes can return
+        // USN_RECORD_V3 records with 128-bit file IDs.
+        var request = new ReadUsnJournalRequest
+        {
+            StartUsn = startUsn,
+            ReasonMask = reasonMask,
+            ReturnOnlyOnClose = 0,
+            Timeout = 0,
+            BytesToWaitFor = 0,
+            UsnJournalId = journalId
+        };
+
+        var input = StructureToBytes(request);
+        var output = new byte[1024 * 1024];
+        nextUsn = startUsn;
+
+        if (!DeviceIoControl(
+                volumeHandle,
+                FsctlReadUsnJournal,
+                input,
+                (uint)input.Length,
+                output,
+                (uint)output.Length,
+                out var bytesReturned,
+                IntPtr.Zero))
+        {
+            var error = Marshal.GetLastWin32Error();
+
+            if (error == ErrorJournalDeleteInProgress ||
+                error == ErrorJournalNotActive ||
+                error == ErrorJournalEntryDeleted)
+            {
+                return [];
+            }
+
+            throw new Win32Exception(
+                error,
+                $"FSCTL_READ_USN_JOURNAL failed (error {error}) at USN {startUsn} for journal {journalId}.");
+        }
+
+        if (bytesReturned < sizeof(long))
+        {
+            return [];
+        }
+
+        nextUsn = BinaryPrimitives.ReadInt64LittleEndian(
+            output.AsSpan(0, 8));
+
+        var records = new List<UsnRecord>();
+        var offset = 8;
+
+        while (offset + 4 <= bytesReturned)
+        {
+            var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                output.AsSpan(offset, 4));
+
+            if (recordLength < UsnRecordV2MinimumLength ||
+                recordLength > bytesReturned - offset)
+            {
+                break;
+            }
+
+            var recordSpan = output.AsSpan(
+                offset,
+                checked((int)recordLength));
+
+            var majorVersion = BinaryPrimitives.ReadUInt16LittleEndian(
+                recordSpan.Slice(4, 2));
+
+            ulong fileReference;
+            ulong parentReference;
+            long timestampFileTime;
+            uint reason;
+            uint fileAttributes;
+            ushort nameLength;
+            ushort nameOffset;
+
+            if (majorVersion == 2)
+            {
+                // USN_RECORD_V2
+                fileReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(8, 8));
+
+                parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(16, 8));
+
+                timestampFileTime = BinaryPrimitives.ReadInt64LittleEndian(
+                    recordSpan.Slice(32, 8));
+
+                reason = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(40, 4));
+
+                fileAttributes = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(52, 4));
+
+                nameLength = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(56, 2));
+
+                nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(58, 2));
+            }
+            else if (majorVersion == 3)
+            {
+                // USN_RECORD_V3
+                //
+                // FileReferenceNumber and ParentFileReferenceNumber are
+                // FILE_ID_128 values. On this NTFS volume the traditional
+                // NTFS MFT reference is in the lower 64 bits.
+                if (recordSpan.Length < 76)
+                {
+                    offset += checked((int)recordLength);
+                    continue;
+                }
+
+                // NTFS places its traditional 64-bit MFT file reference in
+                // the first 8 bytes of each FILE_ID_128. The remaining 8 bytes
+                // are the high half of the 128-bit identifier.
+                fileReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(8, 8));
+
+                parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(24, 8));
+
+                timestampFileTime = BinaryPrimitives.ReadInt64LittleEndian(
+                    recordSpan.Slice(48, 8));
+
+                reason = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(56, 4));
+
+                fileAttributes = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(68, 4));
+
+                nameLength = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(72, 2));
+
+                nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(74, 2));
+            }
+            else
+            {
+                // USN_RECORD_V4 or an unknown future version.
+                // Do not guess its layout.
+                offset += checked((int)recordLength);
+                continue;
+            }
+
+            if (nameLength == 0 ||
+                nameOffset + nameLength > recordSpan.Length ||
+                (nameLength & 1) != 0)
+            {
+                offset += checked((int)recordLength);
+                continue;
+            }
+
+            var name = System.Text.Encoding.Unicode.GetString(
+                recordSpan.Slice(nameOffset, nameLength));
+
+            DateTime timestampUtc;
+
+            try
+            {
+                timestampUtc = DateTime.FromFileTimeUtc(
+                    timestampFileTime);
+            }
+            catch
+            {
+                timestampUtc = DateTime.UtcNow;
+            }
+
+            records.Add(
+                new UsnRecord(
+                    fileReference,
+                    parentReference,
+                    reason,
+                    fileAttributes,
+                    name,
+                    timestampUtc));
+
+            offset += checked((int)recordLength);
+        }
+
+        return records;
+    }
+
+    private static string? ResolveParentDirectory(SafeFileHandle volumeHandle, ulong parentFileReference)
+    {
+        var descriptor = new FileIdDescriptor
+        {
+            Size = (uint)Marshal.SizeOf<FileIdDescriptor>(),
+            Type = 0,
+            FileId = unchecked((long)parentFileReference)
+        };
+
+        var directoryHandle = OpenFileById(
+            volumeHandle,
+            ref descriptor,
+            FileReadAttributes,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            FileFlagBackupSemantics);
+
+        if (directoryHandle == IntPtr.Zero ||
+            directoryHandle == new IntPtr(-1))
+        {
+            return null;
+        }
+
+        try
+        {
+            var builder = new System.Text.StringBuilder(1024);
+            var length = GetFinalPathNameByHandle(
+                directoryHandle,
+                builder,
+                (uint)builder.Capacity,
+                0);
+
+            if (length == 0)
+            {
+                return null;
+            }
+
+            if (length >= builder.Capacity)
+            {
+                builder = new System.Text.StringBuilder((int)length + 1);
+                length = GetFinalPathNameByHandle(
+                    directoryHandle,
+                    builder,
+                    (uint)builder.Capacity,
+                    0);
+            }
+
+            if (length == 0)
+            {
+                return null;
+            }
+
+            return NormalizeFinalPath(builder.ToString());
+        }
+        finally
+        {
+            CloseHandle(directoryHandle);
+        }
+    }
+
+    private static string NormalizeFinalPath(string path)
+    {
+        // GetFinalPathNameByHandle returns device-style paths such as
+        // "\\?\E:\TestRecovery". Convert them to ordinary Win32 paths so
+        // they compare correctly with FileSystemWatcher/history paths.
+        if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+        {
+            return @"\\" + path[8..];
+        }
+
+        if (path.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
+        {
+            return path[4..];
+        }
+
+        return path;
+    }
+
+    private static IReadOnlyList<DriveInfo> GetNtfsFixedDrives()
+    {
+        var drives = new List<DriveInfo>();
+
+        foreach (var drive in DriveInfo.GetDrives())
+        {
+            try
+            {
+                if (drive.IsReady &&
+                    drive.DriveType == DriveType.Fixed &&
+                    string.Equals(drive.DriveFormat, "NTFS", StringComparison.OrdinalIgnoreCase))
+                {
+                    drives.Add(drive);
+                }
+            }
+            catch
+            {
+                // Drive availability can change during enumeration.
+            }
+        }
+
+        return drives;
+    }
+
+    private static byte[] StructureToBytes<T>(T value) where T : struct
+    {
+        var size = Marshal.SizeOf<T>();
+        var bytes = new byte[size];
+        var handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+
+        try
+        {
+            Marshal.StructureToPtr(value, handle.AddrOfPinnedObject(), fDeleteOld: false);
+            return bytes;
+        }
+        finally
+        {
+            handle.Free();
+        }
+    }
+
+    public void Dispose()
+    {
+        Stop();
+        _historicalLogFileSnapshotGate.Dispose();
+        _cts.Dispose();
+    }
+
+public sealed record UsnDeletedFileRecord(
+    string FullPath,
+    ulong FileReferenceNumber,
+    ulong ParentFileReferenceNumber,
+    string FileName,
+    string DirectoryPath,
+    DateTime DeletedAtUtc);
+
+public sealed record HistoricalUsnResolution(
+    string FullPath,
+    ulong FileReferenceNumber,
+    ulong ParentFileReferenceNumber,
+    DateTime DeletedAtUtc);
+
+    private readonly record struct JournalInfo(
+        ulong JournalId,
+        long FirstUsn,
+        long NextUsn,
+        long LowestValidUsn);
+
+    private readonly record struct RecentDeletedRecord(
+        ulong FileReferenceNumber,
+        ulong ParentFileReferenceNumber,
+        string FileName,
+        string? DirectoryPath,
+        DateTime TimestampUtc);
+
+    private readonly record struct UsnRecord(
+        ulong FileReferenceNumber,
+        ulong ParentFileReferenceNumber,
+        uint Reason,
+        uint FileAttributes,
+        string FileName,
+        DateTime TimestampUtc);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CreateUsnJournalData
+    {
+        public ulong MaximumSize;
+        public ulong AllocationDelta;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ReadUsnJournalRequest
+    {
+        public long StartUsn;
+        public uint ReasonMask;
+        public uint ReturnOnlyOnClose;
+        public ulong Timeout;
+        public ulong BytesToWaitFor;
+        public ulong UsnJournalId;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
+    private struct FileIdDescriptor
+    {
+        [FieldOffset(0)]
+        public uint Size;
+
+        [FieldOffset(4)]
+        public int Type;
+
+        [FieldOffset(8)]
+        public long FileId;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle hDevice,
+        uint dwIoControlCode,
+        byte[]? lpInBuffer,
+        uint nInBufferSize,
+        byte[]? lpOutBuffer,
+        uint nOutBufferSize,
+        out uint lpBytesReturned,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenFileById(
+        SafeFileHandle hVolumeHint,
+        ref FileIdDescriptor lpFileId,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwFlagsAndAttributes);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(
+        IntPtr hFile,
+        System.Text.StringBuilder lpszFilePath,
+        uint cchFilePath,
+        uint dwFlags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+}
