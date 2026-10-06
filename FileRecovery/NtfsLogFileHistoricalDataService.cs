@@ -1356,6 +1356,36 @@ public sealed class NtfsLogFileHistoricalDataService
             $"bitmapRecords={bitmapRecords.Count:N0}, " +
             $"bitmapRecordsInDeletionTransactions=[{string.Join(",", bitmapTransactionSummary)}].");
 
+
+        // Compact inventory of every retained $MFT-resident operation for the exact
+        // historical segment. This is diagnostic only and does not relax identity
+        // validation or accept any heuristic data source.
+        foreach (var record in segmentRecords)
+        {
+            var selectedOperation =
+                record.RedoOperation != 0
+                    ? record.RedoOperation
+                    : record.UndoOperation;
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile target segment operation: " +
+                $"fileRef={targetFileReference}, " +
+                $"segment={targetSegment:N0}, " +
+                $"lsn=0x{record.Lsn:X16}, " +
+                $"transaction=0x{record.TransactionId:X8}, " +
+                $"redo=0x{record.RedoOperation:X4}, " +
+                $"undo=0x{record.UndoOperation:X4}, " +
+                $"targetAttribute=0x{record.TargetAttribute:X4}, " +
+                $"recordOffset=0x{record.RecordOffset:X}, " +
+                $"attributeOffset=0x{record.AttributeOffset:X}, " +
+                $"targetVcn={record.TargetVcn:N0}, " +
+                $"clusterBlockOffset={record.ClusterBlockOffset}, " +
+                $"targetBlockSize={record.TargetBlockSize}, " +
+                $"redoBytes={record.RedoData.Length:N0}, " +
+                $"undoBytes={record.UndoData.Length:N0}, " +
+                $"selectedOperation=0x{selectedOperation:X4}.");
+        }
+
         foreach (var record in initializationRecords)
         {
             var actualSequence =
@@ -2774,6 +2804,46 @@ public sealed class NtfsLogFileHistoricalDataService
                     continue;
                 }
 
+                var coveredEndVcn =
+                    extents
+                        .Select(extent =>
+                            extent.VirtualClusterNumber + extent.ClusterCount)
+                        .DefaultIfEmpty(0)
+                        .Max();
+
+                var extentSummary =
+                    string.Join(
+                        "; ",
+                        extents
+                            .Take(32)
+                            .Select(extent =>
+                                $"VCN={extent.VirtualClusterNumber:N0}+" +
+                                $"{extent.ClusterCount:N0}->" +
+                                $"{(extent.IsSparse ? "SPARSE" : extent.LogicalClusterNumber.ToString("N0"))}"));
+
+                if (extents.Count > 32)
+                {
+                    extentSummary += "; ...";
+                }
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile historical mapping candidate: " +
+                    $"fileRef={targetFileReference}, " +
+                    $"targetSegment={targetSegment:N0}, " +
+                    $"lsn=0x{record.Lsn:X16}, " +
+                    $"transaction=0x{record.TransactionId:X8}, " +
+                    $"targetAttribute=0x{record.TargetAttribute:X4}, " +
+                    $"identity={(exactMftTarget ? "MFT-segment" : "open-attribute")}, " +
+                    $"recordTargetOffset=0x{record.RecordOffset:X}, " +
+                    $"attributeTargetOffset=0x{record.AttributeOffset:X}, " +
+                    $"targetVcn={record.TargetVcn:N0}, " +
+                    $"clusterBlockOffset={record.ClusterBlockOffset}, " +
+                    $"targetBlockSize={record.TargetBlockSize}, " +
+                    $"mappingBytes={mappingBytes.Length:N0}, " +
+                    $"extentCount={extents.Count:N0}, " +
+                    $"coveredEndVcn={coveredEndVcn:N0}, " +
+                    $"extents=[{extentSummary}].");
+
                 candidates.Add(
                     new MappingCandidate(
                         record.Lsn,
@@ -3298,434 +3368,3 @@ public sealed class NtfsLogFileHistoricalDataService
                 targetOffset %
                     (uint)geometry.LogPageSize != 0)
             {
-                continue;
-            }
-
-            Buffer.BlockCopy(
-                page,
-                0,
-                logData,
-                checked((int)targetOffset),
-                geometry.LogPageSize);
-        }
-    }
-
-    private static bool TryApplyLogPageFixups(
-        byte[] page,
-        int bytesPerSector)
-    {
-        if (page.Length == 0 ||
-            bytesPerSector <= 0 ||
-            page.Length % bytesPerSector != 0)
-        {
-            return false;
-        }
-
-        var usaOffset =
-            BinaryPrimitives.ReadUInt16LittleEndian(
-                page.AsSpan(4, 2));
-
-        var usaSize =
-            BinaryPrimitives.ReadUInt16LittleEndian(
-                page.AsSpan(6, 2));
-
-        if (usaOffset < 8 ||
-            usaSize < 2 ||
-            usaOffset + usaSize * 2 >
-            page.Length ||
-            (usaSize - 1) *
-            bytesPerSector !=
-            page.Length)
-        {
-            return false;
-        }
-
-        var sequence =
-            page.AsSpan(
-                    usaOffset,
-                    2)
-                .ToArray();
-
-        for (var i = 1; i < usaSize; i++)
-        {
-            var trailer =
-                checked(
-                    i * bytesPerSector - 2);
-
-            if (!page.AsSpan(
-                    trailer,
-                    2)
-                .SequenceEqual(sequence))
-            {
-                return false;
-            }
-
-            page[trailer] =
-                page[usaOffset + i * 2];
-
-            page[trailer + 1] =
-                page[usaOffset + i * 2 + 1];
-        }
-
-        return true;
-    }
-
-    private static byte[] ReadMappedLogicalFile(
-        SafeFileHandle volumeHandle,
-        uint bytesPerCluster,
-        IReadOnlyList<NtfsDataExtent> extents,
-        long logicalLength,
-        IProgress<string>? progress = null,
-        CancellationToken cancellationToken = default)
-    {
-        if (logicalLength <= 0 ||
-            logicalLength > int.MaxValue)
-        {
-            return [];
-        }
-
-        var result =
-            new byte[checked((int)logicalLength)];
-
-        var destinationOffset = 0;
-        var remaining = logicalLength;
-
-        const int ioChunkBytes = 8 * 1024 * 1024;
-        long totalRead = 0;
-
-        foreach (var extent in extents.OrderBy(
-                     item => item.VirtualClusterNumber))
-        {
-            var extentBytes =
-                checked(
-                    extent.ClusterCount *
-                    (long)bytesPerCluster);
-
-            var extentRemaining =
-                Math.Min(
-                    extentBytes,
-                    remaining);
-
-            if (extentRemaining <= 0)
-            {
-                break;
-            }
-
-            var extentOffset = 0L;
-
-            while (extentRemaining > 0)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var chunkBytes = checked(
-                    (int)Math.Min(
-                        extentRemaining,
-                        ioChunkBytes));
-
-                if (!extent.IsSparse)
-                {
-                    ReadRawExact(
-                        volumeHandle,
-                        checked(
-                            extent.LogicalClusterNumber *
-                            (long)bytesPerCluster +
-                            extentOffset),
-                        result,
-                        destinationOffset,
-                        chunkBytes);
-                }
-
-                destinationOffset = checked(
-                    destinationOffset + chunkBytes);
-
-                extentOffset = checked(
-                    extentOffset + chunkBytes);
-
-                extentRemaining -= chunkBytes;
-                remaining -= chunkBytes;
-                totalRead += chunkBytes;
-
-                progress?.Report(
-                    $"Reading historical NTFS $LogFile... " +
-                    $"{totalRead / (1024d * 1024d):0} / " +
-                    $"{logicalLength / (1024d * 1024d):0} MB");
-
-                if (remaining == 0)
-                {
-                    break;
-                }
-            }
-
-            if (remaining == 0)
-            {
-                break;
-            }
-        }
-
-        if (remaining != 0)
-        {
-            throw new EndOfStreamException(
-                "The retained $LogFile extents did not cover its logical size.");
-        }
-
-        return result;
-    }
-
-    private static void ReadRawExact(
-        SafeFileHandle volumeHandle,
-        long fileOffset,
-        byte[] destination,
-        int destinationOffset,
-        int length)
-    {
-        using var completionEvent =
-            new ManualResetEvent(false);
-
-        var nativeOverlapped =
-            new NativeOverlapped
-            {
-                OffsetLow =
-                    unchecked(
-                        (int)(fileOffset &
-                              0xFFFFFFFF)),
-                OffsetHigh =
-                    unchecked(
-                        (int)(fileOffset >> 32)),
-                HEvent =
-                    completionEvent.SafeWaitHandle
-                        .DangerousGetHandle()
-            };
-
-        var overlappedPtr =
-            Marshal.AllocHGlobal(
-                Marshal.SizeOf<NativeOverlapped>());
-
-        try
-        {
-            Marshal.StructureToPtr(
-                nativeOverlapped,
-                overlappedPtr,
-                false);
-
-            var handle =
-                GCHandle.Alloc(
-                    destination,
-                    GCHandleType.Pinned);
-
-            try
-            {
-                var started =
-                    ReadFile(
-                        volumeHandle,
-                        handle.AddrOfPinnedObject() +
-                        destinationOffset,
-                        checked((uint)length),
-                        IntPtr.Zero,
-                        overlappedPtr);
-
-                if (!started)
-                {
-                    var error =
-                        Marshal.GetLastWin32Error();
-
-                    if (error !=
-                        ErrorIoPending)
-                    {
-                        throw new Win32Exception(
-                            error,
-                            $"Could not read NTFS volume data at byte offset {fileOffset:N0}.");
-                    }
-                }
-
-                completionEvent.WaitOne();
-
-                if (!GetOverlappedResult(
-                        volumeHandle,
-                        overlappedPtr,
-                        out var bytesRead,
-                        false) ||
-                    bytesRead != (uint)length)
-                {
-                    throw new EndOfStreamException(
-                        $"NTFS raw read returned {bytesRead:N0} byte(s) instead of {length:N0}.");
-                }
-            }
-            finally
-            {
-                handle.Free();
-            }
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(overlappedPtr);
-        }
-    }
-
-    private static SafeFileHandle CreateVolumeHandle(
-        string root,
-        bool overlapped)
-    {
-        var normalizedRoot =
-            GetNtfsVolumeRoot(root)
-            ?? throw new ArgumentException(
-                "A valid NTFS volume root is required.",
-                nameof(root));
-
-        var volumeName =
-            normalizedRoot.TrimEnd(
-                Path.DirectorySeparatorChar);
-
-        var flags =
-            FileFlagBackupSemantics |
-            (overlapped
-                ? FileFlagOverlapped
-                : 0);
-
-        var handle =
-            CreateFile(
-                $@"\\.\{volumeName[..2]}",
-                GenericRead,
-                FileShareRead |
-                FileShareWrite |
-                FileShareDelete,
-                IntPtr.Zero,
-                OpenExisting,
-                flags,
-                IntPtr.Zero);
-
-        if (handle.IsInvalid)
-        {
-            var error =
-                Marshal.GetLastWin32Error();
-
-            handle.Dispose();
-
-            throw new Win32Exception(
-                error,
-                $"Could not open NTFS source volume {normalizedRoot} for historical $LogFile recovery.");
-        }
-
-        return handle;
-    }
-
-    private static string? GetNtfsVolumeRoot(
-        string path)
-    {
-        var normalized = path.Trim();
-
-        while (normalized.StartsWith(
-                   @"\?",
-                   StringComparison.Ordinal) ||
-               normalized.StartsWith(
-                   @"\.",
-                   StringComparison.Ordinal))
-        {
-            normalized = normalized[4..];
-        }
-
-        return Path.GetPathRoot(normalized);
-    }
-
-    private static int Align8(int value) =>
-        checked((value + 7) & ~7);
-
-    private static string EncodingAscii(
-        byte[] buffer,
-        int offset,
-        int length) =>
-        System.Text.Encoding.ASCII.GetString(
-            buffer,
-            offset,
-            length);
-
-    private sealed record OpenAttributeState(
-        ulong FileReference,
-        string AttributeName);
-
-    private sealed record ResidentDataDefinition(
-        long DataOffset,
-        byte[] InitialValue,
-        ulong GenerationStartLsn = 0,
-        ulong? GenerationEndLsnExclusive = null);
-
-    private sealed record NonresidentDataDefinition(
-        long AttributeOffset,
-        long StartingVcn,
-        long EndingVcn,
-        long FileSizeBytes,
-        int MappingPairsLength,
-        IReadOnlyList<NtfsDataExtent> Extents);
-
-    private sealed record MappingCandidate(
-        ulong Lsn,
-        ushort TargetAttribute,
-        string IdentitySource,
-        IReadOnlyList<NtfsDataExtent> Extents);
-
-    private sealed record ParsedLogRecord(
-        ulong Lsn,
-        ulong ClientPreviousLsn,
-        ulong ClientUndoNextLsn,
-        uint TransactionId,
-        long PhysicalOrder,
-        ushort RedoOperation,
-        ushort UndoOperation,
-        ushort TargetAttribute,
-        ushort RecordOffset,
-        ushort AttributeOffset,
-        long TargetVcn,
-        ushort ClusterBlockOffset,
-        ushort TargetBlockSize,
-        byte[] RedoData,
-        byte[] UndoData);
-
-    private readonly record struct LogGeometry(
-        int SystemPageSize,
-        int LogPageSize,
-        int WrappedStartPage,
-        int RecordHeaderLength,
-        int LogPageDataOffset);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct NativeOverlapped
-    {
-        public IntPtr Internal;
-        public IntPtr InternalHigh;
-        public int OffsetLow;
-        public int OffsetHigh;
-        public IntPtr HEvent;
-    }
-
-    [DllImport(
-        "kernel32.dll",
-        CharSet = CharSet.Unicode,
-        SetLastError = true)]
-    private static extern SafeFileHandle CreateFile(
-        string lpFileName,
-        uint dwDesiredAccess,
-        uint dwShareMode,
-        IntPtr lpSecurityAttributes,
-        uint dwCreationDisposition,
-        uint dwFlagsAndAttributes,
-        IntPtr hTemplateFile);
-
-    [DllImport(
-        "kernel32.dll",
-        SetLastError = true)]
-    private static extern bool GetOverlappedResult(
-        SafeFileHandle hFile,
-        IntPtr lpOverlapped,
-        out uint lpNumberOfBytesTransferred,
-        [MarshalAs(UnmanagedType.Bool)]
-        bool bWait);
-
-    [DllImport(
-        "kernel32.dll",
-        SetLastError = true)]
-    private static extern bool ReadFile(
-        SafeFileHandle hFile,
-        IntPtr lpBuffer,
-        uint nNumberOfBytesToRead,
-        IntPtr lpNumberOfBytesRead,
-        IntPtr lpOverlapped);
-}
