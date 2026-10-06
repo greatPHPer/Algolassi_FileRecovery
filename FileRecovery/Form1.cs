@@ -1319,6 +1319,47 @@ public partial class Form1 : Form
                 {
                     var path = NormalizePath(candidate.FullPath);
 
+                    if (historicalSizeByPath.TryGetValue(path, out var trustedHistoricalSize) &&
+                        trustedHistoricalSize > 0 &&
+                        candidate.FileSizeBytes <= 0)
+                    {
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS candidate historical-size handoff: " +
+                            $"path={candidate.FullPath}, " +
+                            $"fileRef={candidate.FileReferenceNumber}, " +
+                            $"previousSize={candidate.FileSizeBytes:N0}, " +
+                            $"historicalSize={trustedHistoricalSize:N0}. " +
+                            "Propagating the trusted $LogFile historical size into the recovery candidate.");
+
+                        return new RecoveryCandidate
+                        {
+                            FileReferenceNumber = candidate.FileReferenceNumber,
+                            ParentFileReferenceNumber = candidate.ParentFileReferenceNumber,
+                            Name = candidate.Name,
+                            DirectoryPath = candidate.DirectoryPath,
+                            LastUsnTimestampUtc = candidate.LastUsnTimestampUtc,
+                            Strength = candidate.Strength,
+                            Evidence = string.Join(
+                                " ",
+                                new[]
+                                {
+                                    candidate.Evidence,
+                                    $"Trusted historical NTFS $LogFile size: {trustedHistoricalSize:N0} byte(s)."
+                                }.Where(text => !string.IsNullOrWhiteSpace(text))),
+                            DataStreamFound = candidate.DataStreamFound,
+                            DataStreamResident = candidate.DataStreamResident,
+                            FileSizeBytes = trustedHistoricalSize,
+                            ValidDataLengthBytes = candidate.ValidDataLengthBytes,
+                            NtfsDataSnapshot = candidate.NtfsDataSnapshot?.Clone(),
+                            ResidentData = candidate.ResidentData,
+                            DataExtents = candidate.DataExtents,
+                            ExtentAllocations = candidate.ExtentAllocations,
+                            FreeDataClusterCount = candidate.FreeDataClusterCount,
+                            AllocatedDataClusterCount = candidate.AllocatedDataClusterCount,
+                            DataEvidence = candidate.DataEvidence
+                        };
+                    }
+
                     if (!candidate.DataStreamFound ||
                         !historicalSizeByPath.TryGetValue(path, out var historicalSize) ||
                         historicalSize <= 0 ||
