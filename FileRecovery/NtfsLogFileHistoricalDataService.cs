@@ -41,9 +41,8 @@ public sealed class NtfsLogFileHistoricalDataService
     // The marker diagnostic intentionally uses the unfiltered parser because it is
     // a generic content search. Targeted recovery must not materialize unrelated
     // transaction payloads into memory.
-    // Serialize every historical $LogFile operation in this process. Targeted
-    // recovery and the background USN monitor otherwise can each materialize a
-    // large circular journal simultaneously, creating avoidable memory pressure.
+    // Serialize all historical $LogFile operations in this process so the
+    // targeted diagnostic cannot overlap a background journal capture.
     private static readonly SemaphoreSlim HistoricalLogFileGate = new(1, 1);
 
     private static readonly HashSet<ushort> RecoveryRelevantOperations =
@@ -73,8 +72,7 @@ public sealed class NtfsLogFileHistoricalDataService
         HistoricalLogFileGate.Wait();
         try
         {
-
-        if (string.IsNullOrWhiteSpace(rootPath) ||
+            if (string.IsNullOrWhiteSpace(rootPath) ||
             string.IsNullOrWhiteSpace(marker))
         {
             evidence = "A source volume and marker are required.";
@@ -283,7 +281,6 @@ public sealed class NtfsLogFileHistoricalDataService
             return false;
         }
 
-        HistoricalLogFileGate.Wait(cancellationToken);
         try
         {
             WindowsPrivilege.EnableSeBackupPrivilege();
@@ -1279,6 +1276,9 @@ public sealed class NtfsLogFileHistoricalDataService
                 .ThenBy(record => record.PhysicalOrder)
                 .ToList();
 
+        // Diagnostic inventory of every retained $MFT-resident operation for the
+        // exact historical segment. This is diagnostic only and does not relax
+        // identity validation or accept heuristic data.
         foreach (var record in segmentRecords)
         {
             var selectedOperation =
@@ -3784,34 +3784,3 @@ public sealed class NtfsLogFileHistoricalDataService
 
     [DllImport(
         "kernel32.dll",
-        CharSet = CharSet.Unicode,
-        SetLastError = true)]
-    private static extern SafeFileHandle CreateFile(
-        string lpFileName,
-        uint dwDesiredAccess,
-        uint dwShareMode,
-        IntPtr lpSecurityAttributes,
-        uint dwCreationDisposition,
-        uint dwFlagsAndAttributes,
-        IntPtr hTemplateFile);
-
-    [DllImport(
-        "kernel32.dll",
-        SetLastError = true)]
-    private static extern bool GetOverlappedResult(
-        SafeFileHandle hFile,
-        IntPtr lpOverlapped,
-        out uint lpNumberOfBytesTransferred,
-        [MarshalAs(UnmanagedType.Bool)]
-        bool bWait);
-
-    [DllImport(
-        "kernel32.dll",
-        SetLastError = true)]
-    private static extern bool ReadFile(
-        SafeFileHandle hFile,
-        IntPtr lpBuffer,
-        uint nNumberOfBytesToRead,
-        IntPtr lpNumberOfBytesRead,
-        IntPtr lpOverlapped);
-}
