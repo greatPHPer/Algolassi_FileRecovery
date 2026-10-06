@@ -1450,7 +1450,7 @@ public sealed class NtfsLogFileHistoricalDataService
                 var references = ReadPossibleOpenAttributeFileReferences(
                     record.RedoData);
 
-                if (references.Length == 0)
+                if (references.Count == 0)
                 {
                     continue;
                 }
