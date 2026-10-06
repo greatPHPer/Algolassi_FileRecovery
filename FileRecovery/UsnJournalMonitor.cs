@@ -681,6 +681,47 @@ public sealed class UsnJournalMonitor : IDisposable
                     RecoveryStrength = "Weak"
                 };
 
+                // For deletions that occurred after AlgoLassi armed the USN journal,
+                // capture the exact MFT generation BEFORE resolving the parent path.
+                // Parent-directory resolution reads additional filesystem metadata and
+                // can give NTFS enough time to reuse the just-deleted MFT segment.
+                // The historical/pre-start scan deliberately stays on the old path.
+                if (record.TimestampUtc >= _monitorStartedAtUtc &&
+                    record.TimestampUtc <= DateTime.UtcNow.AddMinutes(1))
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS deletion-time capture-first: " +
+                        $"path={record.FileName}, " +
+                        $"fileRef={record.FileReferenceNumber}, " +
+                        $"parentRef={record.ParentFileReferenceNumber}, " +
+                        $"deleteTime={record.TimestampUtc:O}.");
+
+                    CaptureNtfsDeletionSnapshot(
+                        deletion,
+                        volumeKey,
+                        record.FileReferenceNumber,
+                        record.ParentFileReferenceNumber,
+                        record.FileName,
+                        cachedDirectory ?? "(Parent directory unavailable)",
+                        allowBoundedDeleteTransition: false);
+
+                    if (deletion.NtfsDataSnapshot?.IsComplete == true)
+                    {
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS deletion-time capture-first SUCCESS: " +
+                            $"fileRef={record.FileReferenceNumber}, " +
+                            $"size={deletion.NtfsDataSnapshot.FileSizeBytes:N0}, " +
+                            $"sha256={deletion.NtfsDataSnapshot.Sha256 ?? "(none)"}.");
+                    }
+                    else
+                    {
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS deletion-time capture-first MISS: " +
+                            $"fileRef={record.FileReferenceNumber}, " +
+                            $"reason=exact-generation $DATA capture did not complete.");
+                    }
+                }
+
                 var directory = cachedDirectory ??
                     ResolveParentDirectory(volumeHandle, record.ParentFileReferenceNumber);
 
