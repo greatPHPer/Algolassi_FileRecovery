@@ -2749,9 +2749,25 @@ public sealed class NtfsLogFileHistoricalDataService
 
         var candidates = new List<MappingCandidate>();
 
-        foreach (var record in records
-                     .OrderBy(item => item.Lsn)
-                     .ThenBy(item => item.PhysicalOrder))
+        // Only ordering the two operation types needed by this search avoids
+        // sorting the entire retained historical record set.
+        var orderedRelevantRecords =
+            records
+                .Where(record =>
+                    record.RedoOperation == OpenNonresidentAttribute ||
+                    record.RedoOperation == UpdateMappingPairs ||
+                    record.UndoOperation == UpdateMappingPairs)
+                .OrderBy(item => item.Lsn)
+                .ThenBy(item => item.PhysicalOrder)
+                .ToList();
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile mapping search: " +
+            $"fileRef={targetFileReference}, " +
+            $"retainedRecords={records.Count:N0}, " +
+            $"relevantOpenOrMappingRecords={orderedRelevantRecords.Count:N0}.");
+
+        foreach (var record in orderedRelevantRecords)
         {
             if (record.RedoOperation == OpenNonresidentAttribute)
             {
