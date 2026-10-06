@@ -2973,6 +2973,7 @@ public sealed class NtfsLogFileHistoricalDataService
         var result = new List<ParsedLogRecord>();
         var pageCount = logData.Length / geometry.LogPageSize;
         var physicalOrder = 0L;
+        var page = new byte[geometry.LogPageSize];
 
         for (var pageIndex = geometry.WrappedStartPage;
              pageIndex < pageCount;
@@ -3775,8 +3776,7 @@ public sealed class NtfsLogFileHistoricalDataService
                     $"{pageCount - geometry.WrappedStartPage:N0}");
             }
 
-            var page =
-                new byte[geometry.LogPageSize];
+            Array.Clear(page, 0, page.Length);
 
             input.Position =
                 checked(
@@ -3907,25 +3907,17 @@ public sealed class NtfsLogFileHistoricalDataService
                             clientSpan.Slice(22, 2));
 
                     var exactMftTarget =
-                        CalculateTargetMftSegment(
-                            new ParsedLogRecord(
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                redoOperation,
-                                undoOperation,
-                                targetAttribute,
-                                targetRecordOffset,
-                                attributeOffset,
-                                targetVcn,
-                                clusterBlockOffset,
-                                targetBlockSize,
-                                [],
-                                []),
-                            bytesPerCluster,
-                            bytesPerFileRecordSegment) == targetSegment;
+                        targetVcn >= 0 &&
+                        bytesPerCluster != 0 &&
+                        bytesPerFileRecordSegment != 0 &&
+                        checked(
+                            (targetVcn *
+                             (long)bytesPerCluster +
+                             clusterBlockOffset * 512L) /
+                            (targetBlockSize > 0
+                                ? targetBlockSize * 512L
+                                : (long)bytesPerFileRecordSegment)) ==
+                            (long)targetSegment;
 
                     var isOpenAttribute =
                         redoOperation == OpenNonresidentAttribute;
