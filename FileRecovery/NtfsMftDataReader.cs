@@ -2481,6 +2481,8 @@ public sealed class NtfsMftDataReader
                 return false;
             }
 
+            TraceDataStreamLayout("capture-layout", fileReferenceNumber, stream, volumeInfo.BytesPerCluster);
+
             if (stream.FileSizeBytes < 0)
             {
                 return false;
@@ -2582,6 +2584,8 @@ public sealed class NtfsMftDataReader
                 capturedData = [];
                 return false;
             }
+
+            TraceCapturedContent("capture-content", fileReferenceNumber, capturedData);
 
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS deletion snapshot: captured nonresident data fileRef={fileReferenceNumber}, " +
@@ -4098,6 +4102,63 @@ public sealed class NtfsMftDataReader
         public bool Found { get; init; }
         public bool IsResident { get; init; }
         public byte[]? ResidentData { get; init; }
+    }
+
+    // DIAGNOSTIC ONLY: no behavioral effect.
+    private static void TraceDataStreamLayout(
+        string tag,
+        ulong fileReferenceNumber,
+        NtfsDataStreamInfo stream,
+        uint bytesPerCluster)
+    {
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS {tag}: fileRef={fileReferenceNumber}, resident={stream.IsResident}, " +
+            $"fileSize={stream.FileSizeBytes:N0}, validDataLength={stream.ValidDataLengthBytes:N0}, " +
+            $"extents={stream.Extents.Count:N0}, bytesPerCluster={bytesPerCluster}.");
+
+        long mappedClusters = 0;
+        long sparseClusters = 0;
+        foreach (var extent in stream.Extents)
+        {
+            mappedClusters += extent.ClusterCount;
+            if (extent.IsSparse)
+            {
+                sparseClusters += extent.ClusterCount;
+            }
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS {tag}: extent vcn={extent.VirtualClusterNumber}, " +
+                $"clusters={extent.ClusterCount}, lcn={extent.LogicalClusterNumber}, " +
+                $"sparse={extent.IsSparse}, byteOffset={(extent.IsSparse ? -1L : extent.LogicalClusterNumber * (long)bytesPerCluster)}.");
+        }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS {tag}: mappedClusters={mappedClusters}, sparseClusters={sparseClusters}, " +
+            $"mappedBytes={mappedClusters * bytesPerCluster:N0}, " +
+            $"vdlIsZeroButSizeIsNot={stream.ValidDataLengthBytes == 0 && stream.FileSizeBytes > 0}.");
+    }
+
+    // DIAGNOSTIC ONLY: no behavioral effect.
+    private static void TraceCapturedContent(
+        string tag,
+        ulong fileReferenceNumber,
+        byte[] data)
+    {
+        var nonZero = 0L;
+        foreach (var b in data)
+        {
+            if (b != 0)
+            {
+                nonZero++;
+            }
+        }
+
+        var head = Convert.ToHexString(data.AsSpan(0, Math.Min(32, data.Length)));
+        var sha = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(data));
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS {tag}: fileRef={fileReferenceNumber}, bytes={data.LongLength:N0}, " +
+            $"nonZeroBytes={nonZero:N0}, allZero={nonZero == 0}, head32={head}, sha256={sha}.");
     }
 
     private static void ReadRawClusters(
