@@ -4022,11 +4022,32 @@ public sealed class NtfsLogFileHistoricalDataService
                             clientSpan,
                             targetFileReference);
 
+                    // Keep the small set of NTFS history operations needed to
+                    // reconstruct the target file's identity and data. In
+                    // particular, retain ALL OpenNonresidentAttribute and
+                    // UpdateNonresidentValue records so the later exact
+                    // file-reference association can be performed from the
+                    // complete journal ordering. Do NOT retain journal-wide
+                    // bitmap/transaction traffic unless it belongs to the
+                    // target deletion transaction.
+                    var isHistoricalDataOperation =
+                        redoOperation == 0x0002 || // InitializeFileRecordSegment
+                        undoOperation == 0x0002 ||
+                        redoOperation == DeallocateFileRecordSegment ||
+                        undoOperation == DeallocateFileRecordSegment ||
+                        redoOperation == 0x0007 || // UpdateResidentValue
+                        undoOperation == 0x0007 ||
+                        redoOperation == UpdateNonresidentValue ||
+                        undoOperation == UpdateNonresidentValue ||
+                        redoOperation == UpdateMappingPairs ||
+                        undoOperation == UpdateMappingPairs ||
+                        redoOperation == SetNewAttributeSizes ||
+                        undoOperation == SetNewAttributeSizes ||
+                        redoOperation == OpenNonresidentAttribute ||
+                        undoOperation == OpenNonresidentAttribute;
+
                     var keep =
-                        exactMftTarget ||
-                        openTargetsExact ||
-                        isTargetNonresidentUpdate ||
-                        isTargetMappingUpdate ||
+                        isHistoricalDataOperation ||
                         isTargetBitmap ||
                         isTargetTransactionRecord ||
                         isTargetDump;
