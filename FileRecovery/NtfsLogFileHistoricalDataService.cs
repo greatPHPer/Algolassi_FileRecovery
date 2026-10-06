@@ -2973,7 +2973,6 @@ public sealed class NtfsLogFileHistoricalDataService
         var result = new List<ParsedLogRecord>();
         var pageCount = logData.Length / geometry.LogPageSize;
         var physicalOrder = 0L;
-        var page = new byte[geometry.LogPageSize];
 
         for (var pageIndex = geometry.WrappedStartPage;
              pageIndex < pageCount;
@@ -3763,6 +3762,7 @@ public sealed class NtfsLogFileHistoricalDataService
             new Dictionary<ushort, bool>();
 
         var physicalOrder = 0L;
+        var page = new byte[geometry.LogPageSize];
 
         for (var pageIndex = geometry.WrappedStartPage;
              pageIndex < pageCount;
