@@ -1132,23 +1132,10 @@ public sealed class UsnJournalMonitor : IDisposable
             // inference from the reused MFT generation.
             var knownSize = deletion.FileSizeBytes.GetValueOrDefault();
 
-            if (knownSize <= 0)
+            if (knownSize < 0 ||
+                knownSize > DeleteSnapshotMaxBytes)
             {
-                System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $LogFile live snapshot: skipped because no trusted " +
-                    $"file size is available for {deletion.FullPath}. " +
-                    "Explicit Targeted Historical recovery remains available when " +
-                    "an exact historical size is supplied.");
-                return false;
-            }
-
-            if (knownSize > DeleteSnapshotMaxBytes)
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"NTFS $LogFile live snapshot: skipped because known size " +
-                    $"exceeds the live snapshot limit for {deletion.FullPath}: " +
-                    $"{knownSize:N0}.");
-                return false;
+                knownSize = 0;
             }
 
             if (!dataReader.TryRecoverFileData(
