@@ -3761,6 +3761,13 @@ public sealed class NtfsLogFileHistoricalDataService
         var targetOpenAttributes =
             new Dictionary<ushort, bool>();
 
+        // Retain transaction/bitmap records only after the exact target MFT
+        // deallocation transaction has been identified. Retaining every
+        // transaction record in the journal was the main source of the
+        // multi-GB memory growth observed during the V21 run.
+        var targetDeletionTransactions =
+            new HashSet<uint>();
+
         var physicalOrder = 0L;
         var page = new byte[geometry.LogPageSize];
 
@@ -3977,19 +3984,36 @@ public sealed class NtfsLogFileHistoricalDataService
                               out var mappingOpen) &&
                           mappingOpen));
 
-                    var isTargetBitmap =
-                        redoOperation == SetBitsInNonresidentBitmap ||
-                        undoOperation == SetBitsInNonresidentBitmap ||
-                        redoOperation == ClearBitsInNonresidentBitmap ||
-                        undoOperation == ClearBitsInNonresidentBitmap;
+                    var isTargetDeallocation =
+                        exactMftTarget &&
+                        (redoOperation == DeallocateFileRecordSegment ||
+                         undoOperation == DeallocateFileRecordSegment) &&
+                        transactionId != 0;
 
-                    var isTransaction =
-                        redoOperation == PrepareTransaction ||
-                        undoOperation == PrepareTransaction ||
-                        redoOperation == CommitTransaction ||
-                        undoOperation == CommitTransaction ||
-                        redoOperation == ForgetTransaction ||
-                        undoOperation == ForgetTransaction;
+                    if (isTargetDeallocation)
+                    {
+                        targetDeletionTransactions.Add(transactionId);
+                    }
+
+                    var isTargetTransaction =
+                        transactionId != 0 &&
+                        targetDeletionTransactions.Contains(transactionId);
+
+                    var isTargetBitmap =
+                        isTargetTransaction &&
+                        (redoOperation == SetBitsInNonresidentBitmap ||
+                         undoOperation == SetBitsInNonresidentBitmap ||
+                         redoOperation == ClearBitsInNonresidentBitmap ||
+                         undoOperation == ClearBitsInNonresidentBitmap);
+
+                    var isTargetTransactionRecord =
+                        isTargetTransaction &&
+                        (redoOperation == PrepareTransaction ||
+                         undoOperation == PrepareTransaction ||
+                         redoOperation == CommitTransaction ||
+                         undoOperation == CommitTransaction ||
+                         redoOperation == ForgetTransaction ||
+                         undoOperation == ForgetTransaction);
 
                     var isTargetDump =
                         (redoOperation == 0x001D ||
@@ -4004,7 +4028,7 @@ public sealed class NtfsLogFileHistoricalDataService
                         isTargetNonresidentUpdate ||
                         isTargetMappingUpdate ||
                         isTargetBitmap ||
-                        isTransaction ||
+                        isTargetTransactionRecord ||
                         isTargetDump;
 
                     if (keep)
