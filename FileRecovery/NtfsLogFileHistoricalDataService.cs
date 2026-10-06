@@ -269,6 +269,8 @@ public sealed class NtfsLogFileHistoricalDataService
             return false;
         }
 
+        string? temporaryLogFile = null;
+
         try
         {
             WindowsPrivilege.EnableSeBackupPrivilege();
@@ -303,24 +305,26 @@ public sealed class NtfsLogFileHistoricalDataService
                 MaxHistoricalRecoveryLogBytes);
 
             progress?.Report(
-                $"Reading historical NTFS $LogFile for {expectedFileName}... " +
+                $"Preparing disk-backed historical NTFS $LogFile workspace for " +
+                $"{expectedFileName}... " +
                 $"{logicalLength / (1024d * 1024d):0} MB journal data");
 
-            var logData = ReadMappedLogicalFile(
-                rawHandle,
-                volumeInfo.BytesPerCluster,
-                logStream.Extents,
-                logicalLength,
-                progress,
-                cancellationToken);
+            temporaryLogFile =
+                WriteMappedLogicalFileToTemporaryFile(
+                    rawHandle,
+                    volumeInfo.BytesPerCluster,
+                    logStream.Extents,
+                    logicalLength,
+                    progress,
+                    cancellationToken);
 
             cancellationToken.ThrowIfCancellationRequested();
 
             progress?.Report(
-                $"Parsing historical NTFS $LogFile for {expectedFileName}...");
+                $"Reading historical NTFS $LogFile geometry for {expectedFileName}...");
 
-            if (!TryReadGeometry(
-                    logData,
+            if (!TryReadGeometryFromFile(
+                    temporaryLogFile,
                     volumeInfo.BytesPerSector,
                     out var geometry,
                     out var geometryEvidence))
@@ -329,16 +333,22 @@ public sealed class NtfsLogFileHistoricalDataService
                 return false;
             }
 
-            ApplyFastPages(
-                logData,
-                geometry,
-                volumeInfo.BytesPerSector);
-
-            var records = ParseRecords(
-                logData,
+            ApplyFastPagesToFile(
+                temporaryLogFile,
                 geometry,
                 volumeInfo.BytesPerSector,
-                RecoveryRelevantOperations,
+                cancellationToken);
+
+            progress?.Report(
+                $"Parsing targeted historical NTFS $LogFile records for {expectedFileName}...");
+
+            var records = ParseTargetRecordsFromFile(
+                temporaryLogFile,
+                geometry,
+                volumeInfo.BytesPerSector,
+                fileReferenceNumber,
+                volumeInfo.BytesPerCluster,
+                volumeInfo.BytesPerFileRecordSegment,
                 progress,
                 cancellationToken);
 
@@ -620,6 +630,20 @@ public sealed class NtfsLogFileHistoricalDataService
                 evidence);
 
             return false;
+        }
+        finally
+        {
+            if (!string.IsNullOrWhiteSpace(temporaryLogFile))
+            {
+                try
+                {
+                    File.Delete(temporaryLogFile);
+                }
+                catch
+                {
+                    // Best effort cleanup of the disk-backed journal workspace.
+                }
+            }
         }
     }
 
@@ -3435,6 +3459,643 @@ public sealed class NtfsLogFileHistoricalDataService
         }
 
         return true;
+    }
+
+    private static string WriteMappedLogicalFileToTemporaryFile(
+        SafeFileHandle volumeHandle,
+        uint bytesPerCluster,
+        IReadOnlyList<NtfsDataExtent> extents,
+        long logicalLength,
+        IProgress<string>? progress,
+        CancellationToken cancellationToken)
+    {
+        if (logicalLength <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(logicalLength));
+        }
+
+        var directory =
+            Path.Combine(
+                Path.GetTempPath(),
+                "AlgoLassi.FileRecovery");
+
+        Directory.CreateDirectory(directory);
+
+        var path =
+            Path.Combine(
+                directory,
+                $"NtfsLogFile-{Guid.NewGuid():N}.bin");
+
+        const int ioChunkBytes = 8 * 1024 * 1024;
+        var ioBuffer = new byte[ioChunkBytes];
+        var zeroBuffer = new byte[ioChunkBytes];
+
+        try
+        {
+            using var output =
+                new FileStream(
+                    path,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.Read,
+                    ioChunkBytes,
+                    FileOptions.SequentialScan);
+
+            var remaining = logicalLength;
+            long written = 0;
+
+            foreach (var extent in extents.OrderBy(
+                         item => item.VirtualClusterNumber))
+            {
+                if (remaining <= 0)
+                {
+                    break;
+                }
+
+                var extentBytes =
+                    checked(
+                        extent.ClusterCount *
+                        (long)bytesPerCluster);
+
+                var extentRemaining =
+                    Math.Min(
+                        extentBytes,
+                        remaining);
+
+                var extentOffset = 0L;
+
+                while (extentRemaining > 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var chunkBytes =
+                        checked(
+                            (int)Math.Min(
+                                extentRemaining,
+                                ioChunkBytes));
+
+                    if (extent.IsSparse)
+                    {
+                        output.Write(
+                            zeroBuffer,
+                            0,
+                            chunkBytes);
+                    }
+                    else
+                    {
+                        ReadRawExact(
+                            volumeHandle,
+                            checked(
+                                extent.LogicalClusterNumber *
+                                (long)bytesPerCluster +
+                                extentOffset),
+                            ioBuffer,
+                            0,
+                            chunkBytes);
+
+                        output.Write(
+                            ioBuffer,
+                            0,
+                            chunkBytes);
+                    }
+
+                    extentOffset = checked(
+                        extentOffset + chunkBytes);
+
+                    extentRemaining -= chunkBytes;
+                    remaining -= chunkBytes;
+                    written += chunkBytes;
+
+                    progress?.Report(
+                        $"Writing historical NTFS $LogFile workspace... " +
+                        $"{written / (1024d * 1024d):0} / " +
+                        $"{logicalLength / (1024d * 1024d):0} MB");
+                }
+            }
+
+            if (remaining != 0)
+            {
+                throw new EndOfStreamException(
+                    "The retained $LogFile extents did not cover its logical size.");
+            }
+
+            output.Flush(flushToDisk: false);
+        }
+        catch
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch
+            {
+                // Best effort cleanup after a failed workspace write.
+            }
+
+            throw;
+        }
+
+        return path;
+    }
+
+    private static bool TryReadGeometryFromFile(
+        string path,
+        uint bytesPerSector,
+        out LogGeometry geometry,
+        out string evidence)
+    {
+        geometry = default;
+        evidence = string.Empty;
+
+        using var input =
+            new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                8192,
+                FileOptions.SequentialScan);
+
+        var header = new byte[8192];
+        var totalRead = 0;
+
+        while (totalRead < header.Length)
+        {
+            var read =
+                input.Read(
+                    header,
+                    totalRead,
+                    header.Length - totalRead);
+
+            if (read == 0)
+            {
+                break;
+            }
+
+            totalRead += read;
+        }
+
+        return totalRead > 0 &&
+               TryReadGeometry(
+                   header.AsSpan(
+                       0,
+                       totalRead)
+                       .ToArray(),
+                   bytesPerSector,
+                   out geometry,
+                   out evidence);
+    }
+
+    private static void ApplyFastPagesToFile(
+        string path,
+        LogGeometry geometry,
+        uint bytesPerSector,
+        CancellationToken cancellationToken)
+    {
+        if (geometry.WrappedStartPage != 34)
+        {
+            return;
+        }
+
+        using var stream =
+            new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.ReadWrite,
+                FileShare.Read,
+                geometry.LogPageSize,
+                FileOptions.RandomAccess);
+
+        var page = new byte[geometry.LogPageSize];
+
+        for (var pageIndex = 2; pageIndex < 34; pageIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var sourceOffset =
+                checked(
+                    pageIndex *
+                    (long)geometry.LogPageSize);
+
+            if (sourceOffset +
+                    geometry.LogPageSize >
+                stream.Length)
+            {
+                break;
+            }
+
+            stream.Position = sourceOffset;
+
+            if (stream.Read(page, 0, page.Length) != page.Length)
+            {
+                break;
+            }
+
+            if (!TryApplyLogPageFixups(
+                    page,
+                    checked((int)bytesPerSector)) ||
+                EncodingAscii(page, 0, 4) != "RCRD" ||
+                page.Length < 64)
+            {
+                continue;
+            }
+
+            var targetOffset =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    page.AsSpan(60, 4));
+
+            if (targetOffset <
+                    (uint)(geometry.WrappedStartPage *
+                        geometry.LogPageSize) ||
+                targetOffset +
+                    (uint)geometry.LogPageSize >
+                    (uint)stream.Length ||
+                targetOffset %
+                    (uint)geometry.LogPageSize != 0)
+            {
+                continue;
+            }
+
+            stream.Position = targetOffset;
+            stream.Write(
+                page,
+                0,
+                page.Length);
+        }
+    }
+
+    private static List<ParsedLogRecord> ParseTargetRecordsFromFile(
+        string path,
+        LogGeometry geometry,
+        uint bytesPerSector,
+        ulong targetFileReference,
+        uint bytesPerCluster,
+        uint bytesPerFileRecordSegment,
+        IProgress<string>? progress,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<ParsedLogRecord>();
+
+        using var input =
+            new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                geometry.LogPageSize,
+                FileOptions.SequentialScan);
+
+        var pageCount =
+            checked(
+                (int)(input.Length /
+                    geometry.LogPageSize));
+
+        var targetSegment =
+            targetFileReference &
+            0x0000FFFFFFFFFFFFUL;
+
+        var targetOpenAttributes =
+            new Dictionary<ushort, bool>();
+
+        var physicalOrder = 0L;
+
+        for (var pageIndex = geometry.WrappedStartPage;
+             pageIndex < pageCount;
+             pageIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (progress is not null &&
+                (pageIndex == geometry.WrappedStartPage ||
+                 (pageIndex - geometry.WrappedStartPage) % 128 == 0))
+            {
+                progress.Report(
+                    $"Parsing targeted historical NTFS $LogFile... page " +
+                    $"{pageIndex - geometry.WrappedStartPage + 1:N0} / " +
+                    $"{pageCount - geometry.WrappedStartPage:N0}");
+            }
+
+            var page =
+                new byte[geometry.LogPageSize];
+
+            input.Position =
+                checked(
+                    pageIndex *
+                    (long)geometry.LogPageSize);
+
+            if (input.Read(page, 0, page.Length) != page.Length)
+            {
+                break;
+            }
+
+            if (!TryApplyLogPageFixups(
+                    page,
+                    checked((int)bytesPerSector)) ||
+                EncodingAscii(page, 0, 4) != "RCRD")
+            {
+                continue;
+            }
+
+            var nextRecordOffset =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    page.AsSpan(24, 2));
+
+            if (nextRecordOffset <= geometry.LogPageDataOffset ||
+                nextRecordOffset > page.Length)
+            {
+                nextRecordOffset =
+                    checked((ushort)page.Length);
+            }
+
+            var recordOffset =
+                geometry.LogPageDataOffset;
+
+            while (recordOffset +
+                       geometry.RecordHeaderLength <=
+                   nextRecordOffset)
+            {
+                var clientDataLength =
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        page.AsSpan(recordOffset + 24, 4));
+
+                if (clientDataLength < 32 ||
+                    clientDataLength >
+                    (uint)(
+                        nextRecordOffset -
+                        recordOffset -
+                        geometry.RecordHeaderLength))
+                {
+                    break;
+                }
+
+                var alignedLength =
+                    Align8(
+                        geometry.RecordHeaderLength +
+                        checked((int)clientDataLength));
+
+                if (alignedLength <= 0 ||
+                    recordOffset + alignedLength >
+                    nextRecordOffset)
+                {
+                    break;
+                }
+
+                var clientStart =
+                    checked(
+                        recordOffset +
+                        geometry.RecordHeaderLength);
+
+                var clientEnd =
+                    checked(
+                        clientStart +
+                        (int)clientDataLength);
+
+                if (clientEnd > page.Length)
+                {
+                    break;
+                }
+
+                var clientSpan =
+                    page.AsSpan(
+                        clientStart,
+                        checked((int)clientDataLength));
+
+                var recordType =
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        page.AsSpan(
+                            recordOffset + 32,
+                            4));
+
+                var transactionId =
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        page.AsSpan(
+                            recordOffset + 36,
+                            4));
+
+                if (recordType == LfsClientRecord)
+                {
+                    var redoOperation =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientSpan.Slice(0, 2));
+
+                    var undoOperation =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientSpan.Slice(2, 2));
+
+                    var targetAttribute =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientSpan.Slice(12, 2));
+
+                    var targetRecordOffset =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientSpan.Slice(16, 2));
+
+                    var attributeOffset =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientSpan.Slice(18, 2));
+
+                    var targetVcn =
+                        BinaryPrimitives.ReadInt64LittleEndian(
+                            clientSpan.Slice(24, 8));
+
+                    var clusterBlockOffset =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientSpan.Slice(20, 2));
+
+                    var targetBlockSize =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            clientSpan.Slice(22, 2));
+
+                    var exactMftTarget =
+                        CalculateTargetMftSegment(
+                            new ParsedLogRecord(
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                redoOperation,
+                                undoOperation,
+                                targetAttribute,
+                                targetRecordOffset,
+                                attributeOffset,
+                                targetVcn,
+                                clusterBlockOffset,
+                                targetBlockSize,
+                                [],
+                                []),
+                            bytesPerCluster,
+                            bytesPerFileRecordSegment) == targetSegment;
+
+                    var isOpenAttribute =
+                        redoOperation == OpenNonresidentAttribute;
+
+                    var openTargetsExact =
+                        false;
+
+                    if (isOpenAttribute &&
+                        clientSpan.Length > 0)
+                    {
+                        var openData =
+                            clientSpan.ToArray();
+
+                        if (TryReadOpenAttributeFileReference(
+                                openData,
+                                out var openedFileReference))
+                        {
+                            var openAttributeName =
+                                DecodeUnicodeString(
+                                    ReadLogData(
+                                        openData,
+                                        8,
+                                        10));
+
+                            openTargetsExact =
+                                openedFileReference ==
+                                    targetFileReference &&
+                                string.IsNullOrWhiteSpace(
+                                    openAttributeName);
+
+                            targetOpenAttributes[targetAttribute] =
+                                openTargetsExact;
+                        }
+                    }
+
+                    var isTargetNonresidentUpdate =
+                        redoOperation == UpdateNonresidentValue &&
+                        targetOpenAttributes.TryGetValue(
+                            targetAttribute,
+                            out var targetOpen) &&
+                        targetOpen;
+
+                    var isTargetMappingUpdate =
+                        (redoOperation == UpdateMappingPairs ||
+                         undoOperation == UpdateMappingPairs) &&
+                        (exactMftTarget ||
+                         (targetOpenAttributes.TryGetValue(
+                              targetAttribute,
+                              out var mappingOpen) &&
+                          mappingOpen));
+
+                    var isTargetBitmap =
+                        redoOperation == SetBitsInNonresidentBitmap ||
+                        undoOperation == SetBitsInNonresidentBitmap ||
+                        redoOperation == ClearBitsInNonresidentBitmap ||
+                        undoOperation == ClearBitsInNonresidentBitmap;
+
+                    var isTransaction =
+                        redoOperation == PrepareTransaction ||
+                        undoOperation == PrepareTransaction ||
+                        redoOperation == CommitTransaction ||
+                        undoOperation == CommitTransaction ||
+                        redoOperation == ForgetTransaction ||
+                        undoOperation == ForgetTransaction;
+
+                    var isTargetDump =
+                        (redoOperation == 0x001D ||
+                         undoOperation == 0x001D) &&
+                        ContainsTargetFileReference(
+                            clientSpan,
+                            targetFileReference);
+
+                    var keep =
+                        exactMftTarget ||
+                        openTargetsExact ||
+                        isTargetNonresidentUpdate ||
+                        isTargetMappingUpdate ||
+                        isTargetBitmap ||
+                        isTransaction ||
+                        isTargetDump;
+
+                    if (keep)
+                    {
+                        var clientData =
+                            clientSpan.ToArray();
+
+                        var lsn =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                page.AsSpan(
+                                    recordOffset,
+                                    8));
+
+                        var clientPreviousLsn =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                page.AsSpan(
+                                    recordOffset + 8,
+                                    8));
+
+                        var clientUndoNextLsn =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                page.AsSpan(
+                                    recordOffset + 16,
+                                    8));
+
+                        result.Add(
+                            new ParsedLogRecord(
+                                lsn,
+                                clientPreviousLsn,
+                                clientUndoNextLsn,
+                                transactionId,
+                                physicalOrder++,
+                                redoOperation,
+                                undoOperation,
+                                targetAttribute,
+                                targetRecordOffset,
+                                attributeOffset,
+                                targetVcn,
+                                clusterBlockOffset,
+                                targetBlockSize,
+                                ReadLogData(
+                                    clientData,
+                                    4,
+                                    6),
+                                ReadLogData(
+                                    clientData,
+                                    8,
+                                    10)));
+                    }
+                    else
+                    {
+                        physicalOrder++;
+                    }
+                }
+
+                recordOffset += alignedLength;
+            }
+        }
+
+        progress?.Report(
+            $"Parsed targeted historical NTFS $LogFile: " +
+            $"{result.Count:N0} retained target-relevant record(s).");
+
+        return result;
+    }
+
+    private static bool ContainsTargetFileReference(
+        ReadOnlySpan<byte> data,
+        ulong targetFileReference)
+    {
+        if (targetFileReference == 0 ||
+            data.Length < 8)
+        {
+            return false;
+        }
+
+        for (var offset = 0;
+             offset + 8 <= data.Length;
+             offset += 8)
+        {
+            if (BinaryPrimitives.ReadUInt64LittleEndian(
+                    data.Slice(
+                        offset,
+                        8)) ==
+                targetFileReference)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static byte[] ReadMappedLogicalFile(
