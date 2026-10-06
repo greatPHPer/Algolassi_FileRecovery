@@ -136,7 +136,8 @@ public sealed class TrayApplicationContext : ApplicationContext
             Math.Abs((DateTime.UtcNow - e.Record.DeletedAtUtc).TotalSeconds) <= 30;
 
         if ((!e.Historical && !e.Record.FileReferenceNumber.HasValue || isFreshUsnDelete) &&
-            !string.IsNullOrWhiteSpace(e.Record.FullPath))
+            !string.IsNullOrWhiteSpace(e.Record.FullPath) &&
+            e.Record.NtfsDataSnapshot?.IsComplete != true)
         {
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS immediate live path triggered: path={e.Record.FullPath}, " +
