@@ -1440,7 +1440,6 @@ public sealed class NtfsLogFileHistoricalDataService
             new Dictionary<ushort, List<ParsedLogRecord>>();
 
         var allOpenAttributeCount = 0;
-        var exactOpenAttributeCount = 0;
         var allUpdateNonresidentValueCount = 0;
 
         foreach (var record in records)
@@ -1476,11 +1475,6 @@ public sealed class NtfsLogFileHistoricalDataService
 
                     allOpenAttributeCount++;
 
-                    if (fileReference == targetFileReference &&
-                        string.IsNullOrWhiteSpace(attributeName))
-                    {
-                        exactOpenAttributeCount++;
-                    }
                 }
 
                 continue;
@@ -1515,13 +1509,7 @@ public sealed class NtfsLogFileHistoricalDataService
             }
 
             opens.Sort(
-                static (left, right) =>
-                {
-                    var comparison = left.Lsn.CompareTo(right.Lsn);
-                    return comparison != 0
-                        ? comparison
-                        : 0;
-                });
+                static (left, right) => left.Lsn.CompareTo(right.Lsn));
 
             var updates = attributePair.Value;
             updates.Sort(
