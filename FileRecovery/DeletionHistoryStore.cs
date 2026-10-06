@@ -168,7 +168,7 @@ public sealed class DeletionHistoryStore
                 var ordinaryRecords = _records
                     .Where(x => x.NtfsDataSnapshot?.IsComplete != true)
                     .OrderByDescending(x => x.DeletedAtUtc)
-                    .Take(Math.Max(0, MaxRecords))
+                    .Take(MaxRecords)
                     .ToList();
 
                 _records = snapshotRecords
@@ -294,3 +294,24 @@ public sealed class DeletionHistoryStore
                     File.Delete(temp);
                 }
             }
+            catch
+            {
+                // Best-effort cleanup only.
+            }
+        }
+    }
+
+    private static DeletionRecord Clone(DeletionRecord item) => new()
+    {
+        Id = item.Id,
+        FileReferenceNumber = item.FileReferenceNumber,
+        ParentFileReferenceNumber = item.ParentFileReferenceNumber,
+        FullPath = item.FullPath,
+        FileName = item.FileName,
+        DirectoryPath = item.DirectoryPath,
+        DeletedAtUtc = item.DeletedAtUtc,
+        FileSizeBytes = item.FileSizeBytes,
+        RecoveryStrength = item.RecoveryStrength,
+        NtfsDataSnapshot = item.NtfsDataSnapshot?.Clone()
+    };
+}
