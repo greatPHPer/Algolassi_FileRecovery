@@ -41,9 +41,9 @@ public sealed class NtfsLogFileHistoricalDataService
     // The marker diagnostic intentionally uses the unfiltered parser because it is
     // a generic content search. Targeted recovery must not materialize unrelated
     // transaction payloads into memory.
-    // Serialize all historical $LogFile operations in this process so the
-    // targeted diagnostic cannot overlap a background journal capture.
-    private static readonly SemaphoreSlim HistoricalLogFileGate = new(1, 1);
+    // Serialize historical $LogFile recovery so the targeted diagnostic cannot
+    // overlap a background journal capture in the same process.
+    private static readonly SemaphoreSlim HistoricalLogFileRecoveryGate = new(1, 1);
 
     private static readonly HashSet<ushort> RecoveryRelevantOperations =
     [
@@ -69,10 +69,7 @@ public sealed class NtfsLogFileHistoricalDataService
     {
         evidence = string.Empty;
 
-        HistoricalLogFileGate.Wait();
-        try
-        {
-            if (string.IsNullOrWhiteSpace(rootPath) ||
+        if (string.IsNullOrWhiteSpace(rootPath) ||
             string.IsNullOrWhiteSpace(marker))
         {
             evidence = "A source volume and marker are required.";
@@ -86,7 +83,7 @@ public sealed class NtfsLogFileHistoricalDataService
             return false;
         }
 
-        HistoricalLogFileGate.Wait(cancellationToken);
+        HistoricalLogFileRecoveryGate.Wait(cancellationToken);
         try
         {
             WindowsPrivilege.EnableSeBackupPrivilege();
@@ -242,10 +239,6 @@ public sealed class NtfsLogFileHistoricalDataService
                 $"NTFS $LogFile marker diagnostic exception: {evidence}");
 
             return false;
-        }
-        finally
-        {
-            HistoricalLogFileGate.Release();
         }
     }
 
@@ -635,7 +628,7 @@ public sealed class NtfsLogFileHistoricalDataService
         }
         finally
         {
-            HistoricalLogFileGate.Release();
+            HistoricalLogFileRecoveryGate.Release();
         }
     }
 
