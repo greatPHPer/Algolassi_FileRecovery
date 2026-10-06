@@ -1260,9 +1260,6 @@ public sealed class NtfsLogFileHistoricalDataService
                 .ThenBy(record => record.PhysicalOrder)
                 .ToList();
 
-        // Diagnostic inventory of every retained $MFT-resident operation for the
-        // exact historical segment. This is diagnostic only and does not relax
-        // identity validation or accept heuristic data.
         foreach (var record in segmentRecords)
         {
             var selectedOperation =
@@ -3768,3 +3765,34 @@ public sealed class NtfsLogFileHistoricalDataService
 
     [DllImport(
         "kernel32.dll",
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport(
+        "kernel32.dll",
+        SetLastError = true)]
+    private static extern bool GetOverlappedResult(
+        SafeFileHandle hFile,
+        IntPtr lpOverlapped,
+        out uint lpNumberOfBytesTransferred,
+        [MarshalAs(UnmanagedType.Bool)]
+        bool bWait);
+
+    [DllImport(
+        "kernel32.dll",
+        SetLastError = true)]
+    private static extern bool ReadFile(
+        SafeFileHandle hFile,
+        IntPtr lpBuffer,
+        uint nNumberOfBytesToRead,
+        IntPtr lpNumberOfBytesRead,
+        IntPtr lpOverlapped);
+}
