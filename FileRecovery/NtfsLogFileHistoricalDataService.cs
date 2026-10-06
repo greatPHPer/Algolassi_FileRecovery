@@ -3687,7 +3687,11 @@ public sealed class NtfsLogFileHistoricalDataService
 
             stream.Position = sourceOffset;
 
-            if (stream.Read(page, 0, page.Length) != page.Length)
+            try
+            {
+                stream.ReadExactly(page, 0, page.Length);
+            }
+            catch (EndOfStreamException)
             {
                 break;
             }
@@ -3783,7 +3787,11 @@ public sealed class NtfsLogFileHistoricalDataService
                     pageIndex *
                     (long)geometry.LogPageSize);
 
-            if (input.Read(page, 0, page.Length) != page.Length)
+            try
+            {
+                input.ReadExactly(page, 0, page.Length);
+            }
+            catch (EndOfStreamException)
             {
                 break;
             }
