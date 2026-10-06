@@ -41,6 +41,11 @@ public sealed class NtfsLogFileHistoricalDataService
     // The marker diagnostic intentionally uses the unfiltered parser because it is
     // a generic content search. Targeted recovery must not materialize unrelated
     // transaction payloads into memory.
+    // Serialize every historical $LogFile operation in this process. Targeted
+    // recovery and the background USN monitor otherwise can each materialize a
+    // large circular journal simultaneously, creating avoidable memory pressure.
+    private static readonly SemaphoreSlim HistoricalLogFileGate = new(1, 1);
+
     private static readonly HashSet<ushort> RecoveryRelevantOperations =
     [
         0x0002, // InitializeFileRecordSegment
@@ -65,6 +70,10 @@ public sealed class NtfsLogFileHistoricalDataService
     {
         evidence = string.Empty;
 
+        HistoricalLogFileGate.Wait();
+        try
+        {
+
         if (string.IsNullOrWhiteSpace(rootPath) ||
             string.IsNullOrWhiteSpace(marker))
         {
@@ -79,6 +88,7 @@ public sealed class NtfsLogFileHistoricalDataService
             return false;
         }
 
+        HistoricalLogFileGate.Wait(cancellationToken);
         try
         {
             WindowsPrivilege.EnableSeBackupPrivilege();
@@ -234,6 +244,10 @@ public sealed class NtfsLogFileHistoricalDataService
                 $"NTFS $LogFile marker diagnostic exception: {evidence}");
 
             return false;
+        }
+        finally
+        {
+            HistoricalLogFileGate.Release();
         }
     }
 
@@ -620,6 +634,10 @@ public sealed class NtfsLogFileHistoricalDataService
                 evidence);
 
             return false;
+        }
+        finally
+        {
+            HistoricalLogFileGate.Release();
         }
     }
 
