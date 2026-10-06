@@ -274,6 +274,7 @@ public sealed class NtfsLogFileHistoricalDataService
             return false;
         }
 
+        HistoricalLogFileRecoveryGate.Wait(cancellationToken);
         try
         {
             WindowsPrivilege.EnableSeBackupPrivilege();
