@@ -961,6 +961,13 @@ public sealed class MftCandidateScanner
                     : historicalDirectory;
             }
 
+            // ScanForFileReferences() is driven by persisted USN/history references.
+            // Treat these as historical generations: require the exact file-reference
+            // sequence and never substitute a later-reused MFT record merely because
+            // the filename/parent still happen to match. Fresh deletions have their
+            // own deletion-time snapshot path, while historical recovery can fall
+            // through to $LogFile/MFT-slack reconstruction when the exact generation
+            // is no longer present.
             var data = dataReader.ReadDefaultDataStream(
                 volumeInfo,
                 volumeHandle,
@@ -968,7 +975,9 @@ public sealed class MftCandidateScanner
                 name,
                 target.ParentFileReferenceNumber,
                 target.FullPath,
-                target.DeletedAtUtc);
+                target.DeletedAtUtc,
+                allowBoundedDeleteTransition: false,
+                expectedFileSizeBytes: target.FileSizeBytes);
 
             IReadOnlyList<NtfsExtentAllocation> allocations = [];
             string allocationEvidence = string.Empty;
