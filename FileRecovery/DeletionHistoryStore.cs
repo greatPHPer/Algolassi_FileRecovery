@@ -30,9 +30,26 @@ public sealed class DeletionHistoryStore
     {
         lock (_gate)
         {
-            return _records
+            var limit = Math.Clamp(count, 1, MaxRecords);
+
+            // Complete NTFS deletion snapshots are authoritative forensic evidence.
+            // Always surface them even when they are older than the ordinary history
+            // window, otherwise the recovery UI cannot discover the snapshot that was
+            // intentionally preserved by Upsert().
+            var snapshotRecords = _records
+                .Where(x => x.NtfsDataSnapshot?.IsComplete == true)
                 .OrderByDescending(x => x.DeletedAtUtc)
-                .Take(Math.Clamp(count, 1, MaxRecords))
+                .ToList();
+
+            var ordinaryRecords = _records
+                .Where(x => x.NtfsDataSnapshot?.IsComplete != true)
+                .OrderByDescending(x => x.DeletedAtUtc)
+                .Take(limit)
+                .ToList();
+
+            return snapshotRecords
+                .Concat(ordinaryRecords)
+                .OrderByDescending(x => x.DeletedAtUtc)
                 .Select(Clone)
                 .ToList();
         }
