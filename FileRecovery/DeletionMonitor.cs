@@ -16,6 +16,28 @@ public sealed class DeletionMonitor : IDisposable
 
     public void Start()
     {
+        // Controlled test switch: set ALGOLASSI_DISABLE_FILEWATCHER=1 (or true)
+        // before launching the application to isolate historical NTFS recovery
+        // from FileSystemWatcher activity. USN and Recycle Bin monitoring remain
+        // available because they are independent recovery sources.
+        var disableWatcher =
+            string.Equals(
+                Environment.GetEnvironmentVariable("ALGOLASSI_DISABLE_FILEWATCHER"),
+                "1",
+                StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(
+                Environment.GetEnvironmentVariable("ALGOLASSI_DISABLE_FILEWATCHER"),
+                "true",
+                StringComparison.OrdinalIgnoreCase);
+
+        if (disableWatcher)
+        {
+            StatusChanged?.Invoke(
+                this,
+                "FileSystemWatcher disabled by test environment; NTFS/USN recovery sources remain active.");
+            return;
+        }
+
         lock (_gate)
         {
             if (_started)
