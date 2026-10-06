@@ -1424,31 +1424,139 @@ public sealed class NtfsLogFileHistoricalDataService
             return false;
         }
 
-        var targetAttributeOpens =
-            new List<(ushort AttributeIndex, ulong FileReference, string AttributeName, ulong Lsn)>();
+        // The previous implementation resolved the latest OpenNonresidentAttribute
+        // by scanning and sorting the entire open-attribute collection for EVERY
+        // UpdateNonresidentValue record. On a large retained $LogFile this can become
+        // effectively O(updates * opens), which is needlessly expensive and can make
+        // targeted recovery appear hung for hours.
+        //
+        // Index both operation types by attribute slot, sort each small history once,
+        // then walk each attribute's opens and updates together. The resulting lookup
+        // is O(N log N) for sorting plus O(N) for the merge, instead of O(N^2).
+        var opensByAttribute =
+            new Dictionary<ushort, List<OpenAttributeHistory>>();
 
-        foreach (var record in records
-                     .Where(record => record.RedoOperation == OpenNonresidentAttribute &&
-                                      record.RedoData.Length > 0)
-                     .OrderBy(record => record.Lsn)
-                     .ThenBy(record => record.PhysicalOrder))
+        var updatesByAttribute =
+            new Dictionary<ushort, List<ParsedLogRecord>>();
+
+        var allOpenAttributeCount = 0;
+        var exactOpenAttributeCount = 0;
+        var allUpdateNonresidentValueCount = 0;
+
+        foreach (var record in records)
         {
-            var references = ReadPossibleOpenAttributeFileReferences(
-                record.RedoData);
-
-            foreach (var fileReference in references)
+            if (record.RedoOperation == OpenNonresidentAttribute &&
+                record.RedoData.Length > 0)
             {
-                targetAttributeOpens.Add(
-                    (
+                var references = ReadPossibleOpenAttributeFileReferences(
+                    record.RedoData);
+
+                if (references.Length == 0)
+                {
+                    continue;
+                }
+
+                if (!opensByAttribute.TryGetValue(
                         record.TargetAttribute,
-                        fileReference,
-                        DecodeUnicodeString(record.UndoData),
-                        record.Lsn));
+                        out var opens))
+                {
+                    opens = [];
+                    opensByAttribute[record.TargetAttribute] = opens;
+                }
+
+                foreach (var fileReference in references)
+                {
+                    var attributeName = DecodeUnicodeString(record.UndoData);
+
+                    opens.Add(
+                        new OpenAttributeHistory(
+                            record.Lsn,
+                            fileReference,
+                            attributeName));
+
+                    allOpenAttributeCount++;
+
+                    if (fileReference == targetFileReference &&
+                        string.IsNullOrWhiteSpace(attributeName))
+                    {
+                        exactOpenAttributeCount++;
+                    }
+                }
+
+                continue;
+            }
+
+            if (record.RedoOperation == UpdateNonresidentValue &&
+                record.RedoData.Length > 0)
+            {
+                if (!updatesByAttribute.TryGetValue(
+                        record.TargetAttribute,
+                        out var updates))
+                {
+                    updates = [];
+                    updatesByAttribute[record.TargetAttribute] = updates;
+                }
+
+                updates.Add(record);
+                allUpdateNonresidentValueCount++;
+            }
+        }
+
+        var candidateUpdates = new List<ParsedLogRecord>();
+
+        foreach (var attributePair in updatesByAttribute)
+        {
+            if (!opensByAttribute.TryGetValue(
+                    attributePair.Key,
+                    out var opens) ||
+                opens.Count == 0)
+            {
+                continue;
+            }
+
+            opens.Sort(
+                static (left, right) =>
+                {
+                    var comparison = left.Lsn.CompareTo(right.Lsn);
+                    return comparison != 0
+                        ? comparison
+                        : 0;
+                });
+
+            var updates = attributePair.Value;
+            updates.Sort(
+                static (left, right) =>
+                {
+                    var comparison = left.Lsn.CompareTo(right.Lsn);
+                    return comparison != 0
+                        ? comparison
+                        : left.PhysicalOrder.CompareTo(right.PhysicalOrder);
+                });
+
+            var openIndex = 0;
+            OpenAttributeHistory? latestOpen = null;
+
+            foreach (var record in updates)
+            {
+                while (openIndex < opens.Count &&
+                       opens[openIndex].Lsn <= record.Lsn)
+                {
+                    latestOpen = opens[openIndex];
+                    openIndex++;
+                }
+
+                if (latestOpen is not null &&
+                    latestOpen.FileReference == targetFileReference &&
+                    string.IsNullOrWhiteSpace(latestOpen.AttributeName))
+                {
+                    candidateUpdates.Add(record);
+                }
             }
         }
 
         var exactOpens =
-            targetAttributeOpens
+            opensByAttribute.Values
+                .SelectMany(list => list)
                 .Where(item =>
                     item.FileReference == targetFileReference &&
                     string.IsNullOrWhiteSpace(item.AttributeName))
@@ -1460,56 +1568,20 @@ public sealed class NtfsLogFileHistoricalDataService
                 records,
                 targetFileReference);
 
-        var allOpenAttributeCount = targetAttributeOpens.Count;
-
-        var nonresidentValueUpdates =
-            records
-                .Where(record =>
-                    record.RedoOperation == UpdateNonresidentValue &&
-                    record.RedoData.Length > 0)
-                .OrderBy(record => record.Lsn)
-                .ThenBy(record => record.PhysicalOrder)
-                .ToList();
-
         var targetSegment =
             targetFileReference &
             0x0000FFFFFFFFFFFFUL;
 
         var sameSegmentOpenReferences =
-            targetAttributeOpens
+            opensByAttribute.Values
+                .SelectMany(list => list)
                 .Where(item =>
-                    (item.FileReference & 0x0000FFFFFFFFFFFFUL) == targetSegment)
+                    (item.FileReference & 0x0000FFFFFFFFFFFFUL) ==
+                    targetSegment)
                 .Select(item => item.FileReference)
                 .Distinct()
                 .Take(20)
                 .ToList();
-
-        var candidateUpdates = new List<ParsedLogRecord>();
-
-        foreach (var record in records
-                     .Where(record =>
-                         record.RedoOperation == UpdateNonresidentValue &&
-                         record.RedoData.Length > 0)
-                     .OrderBy(record => record.Lsn)
-                     .ThenBy(record => record.PhysicalOrder))
-        {
-            // The open-attribute table index is reusable. Resolve the most recent
-            // OpenNonresidentAttribute for this exact index, then require that the
-            // currently opened attribute still belongs to the target file reference.
-            var latestOpen = targetAttributeOpens
-                .Where(open =>
-                    open.AttributeIndex == record.TargetAttribute &&
-                    open.Lsn <= record.Lsn)
-                .OrderByDescending(open => open.Lsn)
-                .FirstOrDefault();
-
-            if (latestOpen != default &&
-                latestOpen.FileReference == targetFileReference &&
-                string.IsNullOrWhiteSpace(latestOpen.AttributeName))
-            {
-                candidateUpdates.Add(record);
-            }
-        }
 
         System.Diagnostics.Trace.WriteLine(
             $"NTFS $LogFile historical nonresident value scan: " +
@@ -1518,10 +1590,11 @@ public sealed class NtfsLogFileHistoricalDataService
             $"size={fileSizeBytes:N0}, " +
             $"allOpenAttributes={allOpenAttributeCount:N0}, " +
             $"exactOpenAttributes={exactOpens.Count:N0}, " +
-            $"allUpdateNonresidentValue={nonresidentValueUpdates.Count:N0}, " +
+            $"allUpdateNonresidentValue={allUpdateNonresidentValueCount:N0}, " +
             $"candidateUpdates={candidateUpdates.Count:N0}, " +
             $"sameSegmentOpenRefs={string.Join(",", sameSegmentOpenReferences)}, " +
-            $"openAttributeDumpMatches={openAttributeDumpMatches.Count:N0}.");
+            $"openAttributeDumpMatches={openAttributeDumpMatches.Count:N0}, " +
+            $"lookup=attribute-indexed-ordered-merge.");
 
         if (candidateUpdates.Count == 0)
         {
@@ -1594,10 +1667,7 @@ public sealed class NtfsLogFileHistoricalDataService
             if (!value)
             {
                 uncovered++;
-                if (uncovered > 0)
-                {
-                    break;
-                }
+                break;
             }
         }
 
@@ -1624,6 +1694,11 @@ public sealed class NtfsLogFileHistoricalDataService
 
         return true;
     }
+
+    private sealed record OpenAttributeHistory(
+        ulong Lsn,
+        ulong FileReference,
+        string AttributeName);
 
     private static IReadOnlyList<ulong> ReadPossibleOpenAttributeFileReferences(
         byte[] redoData)
