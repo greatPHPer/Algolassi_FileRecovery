@@ -2774,7 +2774,7 @@ public sealed class NtfsLogFileHistoricalDataService
             {
                 continue;
             }
-        {
+
             if (record.RedoOperation == OpenNonresidentAttribute)
             {
                 if (TryReadOpenAttributeFileReference(
