@@ -3950,11 +3950,14 @@ public sealed class NtfsLogFileHistoricalDataService
                                 out var openedFileReference))
                         {
                             // The attribute name for OpenNonresidentAttribute
-                            // is carried in the UndoData field, not inside the
-                            // OPEN_ATTRIBUTE_ENTRY redo buffer.
+                            // is carried in the UndoData field. ReadLogData uses
+                            // the client record's undo-data offset/length fields.
                             var openAttributeName =
                                 DecodeUnicodeString(
-                                    undoData);
+                                    ReadLogData(
+                                        openData,
+                                        8,
+                                        10));
 
                             openTargetsExact =
                                 openedFileReference ==
