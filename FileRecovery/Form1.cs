@@ -444,7 +444,7 @@ public partial class Form1 : Form
         var fullPath = Microsoft.VisualBasic.Interaction.InputBox(
             "Enter the full path of the deleted file.",
             "Targeted Historical NTFS Recovery",
-            @"E:\TestRecovery\SizeTests\testlast-v7-utf16-1mb.txt");
+            @"E:\TestRecovery\SizeTests\test-prestart-v21-utf16-1mb.txt");
 
         if (string.IsNullOrWhiteSpace(fullPath))
         {
@@ -472,7 +472,7 @@ public partial class Form1 : Form
         var fileReferenceText = Microsoft.VisualBasic.Interaction.InputBox(
             "Enter the exact historical NTFS file reference number.",
             "Targeted Historical NTFS Recovery",
-            "3940649674375817");
+            "6192449488110940");
 
         if (!ulong.TryParse(fileReferenceText, out var fileReferenceNumber) ||
             fileReferenceNumber == 0)
