@@ -875,7 +875,9 @@ public sealed class NtfsLogFileHistoricalDataService
                     CalculateTargetMftSegment(
                         record,
                         bytesPerCluster,
-                        bytesPerFileRecordSegment) == targetSegment)
+                        bytesPerFileRecordSegment) == targetSegment &&
+                    record.MftGenerationSequence.HasValue &&
+                    record.MftGenerationSequence.Value == targetSequence)
                 .OrderBy(record => record.Lsn)
                 .ThenBy(record => record.PhysicalOrder)
                 .ToList();
@@ -1310,6 +1312,8 @@ public sealed class NtfsLogFileHistoricalDataService
                 $"redo=0x{record.RedoOperation:X4}, " +
                 $"undo=0x{record.UndoOperation:X4}, " +
                 $"targetAttribute=0x{record.TargetAttribute:X4}, " +
+                $"mftGenerationSequence={(record.MftGenerationSequence.HasValue ? record.MftGenerationSequence.Value.ToString() : "unknown")}, " +
+                $"generationMatch={record.MftGenerationSequence.HasValue && record.MftGenerationSequence.Value == targetSequence}, " +
                 $"recordOffset=0x{record.RecordOffset:X}, " +
                 $"attributeOffset=0x{record.AttributeOffset:X}, " +
                 $"targetVcn={record.TargetVcn:N0}, " +
@@ -1327,12 +1331,24 @@ public sealed class NtfsLogFileHistoricalDataService
                     record.UndoOperation == 0x0002)
                 .ToList();
 
+        var exactGenerationSegmentRecords =
+            segmentRecords
+                .Where(record =>
+                    record.MftGenerationSequence.HasValue &&
+                    record.MftGenerationSequence.Value == targetSequence)
+                .ToList();
+
         var deallocationRecords =
             segmentRecords
                 .Where(record =>
                     record.RedoOperation == DeallocateFileRecordSegment ||
                     record.UndoOperation == DeallocateFileRecordSegment)
                 .ToList();
+
+        var exactGenerationDeallocations =
+            exactGenerationSegmentRecords.Count(record =>
+                record.RedoOperation == DeallocateFileRecordSegment ||
+                record.UndoOperation == DeallocateFileRecordSegment);
 
         var sizeRecords =
             segmentRecords
@@ -1406,11 +1422,16 @@ public sealed class NtfsLogFileHistoricalDataService
             $"segment={targetSegment:N0}, " +
             $"expectedSequence={targetSequence}, " +
             $"segmentRecords={segmentRecords.Count:N0}, " +
+            $"exactGenerationRecords={exactGenerationSegmentRecords.Count:N0}, " +
             $"initializations={initializationRecords.Count:N0}, " +
             $"initializationSequences=[{string.Join(",", exactInitializationSequences)}], " +
             $"exactSequenceInitializationPresent={exactSequenceInitializations}, " +
             $"deallocations={deallocationRecords.Count:N0}, " +
+            $"exactGenerationDeallocations={exactGenerationDeallocations:N0}, " +
             $"sizeUpdates={sizeRecords.Count:N0}, " +
+            $"exactGenerationSizeUpdates={exactGenerationSegmentRecords.Count(record =>
+                record.RedoOperation == SetNewAttributeSizes ||
+                record.UndoOperation == SetNewAttributeSizes):N0}, " +
             $"exactOpenNonresidentAttributes={targetOpenAttributes.Count:N0}, " +
             $"openAttributeDumpTargetMatches={targetOpenAttributeDumpMatches.Count:N0}, " +
             $"bitmapRecords={bitmapRecords.Count:N0}, " +
@@ -3755,7 +3776,9 @@ public sealed class NtfsLogFileHistoricalDataService
 
             var exactMftTarget =
                 targetSegmentForRecord.HasValue &&
-                targetSegmentForRecord.Value == targetSegment;
+                targetSegmentForRecord.Value == targetSegment &&
+                record.MftGenerationSequence.HasValue &&
+                record.MftGenerationSequence.Value == targetSequence;
 
             var exactOpenAttributeTarget =
                 openAttributes.TryGetValue(
@@ -4108,6 +4131,7 @@ public sealed class NtfsLogFileHistoricalDataService
                             targetAttribute,
                             targetRecordOffset,
                             attributeOffset,
+                            null,
                             targetVcn,
                             clusterBlockOffset,
                             targetBlockSize,
@@ -4702,6 +4726,11 @@ public sealed class NtfsLogFileHistoricalDataService
         var targetOpenAttributes =
             new Dictionary<ushort, bool>();
 
+        // MFT segment numbers are reused. Track the generation sequence of the
+        // latest target-segment initialization so later operations cannot silently
+        // mix unrelated generations of the same MFT slot.
+        ushort? latestTargetGenerationSequence = null;
+
         // Retain transaction/bitmap records only after the exact target MFT
         // deallocation transaction has been identified. Retaining every
         // transaction record in the journal was the main source of the
@@ -4892,6 +4921,21 @@ public sealed class NtfsLogFileHistoricalDataService
                         BinaryPrimitives.ReadUInt16LittleEndian(
                             clientSpan.Slice(22, 2));
 
+                    var clientData =
+                        clientSpan.ToArray();
+
+                    var redoData =
+                        ReadLogData(
+                            clientData,
+                            4,
+                            6);
+
+                    var undoData =
+                        ReadLogData(
+                            clientData,
+                            8,
+                            10);
+
                     var exactMftTarget =
                         targetVcn >= 0 &&
                         bytesPerCluster != 0 &&
@@ -4905,6 +4949,30 @@ public sealed class NtfsLogFileHistoricalDataService
                                 : (long)bytesPerFileRecordSegment)) ==
                             (long)targetSegment;
 
+                    ushort? mftGenerationSequence =
+                        exactMftTarget
+                            ? latestTargetGenerationSequence
+                            : null;
+
+                    if (exactMftTarget &&
+                        redoOperation == 0x0002 &&
+                        TryReadMftRecordSequence(
+                            redoData,
+                            out var initializedSequence))
+                    {
+                        latestTargetGenerationSequence = initializedSequence;
+                        mftGenerationSequence = initializedSequence;
+                    }
+                    else if (exactMftTarget &&
+                             undoOperation == 0x0002 &&
+                             TryReadMftRecordSequence(
+                                 undoData,
+                                 out var undoInitializedSequence))
+                    {
+                        latestTargetGenerationSequence = undoInitializedSequence;
+                        mftGenerationSequence = undoInitializedSequence;
+                    }
+
                     var isOpenAttribute =
                         redoOperation == OpenNonresidentAttribute;
 
@@ -4914,11 +4982,8 @@ public sealed class NtfsLogFileHistoricalDataService
                     if (isOpenAttribute &&
                         clientSpan.Length > 0)
                     {
-                        var openData =
-                            clientSpan.ToArray();
-
                         if (TryReadOpenAttributeFileReference(
-                                openData,
+                                redoData,
                                 out var openedFileReference))
                         {
                             // The attribute name for OpenNonresidentAttribute
@@ -4926,10 +4991,7 @@ public sealed class NtfsLogFileHistoricalDataService
                             // the client record's undo-data offset/length fields.
                             var openAttributeName =
                                 DecodeUnicodeString(
-                                    ReadLogData(
-                                        openData,
-                                        8,
-                                        10));
+                                    undoData);
 
                             openTargetsExact =
                                 openedFileReference ==
@@ -4958,8 +5020,14 @@ public sealed class NtfsLogFileHistoricalDataService
                               out var mappingOpen) &&
                           mappingOpen));
 
-                    var isTargetDeallocation =
+                    var exactHistoricalMftTarget =
                         exactMftTarget &&
+                        mftGenerationSequence.HasValue &&
+                        mftGenerationSequence.Value ==
+                        checked((ushort)(targetFileReference >> 48));
+
+                    var isTargetDeallocation =
+                        exactHistoricalMftTarget &&
                         (redoOperation == DeallocateFileRecordSegment ||
                          undoOperation == DeallocateFileRecordSegment) &&
                         transactionId != 0;
@@ -5032,9 +5100,6 @@ public sealed class NtfsLogFileHistoricalDataService
 
                     if (keep)
                     {
-                        var clientData =
-                            clientSpan.ToArray();
-
                         var lsn =
                             BinaryPrimitives.ReadUInt64LittleEndian(
                                 page.AsSpan(
@@ -5065,17 +5130,12 @@ public sealed class NtfsLogFileHistoricalDataService
                                 targetAttribute,
                                 targetRecordOffset,
                                 attributeOffset,
+                                mftGenerationSequence,
                                 targetVcn,
                                 clusterBlockOffset,
                                 targetBlockSize,
-                                ReadLogData(
-                                    clientData,
-                                    4,
-                                    6),
-                                ReadLogData(
-                                    clientData,
-                                    8,
-                                    10)));
+                                redoData,
+                                undoData));
                     }
                     else
                     {
@@ -5119,6 +5179,29 @@ public sealed class NtfsLogFileHistoricalDataService
         }
 
         return false;
+    }
+
+    private static bool TryReadMftRecordSequence(
+        byte[] recordData,
+        out ushort sequence)
+    {
+        sequence = 0;
+
+        // InitializeFileRecordSegment data contains the NTFS FILE header.
+        if (recordData.Length < 0x12 ||
+            !string.Equals(
+                EncodingAscii(recordData, 0, 4),
+                "FILE",
+                StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        sequence =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                recordData.AsSpan(0x10, 2));
+
+        return sequence != 0;
     }
 
     private static byte[] ReadMappedLogicalFile(
@@ -5424,6 +5507,7 @@ public sealed class NtfsLogFileHistoricalDataService
         ushort TargetAttribute,
         ushort RecordOffset,
         ushort AttributeOffset,
+        ushort? MftGenerationSequence,
         long TargetVcn,
         ushort ClusterBlockOffset,
         ushort TargetBlockSize,
