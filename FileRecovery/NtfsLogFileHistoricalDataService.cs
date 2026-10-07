@@ -1274,8 +1274,7 @@ public sealed class NtfsLogFileHistoricalDataService
         IReadOnlyList<ParsedLogRecord> records,
         ulong targetFileReference,
         uint bytesPerCluster,
-        uint bytesPerFileRecordSegment,
-        IReadOnlyList<OpenAttributeHistory>? restartOpenAttributeHistories = null)
+        uint bytesPerFileRecordSegment)
     {
         var targetSegment =
             targetFileReference &
@@ -3144,9 +3143,31 @@ public sealed class NtfsLogFileHistoricalDataService
                 sequenceNumberBits,
                 openAttributeTableLsn,
                 out var recordType,
-                out var tableData) ||
-            recordType != LfsClientRestart ||
-            tableData.Length < 0x18)
+                out var tableClientData) ||
+            recordType != LfsClientRecord ||
+            tableClientData.Length < 32)
+        {
+            return;
+        }
+
+        // OpenAttributeTableLsn identifies an NTFS OpenAttributeTableDump
+        // client record. Its redo buffer contains the restart table.
+        var redoOperation =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                tableClientData.AsSpan(0, 2));
+
+        if (redoOperation != 0x001D)
+        {
+            return;
+        }
+
+        var tableData =
+            ReadLogData(
+                tableClientData,
+                4,
+                6);
+
+        if (tableData.Length < 0x18)
         {
             return;
         }
