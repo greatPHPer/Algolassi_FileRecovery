@@ -3237,10 +3237,28 @@ public sealed class NtfsLogFileHistoricalDataService
                 sequenceNumberBits,
                 openAttributeTableLsn,
                 out var recordType,
-                out var tableClientData) ||
-            recordType != LfsClientRecord ||
+                out var tableClientData))
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile restart open-attribute table read FAILED: " +
+                $"openAttributeTableLsn=0x{openAttributeTableLsn:X16}, " +
+                $"seqBits={sequenceNumberBits}.");
+            return;
+        }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile restart open-attribute table record: " +
+            $"openAttributeTableLsn=0x{openAttributeTableLsn:X16}, " +
+            $"recordType={recordType}, " +
+            $"clientDataBytes={tableClientData.Length:N0}.");
+
+        if (recordType != LfsClientRecord ||
             tableClientData.Length < 32)
         {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile restart open-attribute table rejected: " +
+                $"recordType={recordType}, " +
+                $"clientDataBytes={tableClientData.Length:N0}.");
             return;
         }
 
@@ -3250,8 +3268,20 @@ public sealed class NtfsLogFileHistoricalDataService
             BinaryPrimitives.ReadUInt16LittleEndian(
                 tableClientData.AsSpan(0, 2));
 
+        var undoOperation =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                tableClientData.AsSpan(2, 2));
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile restart open-attribute table operations: " +
+            $"redo=0x{redoOperation:X4}, " +
+            $"undo=0x{undoOperation:X4}.");
+
         if (redoOperation != 0x001D)
         {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile restart open-attribute table rejected: " +
+                $"expected redo=0x001D, actual=0x{redoOperation:X4}.");
             return;
         }
 
@@ -3263,6 +3293,10 @@ public sealed class NtfsLogFileHistoricalDataService
 
         if (tableData.Length < 0x18)
         {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile restart open-attribute table rejected: " +
+                $"redoDataBytes={tableData.Length:N0}, " +
+                $"minimum=24.");
             return;
         }
 
@@ -3276,10 +3310,25 @@ public sealed class NtfsLogFileHistoricalDataService
                 BinaryPrimitives.ReadUInt16LittleEndian(
                     tableData.AsSpan(2, 2));
 
+            var allocatedCount =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    tableData.AsSpan(4, 2));
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile restart open-attribute table header: " +
+                $"redoDataBytes={tableData.Length:N0}, " +
+                $"entrySize={entrySize:N0}, " +
+                $"entryCount={entryCount:N0}, " +
+                $"allocatedCount={allocatedCount:N0}.");
+
             if (entrySize < 0x20 ||
                 entryCount == 0 ||
                 entrySize > 4096)
             {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile restart open-attribute table rejected: " +
+                    $"entrySize={entrySize:N0}, " +
+                    $"entryCount={entryCount:N0}.");
                 return;
             }
 
@@ -3334,9 +3383,26 @@ public sealed class NtfsLogFileHistoricalDataService
                         openLsn =
                             BinaryPrimitives.ReadUInt64LittleEndian(
                                 entry.Slice(0x18, 8));
-                        attributeNamePresent =
-                            entry[0x0C] != 0;
+
+                        // NTFS client v1.0 stores DirtyPagesSeen at 0x0C.
+                        // It does NOT store AttributeNamePresent there.
+                        // Treating DirtyPagesSeen as a name flag caused valid
+                        // unnamed $DATA entries to be discarded whenever the
+                        // stream had dirty pages at checkpoint time.
+                        attributeNamePresent = false;
                         layout = "client-v1.0";
+
+                        if (fileReference == targetFileReference &&
+                            attributeType == NtfsAttributeTypeData)
+                        {
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS $LogFile restart open-attribute v1 TARGET: " +
+                                $"entryOffset=0x{entryOffset:X}, " +
+                                $"entrySize={entrySize:N0}, " +
+                                $"dirtyPagesSeen={entry[0x0C]}, " +
+                                $"fileRef={fileReference}, " +
+                                $"openLsn=0x{openLsn:X16}.");
+                        }
                     }
                     else if (IsLikelyNtfsAttributeType(typeAt1c))
                     {
@@ -3359,6 +3425,14 @@ public sealed class NtfsLogFileHistoricalDataService
                 {
                     continue;
                 }
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile restart open-attribute accepted: " +
+                    $"fileRef={fileReference}, " +
+                    $"entryOffset=0x{entryOffset:X}, " +
+                    $"entrySize={entrySize:N0}, " +
+                    $"layout={layout}, " +
+                    $"openLsn=0x{openLsn:X16}.");
 
                 var targetAttribute =
                     checked((ushort)entryOffset);
