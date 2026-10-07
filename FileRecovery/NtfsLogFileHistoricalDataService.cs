@@ -5,8 +5,10 @@ using Microsoft.Win32.SafeHandles;
 
 namespace FileRecovery;
 
-public sealed class NtfsLogFileHistoricalDataService
+public sealed class NtfsLogFileHistoricalDataService : IDisposable
 {
+    private HistoricalLogWorkspace? _historicalLogWorkspace;
+
     private const uint GenericRead = 0x80000000;
     private const uint FileShareRead = 0x00000001;
     private const uint FileShareWrite = 0x00000002;
@@ -305,55 +307,90 @@ public sealed class NtfsLogFileHistoricalDataService
                 logStream.FileSizeBytes,
                 MaxHistoricalRecoveryLogBytes);
 
-            progress?.Report(
-                $"Preparing disk-backed historical NTFS $LogFile workspace for " +
-                $"{expectedFileName}... " +
-                $"{logicalLength / (1024d * 1024d):0} MB journal data");
+            LogGeometry geometry;
+            List<ParsedLogRecord> records;
 
-            temporaryLogFile =
-                WriteMappedLogicalFileToTemporaryFile(
-                    rawHandle,
-                    volumeInfo.BytesPerCluster,
-                    logStream.Extents,
+            if (_historicalLogWorkspace is not null &&
+                _historicalLogWorkspace.Matches(
+                    normalizedRoot,
                     logicalLength,
+                    volumeInfo.BytesPerSector,
+                    volumeInfo.BytesPerCluster,
+                    volumeInfo.BytesPerFileRecordSegment) &&
+                File.Exists(_historicalLogWorkspace.Path))
+            {
+                progress?.Report(
+                    $"Reusing cached historical NTFS $LogFile workspace for {expectedFileName}...");
+
+                geometry = _historicalLogWorkspace.Geometry;
+                records = _historicalLogWorkspace.Records;
+            }
+            else
+            {
+                progress?.Report(
+                    $"Preparing disk-backed historical NTFS $LogFile workspace for " +
+                    $"{expectedFileName}... " +
+                    $"{logicalLength / (1024d * 1024d):0} MB journal data");
+
+                temporaryLogFile =
+                    WriteMappedLogicalFileToTemporaryFile(
+                        rawHandle,
+                        volumeInfo.BytesPerCluster,
+                        logStream.Extents,
+                        logicalLength,
+                        progress,
+                        cancellationToken);
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                progress?.Report(
+                    $"Reading historical NTFS $LogFile geometry for {expectedFileName}...");
+
+                if (!TryReadGeometryFromFile(
+                        temporaryLogFile,
+                        volumeInfo.BytesPerSector,
+                        out geometry,
+                        out var geometryEvidence))
+                {
+                    evidence = geometryEvidence;
+                    return false;
+                }
+
+                ApplyFastPagesToFile(
+                    temporaryLogFile,
+                    geometry,
+                    volumeInfo.BytesPerSector,
+                    cancellationToken);
+
+                progress?.Report(
+                    $"Parsing retained historical NTFS $LogFile records for {expectedFileName}...");
+
+                records = ParseTargetRecordsFromFile(
+                    temporaryLogFile,
+                    geometry,
+                    volumeInfo.BytesPerSector,
+                    targetFileReference: 0,
+                    volumeInfo.BytesPerCluster,
+                    volumeInfo.BytesPerFileRecordSegment,
                     progress,
                     cancellationToken);
 
-            cancellationToken.ThrowIfCancellationRequested();
+                cancellationToken.ThrowIfCancellationRequested();
 
-            progress?.Report(
-                $"Reading historical NTFS $LogFile geometry for {expectedFileName}...");
+                _historicalLogWorkspace?.Dispose();
+                _historicalLogWorkspace =
+                    new HistoricalLogWorkspace(
+                        normalizedRoot,
+                        logicalLength,
+                        volumeInfo.BytesPerSector,
+                        volumeInfo.BytesPerCluster,
+                        volumeInfo.BytesPerFileRecordSegment,
+                        temporaryLogFile,
+                        geometry,
+                        records);
 
-            if (!TryReadGeometryFromFile(
-                    temporaryLogFile,
-                    volumeInfo.BytesPerSector,
-                    out var geometry,
-                    out var geometryEvidence))
-            {
-                evidence = geometryEvidence;
-                return false;
+                temporaryLogFile = null;
             }
-
-            ApplyFastPagesToFile(
-                temporaryLogFile,
-                geometry,
-                volumeInfo.BytesPerSector,
-                cancellationToken);
-
-            progress?.Report(
-                $"Parsing targeted historical NTFS $LogFile records for {expectedFileName}...");
-
-            var records = ParseTargetRecordsFromFile(
-                temporaryLogFile,
-                geometry,
-                volumeInfo.BytesPerSector,
-                fileReferenceNumber,
-                volumeInfo.BytesPerCluster,
-                volumeInfo.BytesPerFileRecordSegment,
-                progress,
-                cancellationToken);
-
-            cancellationToken.ThrowIfCancellationRequested();
 
             // Emit a compact target-file evidence inventory before any recovery
             // decision is made. This is diagnostic only: it deliberately does not
@@ -366,7 +403,7 @@ public sealed class NtfsLogFileHistoricalDataService
 
             var restartOpenAttributeHistories =
                 ReadRestartOpenAttributeHistories(
-                    temporaryLogFile,
+                    _historicalLogWorkspace!.Path,
                     geometry,
                     volumeInfo.BytesPerSector,
                     fileReferenceNumber);
@@ -4829,7 +4866,19 @@ public sealed class NtfsLogFileHistoricalDataService
                         redoOperation == SetNewAttributeSizes ||
                         undoOperation == SetNewAttributeSizes ||
                         redoOperation == OpenNonresidentAttribute ||
-                        undoOperation == OpenNonresidentAttribute;
+                        undoOperation == OpenNonresidentAttribute ||
+                        redoOperation == DeallocateFileRecordSegment ||
+                        undoOperation == DeallocateFileRecordSegment ||
+                        redoOperation == SetBitsInNonresidentBitmap ||
+                        undoOperation == SetBitsInNonresidentBitmap ||
+                        redoOperation == ClearBitsInNonresidentBitmap ||
+                        undoOperation == ClearBitsInNonresidentBitmap ||
+                        redoOperation == PrepareTransaction ||
+                        undoOperation == PrepareTransaction ||
+                        redoOperation == CommitTransaction ||
+                        undoOperation == CommitTransaction ||
+                        redoOperation == ForgetTransaction ||
+                        undoOperation == ForgetTransaction;
 
                     var keep =
                         isHistoricalDataOperation ||
@@ -5220,6 +5269,73 @@ public sealed class NtfsLogFileHistoricalDataService
         ushort TargetAttribute,
         string IdentitySource,
         IReadOnlyList<NtfsDataExtent> Extents);
+
+    public void Dispose()
+    {
+        _historicalLogWorkspace?.Dispose();
+        _historicalLogWorkspace = null;
+    }
+
+    private sealed class HistoricalLogWorkspace : IDisposable
+    {
+        public HistoricalLogWorkspace(
+            string rootPath,
+            long logicalLength,
+            uint bytesPerSector,
+            uint bytesPerCluster,
+            uint bytesPerFileRecordSegment,
+            string path,
+            LogGeometry geometry,
+            List<ParsedLogRecord> records)
+        {
+            RootPath = rootPath;
+            LogicalLength = logicalLength;
+            BytesPerSector = bytesPerSector;
+            BytesPerCluster = bytesPerCluster;
+            BytesPerFileRecordSegment = bytesPerFileRecordSegment;
+            Path = path;
+            Geometry = geometry;
+            Records = records;
+        }
+
+        public string RootPath { get; }
+        public long LogicalLength { get; }
+        public uint BytesPerSector { get; }
+        public uint BytesPerCluster { get; }
+        public uint BytesPerFileRecordSegment { get; }
+        public string Path { get; }
+        public LogGeometry Geometry { get; }
+        public List<ParsedLogRecord> Records { get; }
+
+        public bool Matches(
+            string rootPath,
+            long logicalLength,
+            uint bytesPerSector,
+            uint bytesPerCluster,
+            uint bytesPerFileRecordSegment)
+        {
+            return string.Equals(
+                       RootPath,
+                       rootPath,
+                       StringComparison.OrdinalIgnoreCase) &&
+                   LogicalLength == logicalLength &&
+                   BytesPerSector == bytesPerSector &&
+                   BytesPerCluster == bytesPerCluster &&
+                   BytesPerFileRecordSegment == bytesPerFileRecordSegment;
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                File.Delete(Path);
+            }
+            catch
+            {
+                // Best effort cleanup of the disk-backed journal workspace.
+            }
+        }
+    }
 
     private sealed record ParsedLogRecord(
         ulong Lsn,
