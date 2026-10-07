@@ -1324,7 +1324,7 @@ public sealed class NtfsLogFileHistoricalDataService
                 $"undo=0x{record.UndoOperation:X4}, " +
                 $"targetAttribute=0x{record.TargetAttribute:X4}, " +
                 $"mftGenerationSequence={(record.MftGenerationSequence.HasValue ? record.MftGenerationSequence.Value.ToString() : "unknown")}, " +
-                $"generationMatch={record.MftGenerationSequence.HasValue && record.MftGenerationSequence.Value == historicalGenerationSequence},  +
+                $"generationMatch={record.MftGenerationSequence.HasValue && record.MftGenerationSequence.Value == historicalGenerationSequence}, " +
                 $"recordOffset=0x{record.RecordOffset:X}, " +
                 $"attributeOffset=0x{record.AttributeOffset:X}, " +
                 $"targetVcn={record.TargetVcn:N0}, " +
