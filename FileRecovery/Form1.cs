@@ -614,12 +614,16 @@ public partial class Form1 : Form
             var progress = new Progress<string>(message =>
                 SetBusy(true, message));
 
+            using var historicalLogService =
+                new NtfsLogFileHistoricalDataService();
+
             var recovered = await Task.Run(
                 () =>
                 {
                     return TryRecoverFromHistoricalLogFileData(
                         candidate,
                         destinationDirectory,
+                        historicalLogService,
                         progress,
                         CancellationToken.None,
                         out var result)
@@ -2820,6 +2824,7 @@ public partial class Form1 : Form
     private static bool TryRecoverFromHistoricalLogFileData(
         RecoveryCandidate candidate,
         string destinationDirectory,
+        NtfsLogFileHistoricalDataService service,
         IProgress<string>? progress,
         CancellationToken cancellationToken,
         out RecoveryResult result)
@@ -2842,7 +2847,6 @@ public partial class Form1 : Form
 
         try
         {
-            var service = new NtfsLogFileHistoricalDataService();
             const long maxCaptureBytes = int.MaxValue;
 
             progress?.Report(
@@ -2934,6 +2938,8 @@ public partial class Form1 : Form
         var forensicMarkers = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         var forensicMarkerDeclined = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var vssHistoricalRecovery = new VssHistoricalFileRecoveryService();
+        using var historicalLogService =
+            new NtfsLogFileHistoricalDataService();
 
         if (string.IsNullOrWhiteSpace(destinationDirectory))
         {
@@ -3009,6 +3015,7 @@ public partial class Form1 : Form
                                     TryRecoverFromHistoricalLogFileData(
                                         candidate,
                                         destinationDirectory,
+                                        historicalLogService,
                                         historicalLogProgress,
                                         CancellationToken.None,
                                         out var recoveryResult);
