@@ -60,9 +60,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         _recycleBinMonitor.StatusChanged += OnMonitorStatusChanged;
         // Arm the USN journals before FileSystemWatcher starts so a very early
         // Shift+Delete cannot be missed during application startup.
-        _usnMonitor.Start();
+        //_usnMonitor.Start();
         _monitor.Start();
-        _recycleBinMonitor.Start();
+        //_recycleBinMonitor.Start();
     }
 
     private void OpenMainWindow()
@@ -115,10 +115,14 @@ public sealed class TrayApplicationContext : ApplicationContext
                     $"NTFS immediate live path fast snapshot attempt: " +
                     $"path={e.Record.FullPath}, attempt={attempt + 1}/{fastAttempts}.");
 
-                if (await Task.Run(
-                        () => _usnMonitor.TryCaptureRecentDeletionSnapshot(
+                //if (await Task.Run(
+                //        () => _usnMonitor.TryCaptureRecentDeletionSnapshot(
+                //            e.Record,
+                //            allowHistoricalLogFileFallback: false)))
+                if (
+                        _usnMonitor.TryCaptureRecentDeletionSnapshot(
                             e.Record,
-                            allowHistoricalLogFileFallback: false)))
+                            allowHistoricalLogFileFallback: false))
                 {
                     System.Diagnostics.Debug.WriteLine(
                         $"NTFS immediate live path fast snapshot succeeded: " +

@@ -637,10 +637,11 @@ public partial class Form1 : Form
             using var historicalLogService =
                 new NtfsLogFileHistoricalDataService();
 
-            var recovered = await Task.Run(
-                () =>
-                {
-                    return TryRecoverFromHistoricalLogFileData(
+            var recovered = //await Task.Run(
+                //() =>
+                //{
+                    //return 
+                TryRecoverFromHistoricalLogFileData(
                         candidate,
                         destinationDirectory,
                         historicalLogService,
@@ -649,8 +650,8 @@ public partial class Form1 : Form
                         out var result)
                         ? result
                         : null;
-                },
-                CancellationToken.None).ConfigureAwait(true);
+                //},
+                //CancellationToken.None).ConfigureAwait(true);
 
             if (recovered is not null)
             {
