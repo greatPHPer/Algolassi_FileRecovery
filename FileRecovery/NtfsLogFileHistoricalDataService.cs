@@ -369,7 +369,9 @@ public sealed class NtfsLogFileHistoricalDataService
                     temporaryLogFile,
                     geometry,
                     volumeInfo.BytesPerSector,
-                    fileReferenceNumber);
+                    BuildHistoricalFileReference(
+                        fileReferenceNumber,
+                        GetHistoricalGenerationSequence(fileReferenceNumber)));
 
             progress?.Report(
                 $"Searching historical NTFS transactions for {expectedFileName}...");
@@ -683,6 +685,9 @@ public sealed class NtfsLogFileHistoricalDataService
         var targetSequence =
             checked((ushort)(targetFileReference >> 48));
 
+        var historicalGenerationSequence =
+            GetHistoricalGenerationSequence(targetFileReference);
+
         var initializations =
             records
                 .Where(record =>
@@ -711,7 +716,7 @@ public sealed class NtfsLogFileHistoricalDataService
 
             if (!TryFindUnnamedNonresidentDataAttributes(
                     initialization.RedoData,
-                    targetSequence,
+                    historicalGenerationSequence,
                     expectedSize: 0,
                     out var definitions))
             {
@@ -869,6 +874,9 @@ public sealed class NtfsLogFileHistoricalDataService
         var targetSequence =
             checked((ushort)(targetFileReference >> 48));
 
+        var historicalGenerationSequence =
+            GetHistoricalGenerationSequence(targetFileReference);
+
         var targetSegmentRecords =
             records
                 .Where(record =>
@@ -877,7 +885,7 @@ public sealed class NtfsLogFileHistoricalDataService
                         bytesPerCluster,
                         bytesPerFileRecordSegment) == targetSegment &&
                     record.MftGenerationSequence.HasValue &&
-                    record.MftGenerationSequence.Value == targetSequence)
+                    record.MftGenerationSequence.Value == historicalGenerationSequence)
                 .OrderBy(record => record.Lsn)
                 .ThenBy(record => record.PhysicalOrder)
                 .ToList();
@@ -1285,6 +1293,9 @@ public sealed class NtfsLogFileHistoricalDataService
         var targetSequence =
             checked((ushort)(targetFileReference >> 48));
 
+        var historicalGenerationSequence =
+            GetHistoricalGenerationSequence(targetFileReference);
+
         var segmentRecords =
             records
                 .Where(record =>
@@ -1313,7 +1324,7 @@ public sealed class NtfsLogFileHistoricalDataService
                 $"undo=0x{record.UndoOperation:X4}, " +
                 $"targetAttribute=0x{record.TargetAttribute:X4}, " +
                 $"mftGenerationSequence={(record.MftGenerationSequence.HasValue ? record.MftGenerationSequence.Value.ToString() : "unknown")}, " +
-                $"generationMatch={record.MftGenerationSequence.HasValue && record.MftGenerationSequence.Value == targetSequence}, " +
+                $"generationMatch={record.MftGenerationSequence.HasValue && record.MftGenerationSequence.Value == historicalGenerationSequence},  +
                 $"recordOffset=0x{record.RecordOffset:X}, " +
                 $"attributeOffset=0x{record.AttributeOffset:X}, " +
                 $"targetVcn={record.TargetVcn:N0}, " +
@@ -1335,7 +1346,7 @@ public sealed class NtfsLogFileHistoricalDataService
             segmentRecords
                 .Where(record =>
                     record.MftGenerationSequence.HasValue &&
-                    record.MftGenerationSequence.Value == targetSequence)
+                    record.MftGenerationSequence.Value == historicalGenerationSequence)
                 .ToList();
 
         var deallocationRecords =
@@ -2197,6 +2208,9 @@ public sealed class NtfsLogFileHistoricalDataService
         var targetSequence =
             checked((ushort)(targetFileReference >> 48));
 
+        var historicalGenerationSequence =
+            GetHistoricalGenerationSequence(targetFileReference);
+
         var initializations =
             records
                 .Where(record =>
@@ -2221,7 +2235,7 @@ public sealed class NtfsLogFileHistoricalDataService
         {
             if (!TryFindUnnamedNonresidentDataAttributes(
                     initialization.RedoData,
-                    targetSequence,
+                    historicalGenerationSequence,
                     fileSizeBytes,
                     out var definitions))
             {
@@ -3674,6 +3688,14 @@ public sealed class NtfsLogFileHistoricalDataService
         var targetSequence =
             checked((ushort)(targetFileReference >> 48));
 
+        var historicalGenerationSequence =
+            GetHistoricalGenerationSequence(targetFileReference);
+
+        var historicalFileReference =
+            BuildHistoricalFileReference(
+                targetFileReference,
+                historicalGenerationSequence);
+
         var openAttributes =
             new Dictionary<ushort, OpenAttributeState>();
 
@@ -3684,7 +3706,7 @@ public sealed class NtfsLogFileHistoricalDataService
             foreach (var history in restartOpenAttributeHistories
                          .OrderBy(item => item.Lsn))
             {
-                if (history.FileReference == targetFileReference &&
+                if (history.FileReference == historicalFileReference &&
                     string.IsNullOrWhiteSpace(history.AttributeName))
                 {
                     openAttributes[history.TargetAttribute] =
@@ -3700,7 +3722,7 @@ public sealed class NtfsLogFileHistoricalDataService
         foreach (var history in
                  FindHistoricalOpenAttributeDumpHistories(
                      records,
-                     targetFileReference)
+                     historicalFileReference)
                      .OrderBy(item => item.Lsn))
         {
             openAttributes[history.TargetAttribute] =
@@ -3781,13 +3803,13 @@ public sealed class NtfsLogFileHistoricalDataService
                 targetSegmentForRecord.HasValue &&
                 targetSegmentForRecord.Value == targetSegment &&
                 record.MftGenerationSequence.HasValue &&
-                record.MftGenerationSequence.Value == targetSequence;
+                record.MftGenerationSequence.Value == historicalGenerationSequence;
 
             var exactOpenAttributeTarget =
                 openAttributes.TryGetValue(
                     record.TargetAttribute,
                     out var openAttribute) &&
-                openAttribute.FileReference == targetFileReference &&
+                openAttribute.FileReference == historicalFileReference &&
                 string.IsNullOrWhiteSpace(openAttribute.AttributeName);
 
             if (!exactMftTarget &&
@@ -4726,6 +4748,17 @@ public sealed class NtfsLogFileHistoricalDataService
             targetFileReference &
             0x0000FFFFFFFFFFFFUL;
 
+        var targetSequence =
+            checked((ushort)(targetFileReference >> 48));
+
+        var historicalGenerationSequence =
+            GetHistoricalGenerationSequence(targetFileReference);
+
+        var historicalFileReference =
+            BuildHistoricalFileReference(
+                targetFileReference,
+                historicalGenerationSequence);
+
         var targetOpenAttributes =
             new Dictionary<ushort, bool>();
 
@@ -4998,7 +5031,7 @@ public sealed class NtfsLogFileHistoricalDataService
 
                             openTargetsExact =
                                 openedFileReference ==
-                                    targetFileReference &&
+                                    historicalFileReference &&
                                 string.IsNullOrWhiteSpace(
                                     openAttributeName);
 
@@ -5027,7 +5060,7 @@ public sealed class NtfsLogFileHistoricalDataService
                         exactMftTarget &&
                         mftGenerationSequence.HasValue &&
                         mftGenerationSequence.Value ==
-                        checked((ushort)(targetFileReference >> 48));
+                        historicalGenerationSequence;
 
                     var isTargetDeallocation =
                         exactHistoricalMftTarget &&
@@ -5066,9 +5099,12 @@ public sealed class NtfsLogFileHistoricalDataService
 
                     var isTargetDump =
                         isHistoricalCheckpointDump &&
-                        ContainsTargetFileReference(
-                            clientSpan,
-                            targetFileReference);
+                        (ContainsTargetFileReference(
+                             clientSpan,
+                             historicalFileReference) ||
+                         ContainsTargetFileReference(
+                             clientSpan,
+                             targetFileReference));
 
                     // Keep the small set of NTFS history operations needed to
                     // reconstruct the target file's identity and data. In
@@ -5206,6 +5242,33 @@ public sealed class NtfsLogFileHistoricalDataService
 
         return sequence != 0;
     }
+
+    private static ushort GetHistoricalGenerationSequence(
+        ulong targetFileReference)
+    {
+        var targetSequence =
+            checked((ushort)(targetFileReference >> 48));
+
+        if (targetSequence == 0)
+        {
+            throw new InvalidDataException(
+                "A deleted NTFS file reference must contain a nonzero MFT sequence number.");
+        }
+
+        // NTFS increments the MFT sequence when the record is freed. Therefore
+        // a deleted file reference carries the post-free sequence, while the
+        // historical FILE record/data belong to the immediately preceding
+        // sequence. NTFS skips sequence zero.
+        return targetSequence == 1
+            ? ushort.MaxValue
+            : checked((ushort)(targetSequence - 1));
+    }
+
+    private static ulong BuildHistoricalFileReference(
+        ulong targetFileReference,
+        ushort historicalGenerationSequence) =>
+        (targetFileReference & 0x0000FFFFFFFFFFFFUL) |
+        ((ulong)historicalGenerationSequence << 48);
 
     private static byte[] ReadMappedLogicalFile(
         SafeFileHandle volumeHandle,
