@@ -363,6 +363,13 @@ public sealed class NtfsLogFileHistoricalDataService
                 volumeInfo.BytesPerCluster,
                 volumeInfo.BytesPerFileRecordSegment);
 
+            var restartOpenAttributeHistories =
+                ReadRestartOpenAttributeHistories(
+                    temporaryLogFile,
+                    geometry,
+                    volumeInfo.BytesPerSector,
+                    fileReferenceNumber);
+
             progress?.Report(
                 $"Searching historical NTFS transactions for {expectedFileName}...");
 
@@ -444,6 +451,7 @@ public sealed class NtfsLogFileHistoricalDataService
                     fileReferenceNumber,
                     fileSizeBytes,
                     volumeInfo.BytesPerCluster,
+                    restartOpenAttributeHistories,
                     out data,
                     out var nonresidentValueEvidence))
             {
@@ -504,7 +512,8 @@ public sealed class NtfsLogFileHistoricalDataService
                     records,
                     fileReferenceNumber,
                     volumeInfo.BytesPerCluster,
-                    volumeInfo.BytesPerFileRecordSegment);
+                    volumeInfo.BytesPerFileRecordSegment,
+                    restartOpenAttributeHistories);
 
             if (mappingCandidates.Count == 0)
             {
@@ -1264,7 +1273,8 @@ public sealed class NtfsLogFileHistoricalDataService
         IReadOnlyList<ParsedLogRecord> records,
         ulong targetFileReference,
         uint bytesPerCluster,
-        uint bytesPerFileRecordSegment)
+        uint bytesPerFileRecordSegment,
+        IReadOnlyList<OpenAttributeHistory>? restartOpenAttributeHistories = null)
     {
         var targetSegment =
             targetFileReference &
@@ -1461,6 +1471,7 @@ public sealed class NtfsLogFileHistoricalDataService
         ulong targetFileReference,
         long fileSizeBytes,
         uint bytesPerCluster,
+        IReadOnlyList<OpenAttributeHistory>? restartOpenAttributeHistories,
         out byte[] data,
         out string evidence)
     {
@@ -1492,6 +1503,29 @@ public sealed class NtfsLogFileHistoricalDataService
         var allOpenAttributeCount = 0;
         var allUpdateNonresidentValueCount = 0;
 
+        if (restartOpenAttributeHistories is not null)
+        {
+            foreach (var history in restartOpenAttributeHistories)
+            {
+                if (history.FileReference != targetFileReference ||
+                    !string.IsNullOrWhiteSpace(history.AttributeName))
+                {
+                    continue;
+                }
+
+                if (!opensByAttribute.TryGetValue(
+                        history.TargetAttribute,
+                        out var opens))
+                {
+                    opens = [];
+                    opensByAttribute[history.TargetAttribute] = opens;
+                }
+
+                opens.Add(history);
+                allOpenAttributeCount++;
+            }
+        }
+
         foreach (var record in records)
         {
             if (record.RedoOperation == OpenNonresidentAttribute &&
@@ -1520,6 +1554,7 @@ public sealed class NtfsLogFileHistoricalDataService
                     opens.Add(
                         new OpenAttributeHistory(
                             record.Lsn,
+                            record.TargetAttribute,
                             fileReference,
                             attributeName));
 
@@ -1735,31 +1770,98 @@ public sealed class NtfsLogFileHistoricalDataService
 
     private sealed record OpenAttributeHistory(
         ulong Lsn,
+        ushort TargetAttribute,
         ulong FileReference,
         string AttributeName);
 
     private static IReadOnlyList<ulong> ReadPossibleOpenAttributeFileReferences(
         byte[] redoData)
     {
+        if (redoData.Length < 16)
+        {
+            return [];
+        }
+
         var references = new HashSet<ulong>();
 
-        // OPEN_ATTRIBUTE_ENTRY stores FileReference at offset 0x08 for
-        // both NTFS v1.x and v3.x+ layouts. Offset 0x10 is LsnOfOpenRecord,
-        // not another file-reference variant.
-        if (redoData.Length >= 16)
+        // NTFS client v0.0: FileReference=0x08, AttributeTypeCode=0x1C.
+        // NTFS client v1.0: AttributeTypeCode=0x08, FileReference=0x10.
+        if (redoData.Length >= 0x20)
         {
-            var fileReference =
-                BinaryPrimitives.ReadUInt64LittleEndian(
-                    redoData.AsSpan(8, 8));
+            var typeAt08 =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    redoData.AsSpan(8, 4));
 
-            if (fileReference != 0)
+            var typeAt1c =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    redoData.AsSpan(0x1C, 4));
+
+            if (IsLikelyNtfsAttributeType(typeAt08))
             {
-                references.Add(fileReference);
+                var v1Reference =
+                    BinaryPrimitives.ReadUInt64LittleEndian(
+                        redoData.AsSpan(0x10, 8));
+
+                if (v1Reference != 0)
+                {
+                    references.Add(v1Reference);
+                    return references.ToArray();
+                }
+            }
+
+            if (IsLikelyNtfsAttributeType(typeAt1c))
+            {
+                var v0Reference =
+                    BinaryPrimitives.ReadUInt64LittleEndian(
+                        redoData.AsSpan(8, 8));
+
+                if (v0Reference != 0)
+                {
+                    references.Add(v0Reference);
+                    return references.ToArray();
+                }
+            }
+        }
+
+        var fallbackReference =
+            BinaryPrimitives.ReadUInt64LittleEndian(
+                redoData.AsSpan(8, 8));
+
+        if (fallbackReference != 0)
+        {
+            references.Add(fallbackReference);
+        }
+
+        if (redoData.Length >= 0x18)
+        {
+            var alternateReference =
+                BinaryPrimitives.ReadUInt64LittleEndian(
+                    redoData.AsSpan(0x10, 8));
+
+            if (alternateReference != 0)
+            {
+                references.Add(alternateReference);
             }
         }
 
         return references.ToArray();
     }
+
+    private static bool IsLikelyNtfsAttributeType(uint type) =>
+        type is
+            0x00000010 or
+            0x00000020 or
+            0x00000030 or
+            0x00000040 or
+            0x00000050 or
+            0x00000060 or
+            0x00000070 or
+            0x00000080 or
+            0x00000090 or
+            0x000000A0 or
+            0x000000B0 or
+            0x000000C0 or
+            0x000000D0;
 
     private static List<string> FindOpenAttributeTableDumpMatches(
         IReadOnlyList<ParsedLogRecord> records,
@@ -2725,6 +2827,450 @@ public sealed class NtfsLogFileHistoricalDataService
         long BitCount,
         ulong DeallocateLsn);
 
+    private static List<OpenAttributeHistory> ReadRestartOpenAttributeHistories(
+        string path,
+        LogGeometry geometry,
+        uint bytesPerSector,
+        ulong targetFileReference)
+    {
+        var matches = new List<OpenAttributeHistory>();
+
+        try
+        {
+            using var input =
+                new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    geometry.LogPageSize,
+                    FileOptions.SequentialScan);
+
+            var restartPage =
+                new byte[geometry.SystemPageSize];
+
+            var visitedRestartLsns =
+                new HashSet<ulong>();
+
+            for (var restartPageIndex = 0; restartPageIndex < 2; restartPageIndex++)
+            {
+                input.Position =
+                    checked((long)restartPageIndex * geometry.SystemPageSize);
+
+                if (input.Read(restartPage, 0, restartPage.Length) !=
+                    restartPage.Length)
+                {
+                    continue;
+                }
+
+                var page = restartPage.ToArray();
+
+                if (!TryApplyLogPageFixups(
+                        page,
+                        checked((int)bytesPerSector)) ||
+                    EncodingAscii(page, 0, 4) != "RSTR")
+                {
+                    continue;
+                }
+
+                var restartOffset =
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        page.AsSpan(24, 2));
+
+                if (restartOffset < 0x28 ||
+                    restartOffset + 0x18 > page.Length)
+                {
+                    continue;
+                }
+
+                var sequenceNumberBits =
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        page.AsSpan(restartOffset + 0x10, 4));
+
+                var logClients =
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        page.AsSpan(restartOffset + 0x08, 2));
+
+                var clientArrayOffset =
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        page.AsSpan(restartOffset + 0x16, 2));
+
+                if (sequenceNumberBits < 3 ||
+                    sequenceNumberBits >= 64 ||
+                    logClients == 0 ||
+                    clientArrayOffset >= page.Length)
+                {
+                    continue;
+                }
+
+                const int lfsClientRecordSize = 0xA0;
+
+                for (var clientIndex = 0;
+                     clientIndex < logClients;
+                     clientIndex++)
+                {
+                    var clientOffset =
+                        checked(
+                            restartOffset +
+                            clientArrayOffset +
+                            clientIndex * lfsClientRecordSize);
+
+                    if (clientOffset + 0x10 > page.Length)
+                    {
+                        break;
+                    }
+
+                    var clientRestartLsn =
+                        BinaryPrimitives.ReadUInt64LittleEndian(
+                            page.AsSpan(clientOffset + 0x08, 8));
+
+                    if (clientRestartLsn == 0 ||
+                        !visitedRestartLsns.Add(clientRestartLsn))
+                    {
+                        continue;
+                    }
+
+                    TraceRestartOpenAttributeTableChain(
+                        input,
+                        geometry,
+                        bytesPerSector,
+                        sequenceNumberBits,
+                        clientRestartLsn,
+                        targetFileReference,
+                        matches,
+                        visitedRestartLsns);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile restart open-attribute history scan exception: " +
+                $"{ex.GetType().Name}: {ex.Message}");
+        }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile restart open-attribute history scan: " +
+            $"fileRef={targetFileReference}, matches={matches.Count:N0}.");
+
+        return matches;
+    }
+
+    private static void TraceRestartOpenAttributeTableChain(
+        FileStream input,
+        LogGeometry geometry,
+        uint bytesPerSector,
+        uint sequenceNumberBits,
+        ulong restartLsn,
+        ulong targetFileReference,
+        List<OpenAttributeHistory> matches,
+        HashSet<ulong> visitedRestartLsns)
+    {
+        const int maximumRestartRecords = 16;
+        var currentLsn = restartLsn;
+
+        for (var i = 0;
+             i < maximumRestartRecords && currentLsn != 0;
+             i++)
+        {
+            if (!TryReadLfsClientDataAtLsn(
+                    input,
+                    geometry,
+                    bytesPerSector,
+                    sequenceNumberBits,
+                    currentLsn,
+                    out var recordType,
+                    out var clientData))
+            {
+                break;
+            }
+
+            if (recordType != LfsClientRestart ||
+                clientData.Length < 0x50)
+            {
+                break;
+            }
+
+            var openAttributeTableLsn =
+                BinaryPrimitives.ReadUInt64LittleEndian(
+                    clientData.AsSpan(0x10, 8));
+
+            var previousRestartRecordLsn =
+                BinaryPrimitives.ReadUInt64LittleEndian(
+                    clientData.AsSpan(0x48, 8));
+
+            if (openAttributeTableLsn != 0)
+            {
+                ReadRestartOpenAttributeTable(
+                    input,
+                    geometry,
+                    bytesPerSector,
+                    sequenceNumberBits,
+                    openAttributeTableLsn,
+                    targetFileReference,
+                    matches);
+            }
+
+            if (previousRestartRecordLsn == 0 ||
+                !visitedRestartLsns.Add(previousRestartRecordLsn))
+            {
+                break;
+            }
+
+            currentLsn = previousRestartRecordLsn;
+        }
+    }
+
+    private static bool TryReadLfsClientDataAtLsn(
+        FileStream input,
+        LogGeometry geometry,
+        uint bytesPerSector,
+        uint sequenceNumberBits,
+        ulong lsn,
+        out uint recordType,
+        out byte[] clientData)
+    {
+        recordType = 0;
+        clientData = [];
+
+        if (lsn == 0 ||
+            sequenceNumberBits < 3 ||
+            sequenceNumberBits >= 64)
+        {
+            return false;
+        }
+
+        try
+        {
+            var absoluteOffset =
+                unchecked(
+                    (lsn << checked((int)sequenceNumberBits)) >>
+                    checked((int)sequenceNumberBits - 3));
+
+            var pageNumber =
+                absoluteOffset /
+                checked((ulong)geometry.LogPageSize);
+
+            var pageOffset =
+                checked(
+                    (int)(
+                        absoluteOffset %
+                        checked((ulong)geometry.LogPageSize)));
+
+            if (pageNumber >=
+                (ulong)(input.Length / geometry.LogPageSize))
+            {
+                return false;
+            }
+
+            var page =
+                new byte[geometry.LogPageSize];
+
+            input.Position =
+                checked((long)(
+                    pageNumber *
+                    checked((ulong)geometry.LogPageSize)));
+
+            if (input.Read(page, 0, page.Length) != page.Length)
+            {
+                return false;
+            }
+
+            if (!TryApplyLogPageFixups(
+                    page,
+                    checked((int)bytesPerSector)))
+            {
+                return false;
+            }
+
+            if (pageOffset < geometry.LogPageDataOffset ||
+                pageOffset + geometry.RecordHeaderLength > page.Length)
+            {
+                return false;
+            }
+
+            var clientDataLength =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    page.AsSpan(pageOffset + 24, 4));
+
+            recordType =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    page.AsSpan(pageOffset + 32, 4));
+
+            var clientStart =
+                checked(
+                    pageOffset +
+                    geometry.RecordHeaderLength);
+
+            var clientEnd =
+                checked(
+                    clientStart +
+                    (long)clientDataLength);
+
+            if (clientDataLength == 0 ||
+                clientEnd > page.Length)
+            {
+                return false;
+            }
+
+            clientData =
+                page.AsSpan(
+                        clientStart,
+                        checked((int)clientDataLength))
+                    .ToArray();
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void ReadRestartOpenAttributeTable(
+        FileStream input,
+        LogGeometry geometry,
+        uint bytesPerSector,
+        uint sequenceNumberBits,
+        ulong openAttributeTableLsn,
+        ulong targetFileReference,
+        List<OpenAttributeHistory> matches)
+    {
+        if (!TryReadLfsClientDataAtLsn(
+                input,
+                geometry,
+                bytesPerSector,
+                sequenceNumberBits,
+                openAttributeTableLsn,
+                out var recordType,
+                out var tableData) ||
+            recordType != LfsClientRestart ||
+            tableData.Length < 0x18)
+        {
+            return;
+        }
+
+        try
+        {
+            var entrySize =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    tableData.AsSpan(0, 2));
+
+            var entryCount =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    tableData.AsSpan(2, 2));
+
+            if (entrySize < 0x20 ||
+                entryCount == 0 ||
+                entrySize > 4096)
+            {
+                return;
+            }
+
+            var tableLength =
+                checked(0x18L +
+                    (long)entrySize * entryCount);
+
+            if (tableLength > tableData.Length)
+            {
+                return;
+            }
+
+            for (var index = 0; index < entryCount; index++)
+            {
+                var entryOffset =
+                    checked(0x18 + index * entrySize);
+
+                var entry =
+                    tableData.AsSpan(
+                        entryOffset,
+                        entrySize);
+
+                if (entry.Length < 16 ||
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        entry.Slice(0, 4)) != 0xFFFFFFFF)
+                {
+                    continue;
+                }
+
+                ulong fileReference = 0;
+                ulong openLsn = 0;
+                uint attributeType = 0;
+                var attributeNamePresent = false;
+                var layout = string.Empty;
+
+                if (entry.Length >= 0x20)
+                {
+                    var typeAt08 =
+                        BinaryPrimitives.ReadUInt32LittleEndian(
+                            entry.Slice(8, 4));
+
+                    var typeAt1c =
+                        BinaryPrimitives.ReadUInt32LittleEndian(
+                            entry.Slice(0x1C, 4));
+
+                    if (IsLikelyNtfsAttributeType(typeAt08))
+                    {
+                        attributeType = typeAt08;
+                        fileReference =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                entry.Slice(0x10, 8));
+                        openLsn =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                entry.Slice(0x18, 8));
+                        attributeNamePresent =
+                            entry[0x0C] != 0;
+                        layout = "client-v1.0";
+                    }
+                    else if (IsLikelyNtfsAttributeType(typeAt1c))
+                    {
+                        attributeType = typeAt1c;
+                        fileReference =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                entry.Slice(8, 8));
+                        openLsn =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                entry.Slice(0x10, 8));
+                        attributeNamePresent =
+                            entry[0x19] != 0;
+                        layout = "client-v0.0";
+                    }
+                }
+
+                if (attributeType != NtfsAttributeTypeData ||
+                    fileReference != targetFileReference ||
+                    attributeNamePresent)
+                {
+                    continue;
+                }
+
+                var targetAttribute =
+                    checked((ushort)entryOffset);
+
+                matches.Add(
+                    new OpenAttributeHistory(
+                        openLsn,
+                        targetAttribute,
+                        fileReference,
+                        string.Empty));
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile restart open-attribute TARGET MATCH: " +
+                    $"fileRef={targetFileReference}, " +
+                    $"targetAttribute=0x{targetAttribute:X4}, " +
+                    $"entryIndex={index:N0}, " +
+                    $"entrySize={entrySize:N0}, " +
+                    $"layout={layout}, " +
+                    $"openLsn=0x{openLsn:X16}, " +
+                    $"openAttributeTableLsn=0x{openAttributeTableLsn:X16}.");
+            }
+        }
+        catch
+        {
+            // Ignore incompatible or malformed restart table data.
+        }
+    }
+
     private static List<MappingCandidate> FindTargetMappingCandidates(
         IReadOnlyList<ParsedLogRecord> records,
         ulong targetFileReference,
@@ -2739,6 +3285,22 @@ public sealed class NtfsLogFileHistoricalDataService
             new Dictionary<ushort, OpenAttributeState>();
 
         var candidates = new List<MappingCandidate>();
+
+        if (restartOpenAttributeHistories is not null)
+        {
+            foreach (var history in restartOpenAttributeHistories
+                         .OrderBy(item => item.Lsn))
+            {
+                if (history.FileReference == targetFileReference &&
+                    string.IsNullOrWhiteSpace(history.AttributeName))
+                {
+                    openAttributes[history.TargetAttribute] =
+                        new OpenAttributeState(
+                            history.FileReference,
+                            history.AttributeName);
+                }
+            }
+        }
 
         // ParseTargetRecordsFromFile already walks the journal from the
         // wrapped start page forward and assigns PhysicalOrder in that same
@@ -3217,19 +3779,16 @@ public sealed class NtfsLogFileHistoricalDataService
     {
         fileReference = 0;
 
-        // OPEN_ATTRIBUTE_ENTRY stores FileReference at offset 0x08.
-        // Offset 0x10 is LsnOfOpenRecord and must not be interpreted
-        // as a file reference.
-        if (redoData.Length >= 16)
-        {
-            fileReference =
-                BinaryPrimitives.ReadUInt64LittleEndian(
-                    redoData.AsSpan(8, 8));
+        var references =
+            ReadPossibleOpenAttributeFileReferences(redoData);
 
-            return fileReference != 0;
+        if (references.Count == 0)
+        {
+            return false;
         }
 
-        return false;
+        fileReference = references[0];
+        return true;
     }
 
     private static string DecodeUnicodeString(
