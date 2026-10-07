@@ -1119,7 +1119,8 @@ public sealed class UsnJournalMonitor : IDisposable
     private bool TryCaptureHistoricalLogFileSnapshot(
         DeletionRecord deletion,
         string root,
-        ulong fileReferenceNumber)
+        ulong fileReferenceNumber,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -1145,7 +1146,9 @@ public sealed class UsnJournalMonitor : IDisposable
                     fileSizeBytes: knownSize,
                     maxCaptureBytes: DeleteSnapshotMaxBytes,
                     out var recoveredData,
-                    out var dataEvidence))
+                    out var dataEvidence,
+                    progress: null,
+                    cancellationToken: cancellationToken))
             {
                 System.Diagnostics.Debug.WriteLine(
                     $"NTFS $LogFile live snapshot: data lookup failed for " +
@@ -1200,6 +1203,13 @@ public sealed class UsnJournalMonitor : IDisposable
 
             return true;
         }
+        catch (OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile live snapshot cancelled: " +
+                $"{deletion.FullPath}: fileRef={fileReferenceNumber}.");
+            return false;
+        }
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine(
@@ -1209,7 +1219,10 @@ public sealed class UsnJournalMonitor : IDisposable
         }
     }
 
-    public bool TryCaptureRecentDeletionSnapshot(DeletionRecord deletion)
+    public bool TryCaptureRecentDeletionSnapshot(
+        DeletionRecord deletion,
+        bool allowHistoricalLogFileFallback = true,
+        CancellationToken cancellationToken = default)
     {
         if (deletion is null ||
             string.IsNullOrWhiteSpace(deletion.FullPath) ||
@@ -1291,6 +1304,16 @@ public sealed class UsnJournalMonitor : IDisposable
             return false;
         }
 
+        // Fast live retries deliberately stop here. The $LogFile reconstruction
+        // below is expensive and must run at most once for a deletion event.
+        if (!allowHistoricalLogFileFallback)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: skipping $LogFile fallback for retry " +
+                $"path={deletion.FullPath}, fileRef={fileReferenceNumber}.");
+            return false;
+        }
+
         if (!_historicalLogFileSnapshotGate.Wait(0))
         {
             System.Diagnostics.Debug.WriteLine(
@@ -1304,7 +1327,8 @@ public sealed class UsnJournalMonitor : IDisposable
             return TryCaptureHistoricalLogFileSnapshot(
                 deletion,
                 root,
-                fileReferenceNumber);
+                fileReferenceNumber,
+                cancellationToken);
         }
         finally
         {
