@@ -4206,6 +4206,19 @@ public sealed class NtfsMftDataReader
         }
     }
 
+    internal byte[]? ReadMftRecordForDiagnostic(
+        SafeFileHandle volumeHandle,
+        NtfsVolumeInfo volumeInfo,
+        ulong segmentNumber)
+    {
+        return ReadMftRecordByExtentMap(
+            volumeHandle,
+            volumeInfo,
+            segmentNumber,
+            expectedSequenceNumber: 0,
+            expectedBaseFileReference: 0);
+    }
+
     private byte[]? ReadMftRecordByExtentMap(
         SafeFileHandle volumeHandle,
         NtfsVolumeInfo volumeInfo,
