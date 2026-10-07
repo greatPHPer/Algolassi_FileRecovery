@@ -648,7 +648,7 @@ public partial class Form1 : Form
                 $"The targeted historical $LogFile reconstruction did not recover '{candidate.Name}'.\r\n\r\n" +
                 "Enter a distinctive marker from the deleted text file to test the retained $LogFile and, only if necessary, the raw volume.",
                 "Targeted Historical Recovery — Marker Fallback",
-                "");
+                "ALGOLASSI-V21-PRESTART-20261005-UNIQUE-MARKER-A91C7E");
 
             if (string.IsNullOrWhiteSpace(marker))
             {
