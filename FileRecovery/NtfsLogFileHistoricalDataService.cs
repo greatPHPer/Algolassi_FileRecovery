@@ -3544,8 +3544,19 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
         System.Diagnostics.Trace.WriteLine(
             $"NTFS $LogFile mapping search: " +
             $"fileRef={targetFileReference}, " +
+            $"targetSegment={targetSegment:N0}, " +
             $"retainedRecords={records.Count:N0}, " +
             $"relevantOpenOrMappingRecords={relevantOpenOrMappingCount:N0}.");
+
+        var mappingRecordCount = 0;
+        var mappingWithPayloadCount = 0;
+        var targetMftMappingCount = 0;
+        var targetOpenAttributeMappingCount = 0;
+        var targetMftParsedCount = 0;
+        var targetOpenAttributeParsedCount = 0;
+        var targetMftParseFailureCount = 0;
+        var targetOpenAttributeParseFailureCount = 0;
+        var targetMftDiagnosticSamples = 0;
 
         foreach (var record in records)
         {
@@ -3559,8 +3570,8 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
             if (record.RedoOperation == OpenNonresidentAttribute)
             {
                 if (TryReadOpenAttributeFileReference(
-                        record.RedoData,
-                        out var fileReference))
+                    record.RedoData,
+                    out var fileReference))
                 {
                     openAttributes[record.TargetAttribute] =
                         new OpenAttributeState(
@@ -3577,6 +3588,8 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
                 continue;
             }
 
+            mappingRecordCount++;
+
             var mappingBytes =
                 record.RedoOperation == UpdateMappingPairs
                     ? record.RedoData
@@ -3586,6 +3599,8 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
             {
                 continue;
             }
+
+            mappingWithPayloadCount++;
 
             // UpdateMappingPairs can update the resident $MFT record containing
             // the nonresident attribute's runlist. In that form, the target VCN
@@ -3609,6 +3624,44 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
                 openAttribute.FileReference == targetFileReference &&
                 string.IsNullOrWhiteSpace(openAttribute.AttributeName);
 
+            if (exactMftTarget)
+            {
+                targetMftMappingCount++;
+
+                if (targetMftDiagnosticSamples < 12)
+                {
+                    var currentOpen =
+                        openAttributes.TryGetValue(
+                            record.TargetAttribute,
+                            out var diagnosticOpen)
+                            ? $"ref={diagnosticOpen.FileReference}, name='{diagnosticOpen.AttributeName}'"
+                            : "none";
+
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS $LogFile target-segment mapping diagnostic: " +
+                        $"fileRef={targetFileReference}, " +
+                        $"segment={targetSegment:N0}, " +
+                        $"lsn=0x{record.Lsn:X16}, " +
+                        $"transaction=0x{record.TransactionId:X8}, " +
+                        $"targetAttribute=0x{record.TargetAttribute:X4}, " +
+                        $"recordTargetOffset=0x{record.RecordOffset:X}, " +
+                        $"attributeTargetOffset=0x{record.AttributeOffset:X}, " +
+                        $"targetVcn={record.TargetVcn:N0}, " +
+                        $"clusterBlockOffset={record.ClusterBlockOffset}, " +
+                        $"targetBlockSize={record.TargetBlockSize}, " +
+                        $"mappingBytes={mappingBytes.Length:N0}, " +
+                        $"openAttributeState={currentOpen}, " +
+                        $"openAttributeExact={exactOpenAttributeTarget}.");
+
+                    targetMftDiagnosticSamples++;
+                }
+            }
+
+            if (exactOpenAttributeTarget)
+            {
+                targetOpenAttributeMappingCount++;
+            }
+
             if (!exactMftTarget &&
                 !exactOpenAttributeTarget)
             {
@@ -3625,6 +3678,16 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
                 if (extents.Count == 0)
                 {
                     continue;
+                }
+
+                if (exactMftTarget)
+                {
+                    targetMftParsedCount++;
+                }
+
+                if (exactOpenAttributeTarget)
+                {
+                    targetOpenAttributeParsedCount++;
                 }
 
                 var coveredEndVcn =
@@ -3679,9 +3742,33 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
             }
             catch
             {
+                if (exactMftTarget)
+                {
+                    targetMftParseFailureCount++;
+                }
+
+                if (exactOpenAttributeTarget)
+                {
+                    targetOpenAttributeParseFailureCount++;
+                }
+
                 // Keep searching later exact-file mapping updates.
             }
         }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS $LogFile mapping diagnostic summary: " +
+            $"fileRef={targetFileReference}, " +
+            $"targetSegment={targetSegment:N0}, " +
+            $"mappingRecords={mappingRecordCount:N0}, " +
+            $"mappingWithPayload={mappingWithPayloadCount:N0}, " +
+            $"targetMftMappings={targetMftMappingCount:N0}, " +
+            $"targetOpenAttributeMappings={targetOpenAttributeMappingCount:N0}, " +
+            $"targetMftParsed={targetMftParsedCount:N0}, " +
+            $"targetOpenAttributeParsed={targetOpenAttributeParsedCount:N0}, " +
+            $"targetMftParseFailures={targetMftParseFailureCount:N0}, " +
+            $"targetOpenAttributeParseFailures={targetOpenAttributeParseFailureCount:N0}, " +
+            $"candidates={candidates.Count:N0}.");
 
         return candidates;
     }
