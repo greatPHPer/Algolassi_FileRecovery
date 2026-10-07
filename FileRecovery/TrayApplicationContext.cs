@@ -101,6 +101,85 @@ public sealed class TrayApplicationContext : ApplicationContext
         _mainForm.Activate();
     }
 
+    private async Task attmp(DeletionDetectedEventArgs e)
+    {
+        try
+        {
+            const int fastAttempts = 5;
+
+            // Give the freshly deleted MFT generation several cheap chances first.
+            // These attempts deliberately do not enter the expensive $LogFile path.
+            for (var attempt = 0; attempt < fastAttempts; attempt++)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS immediate live path fast snapshot attempt: " +
+                    $"path={e.Record.FullPath}, attempt={attempt + 1}/{fastAttempts}.");
+
+                if (await Task.Run(
+                        () => _usnMonitor.TryCaptureRecentDeletionSnapshot(
+                            e.Record,
+                            allowHistoricalLogFileFallback: false)))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS immediate live path fast snapshot succeeded: " +
+                        $"path={e.Record.FullPath}, attempt={attempt + 1}.");
+
+                    await Task.Run(() => _history.Upsert(e.Record));
+                    return;
+                }
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS immediate live path fast snapshot attempt failed: " +
+                    $"path={e.Record.FullPath}, attempt={attempt + 1}/{fastAttempts}.");
+
+                if (attempt < fastAttempts - 1)
+                {
+                    await Task.Delay(150);
+                }
+            }
+
+            // Only one expensive $LogFile reconstruction is allowed for this
+            // deletion event. The underlying reader is also cancelled after 45 seconds.
+            using var fallbackCts =
+                new CancellationTokenSource(TimeSpan.FromSeconds(45));
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS immediate live path starting SINGLE $LogFile fallback: " +
+                $"path={e.Record.FullPath}.");
+
+            if (await Task.Run(
+                    () => _usnMonitor.TryCaptureRecentDeletionSnapshot(
+                        e.Record,
+                        allowHistoricalLogFileFallback: true,
+                        cancellationToken: fallbackCts.Token)))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS immediate live path $LogFile fallback succeeded: " +
+                    $"path={e.Record.FullPath}.");
+
+                await Task.Run(() => _history.Upsert(e.Record));
+                return;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS immediate live path snapshot exhausted: " +
+                $"path={e.Record.FullPath}. " +
+                $"Five fast MFT/USN attempts + one $LogFile attempt failed.");
+        }
+        catch (OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS immediate live path snapshot cancelled: " +
+                $"path={e.Record.FullPath}.");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS immediate live path snapshot worker failed: " +
+                $"path={e.Record.FullPath}: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     private async void OnDeletionDetected(object? sender, DeletionDetectedEventArgs e)
     {
         if (RecoveryMonitoringExclusions.IsExcludedPath(e.Record.FullPath))
@@ -146,43 +225,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 $"fileRef={e.Record.FileReferenceNumber?.ToString() ?? "(unknown)"}, " +
                 $"knownSize={e.Record.FileSizeBytes?.ToString("N0") ?? "(unknown)"}.");
 
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    // A large historical USN backlog can delay the background
-                    // cursor long enough for a fresh MFT sequence to be reused.
-                    // Inspect the recent journal tail immediately and try to
-                    // capture the NTFS $DATA snapshot while the deletion is fresh.
-                    for (var attempt = 0; attempt < 6; attempt++)
-                    {
-                        if (_usnMonitor.TryCaptureRecentDeletionSnapshot(e.Record))
-                        {
-                            System.Diagnostics.Debug.WriteLine(
-                                $"NTFS immediate live path snapshot succeeded: " +
-                                $"path={e.Record.FullPath}, attempt={attempt + 1}.");
-
-                            await Task.Run(() => _history.Upsert(e.Record));
-                            return;
-                        }
-
-                        System.Diagnostics.Debug.WriteLine(
-                            $"NTFS immediate live path snapshot attempt failed: " +
-                            $"path={e.Record.FullPath}, attempt={attempt + 1}.");
-
-                        if (attempt < 5)
-                        {
-                            await Task.Delay(150);
-                        }
-                    }
-                }
-                catch
-                {
-                    // Live NTFS snapshotting is best-effort; the original
-                    // deletion history row remains available if the journal/MFT
-                    // race cannot be won.
-                }
-            });
+            await attmp(e);
         }
 
         if (!e.Historical && !wasExisting && !_settings.NotificationsMuted)
