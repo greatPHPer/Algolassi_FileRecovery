@@ -3718,9 +3718,13 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
                 }
             }
 
+            // Matching only the targetAttribute slot is not sufficient
+            // identity. The same attribute slot can occur in UpdateMappingPairs
+            // records for many different MFT record segments. Accept only an
+            // exact MFT-segment target or an exact OpenNonresidentAttribute
+            // file-reference correlation.
             if (!exactMftTarget &&
-                !exactOpenAttributeTarget &&
-                !exactTargetAttributeSlot)
+                !exactOpenAttributeTarget)
             {
                 continue;
             }
