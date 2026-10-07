@@ -4767,21 +4767,24 @@ public sealed class NtfsLogFileHistoricalDataService
                          redoOperation == ForgetTransaction ||
                          undoOperation == ForgetTransaction);
 
+                    var isHistoricalCheckpointDump =
+                        redoOperation == 0x001D ||
+                        undoOperation == 0x001D;
+
                     var isTargetDump =
-                        (redoOperation == 0x001D ||
-                         undoOperation == 0x001D) &&
+                        isHistoricalCheckpointDump &&
                         ContainsTargetFileReference(
                             clientSpan,
                             targetFileReference);
 
                     // Keep the small set of NTFS history operations needed to
                     // reconstruct the target file's identity and data. In
-                    // particular, retain ALL OpenNonresidentAttribute and
-                    // UpdateNonresidentValue records so the later exact
-                    // file-reference association can be performed from the
-                    // complete journal ordering. Do NOT retain journal-wide
-                    // bitmap/transaction traffic unless it belongs to the
-                    // target deletion transaction.
+                    // particular, retain ALL OpenNonresidentAttribute,
+                    // UpdateNonresidentValue, and OpenAttributeTableDump records.
+                    // The checkpoint dumps are small compared with the full
+                    // journal payload and are required to inspect older
+                    // open-attribute snapshots after an MFT generation has
+                    // wrapped out of the ordinary transaction history.
                     var isHistoricalDataOperation =
                         redoOperation == 0x0002 || // InitializeFileRecordSegment
                         undoOperation == 0x0002 ||
@@ -4800,6 +4803,7 @@ public sealed class NtfsLogFileHistoricalDataService
 
                     var keep =
                         isHistoricalDataOperation ||
+                        isHistoricalCheckpointDump ||
                         isTargetBitmap ||
                         isTargetTransactionRecord ||
                         isTargetDump;
