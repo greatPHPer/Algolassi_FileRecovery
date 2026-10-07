@@ -2771,7 +2771,7 @@ public sealed class NtfsLogFileHistoricalDataService
             if (record.RedoOperation != OpenNonresidentAttribute &&
                 record.RedoOperation != UpdateMappingPairs &&
                 record.UndoOperation != UpdateMappingPairs)
-            {
+            
                 continue;
             }
 
