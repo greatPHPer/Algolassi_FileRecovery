@@ -29,6 +29,7 @@ public sealed class NtfsLogFileHistoricalDataService
     private const ushort ForgetTransaction = 0x001B;
     private const uint NtfsAttributeTypeData = 0x00000080;
     private const uint LfsClientRecord = 0x0001;
+    private const uint LfsClientRestart = 0x0002;
     private const int RecordHeaderMinimumLength = 48;
     // Marker searches intentionally stay bounded. Targeted historical recovery
     // must read the complete retained $LogFile because the deletion transaction
@@ -3275,7 +3276,8 @@ public sealed class NtfsLogFileHistoricalDataService
         IReadOnlyList<ParsedLogRecord> records,
         ulong targetFileReference,
         uint bytesPerCluster,
-        uint bytesPerFileRecordSegment)
+        uint bytesPerFileRecordSegment,
+        IReadOnlyList<OpenAttributeHistory>? restartOpenAttributeHistories = null)
     {
         var targetSegment =
             targetFileReference &
