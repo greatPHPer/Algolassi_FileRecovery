@@ -1743,27 +1743,18 @@ public sealed class NtfsLogFileHistoricalDataService
     {
         var references = new HashSet<ulong>();
 
-        if (redoData.Length >= 24)
-        {
-            var x64Reference =
-                BinaryPrimitives.ReadUInt64LittleEndian(
-                    redoData.AsSpan(16, 8));
-
-            if (x64Reference != 0)
-            {
-                references.Add(x64Reference);
-            }
-        }
-
+        // OPEN_ATTRIBUTE_ENTRY stores FileReference at offset 0x08 for
+        // both NTFS v1.x and v3.x+ layouts. Offset 0x10 is LsnOfOpenRecord,
+        // not another file-reference variant.
         if (redoData.Length >= 16)
         {
-            var x86Reference =
+            var fileReference =
                 BinaryPrimitives.ReadUInt64LittleEndian(
                     redoData.AsSpan(8, 8));
 
-            if (x86Reference != 0)
+            if (fileReference != 0)
             {
-                references.Add(x86Reference);
+                references.Add(fileReference);
             }
         }
 
@@ -3226,30 +3217,16 @@ public sealed class NtfsLogFileHistoricalDataService
     {
         fileReference = 0;
 
-        if (redoData.Length >= 24)
-        {
-            var v1Reference =
-                BinaryPrimitives.ReadUInt64LittleEndian(
-                    redoData.AsSpan(16, 8));
-
-            if (v1Reference != 0)
-            {
-                fileReference = v1Reference;
-                return true;
-            }
-        }
-
+        // OPEN_ATTRIBUTE_ENTRY stores FileReference at offset 0x08.
+        // Offset 0x10 is LsnOfOpenRecord and must not be interpreted
+        // as a file reference.
         if (redoData.Length >= 16)
         {
-            var v0Reference =
+            fileReference =
                 BinaryPrimitives.ReadUInt64LittleEndian(
                     redoData.AsSpan(8, 8));
 
-            if (v0Reference != 0)
-            {
-                fileReference = v0Reference;
-                return true;
-            }
+            return fileReference != 0;
         }
 
         return false;
@@ -3972,12 +3949,12 @@ public sealed class NtfsLogFileHistoricalDataService
                                 openData,
                                 out var openedFileReference))
                         {
+                            // The attribute name for OpenNonresidentAttribute
+                            // is carried in the UndoData field, not inside the
+                            // OPEN_ATTRIBUTE_ENTRY redo buffer.
                             var openAttributeName =
                                 DecodeUnicodeString(
-                                    ReadLogData(
-                                        openData,
-                                        8,
-                                        10));
+                                    undoData);
 
                             openTargetsExact =
                                 openedFileReference ==
