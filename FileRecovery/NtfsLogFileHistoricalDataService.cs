@@ -3671,6 +3671,9 @@ public sealed class NtfsLogFileHistoricalDataService
             targetFileReference &
             0x0000FFFFFFFFFFFFUL;
 
+        var targetSequence =
+            checked((ushort)(targetFileReference >> 48));
+
         var openAttributes =
             new Dictionary<ushort, OpenAttributeState>();
 
