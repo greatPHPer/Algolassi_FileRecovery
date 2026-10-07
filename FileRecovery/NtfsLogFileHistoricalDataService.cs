@@ -4520,20 +4520,50 @@ public sealed class NtfsLogFileHistoricalDataService
         var physicalOrder = 0L;
         var page = new byte[geometry.LogPageSize];
 
+        var totalScanPages =
+            Math.Max(
+                0,
+                pageCount - geometry.WrappedStartPage);
+
+        var totalScanBytes =
+            checked(
+                (long)totalScanPages *
+                geometry.LogPageSize);
+
         for (var pageIndex = geometry.WrappedStartPage;
              pageIndex < pageCount;
              pageIndex++)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
+            var scannedPages =
+                pageIndex -
+                geometry.WrappedStartPage +
+                1;
+
             if (progress is not null &&
                 (pageIndex == geometry.WrappedStartPage ||
+                 pageIndex == pageCount - 1 ||
                  (pageIndex - geometry.WrappedStartPage) % 128 == 0))
             {
+                var scannedBytes =
+                    Math.Min(
+                        checked(
+                            (long)scannedPages *
+                            geometry.LogPageSize),
+                        totalScanBytes);
+
+                var percent =
+                    totalScanBytes == 0
+                        ? 100d
+                        : scannedBytes * 100d / totalScanBytes;
+
                 progress.Report(
-                    $"Parsing targeted historical NTFS $LogFile... page " +
-                    $"{pageIndex - geometry.WrappedStartPage + 1:N0} / " +
-                    $"{pageCount - geometry.WrappedStartPage:N0}");
+                    $"Parsing targeted historical NTFS $LogFile... " +
+                    $"{scannedBytes / (1024d * 1024d):0} MB / " +
+                    $"{totalScanBytes / (1024d * 1024d):0} MB " +
+                    $"({percent:0.0}%) — " +
+                    $"pages {scannedPages:N0} / {totalScanPages:N0}");
             }
 
             Array.Clear(page, 0, page.Length);
