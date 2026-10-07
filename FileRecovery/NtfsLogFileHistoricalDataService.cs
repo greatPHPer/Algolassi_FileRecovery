@@ -408,6 +408,12 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
                 expectedFileName,
                 fileSizeBytes);
 
+            TraceTargetTransactionEvidence(
+                records,
+                fileReferenceNumber,
+                volumeInfo.BytesPerCluster,
+                volumeInfo.BytesPerFileRecordSegment);
+
             var restartOpenAttributeHistories =
                 ReadRestartOpenAttributeHistories(
                     _historicalLogWorkspace!.Path,
@@ -1312,6 +1318,153 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
         }
 
         return definitions.Count > 0;
+    }
+
+    private static void TraceTargetTransactionEvidence(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetFileReference,
+        uint bytesPerCluster,
+        uint bytesPerFileRecordSegment)
+    {
+        var targetSegment =
+            targetFileReference &
+            0x0000FFFFFFFFFFFFUL;
+
+        var targetRecords =
+            records
+                .Where(record =>
+                    CalculateTargetMftSegment(
+                        record,
+                        bytesPerCluster,
+                        bytesPerFileRecordSegment) == targetSegment)
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
+
+        var targetTransactions =
+            targetRecords
+                .Select(record => record.TransactionId)
+                .Where(transactionId => transactionId != 0)
+                .Distinct()
+                .ToArray();
+
+        if (targetTransactions.Length == 0)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile target transaction evidence: " +
+                $"fileRef={targetFileReference}, " +
+                $"segment={targetSegment:N0}, " +
+                "no nonzero transaction was attached to an exact MFT-targeted record.");
+            return;
+        }
+
+        foreach (var transactionId in targetTransactions)
+        {
+            var transactionRecords =
+                records
+                    .Where(record =>
+                        record.TransactionId == transactionId)
+                    .OrderBy(record => record.Lsn)
+                    .ThenBy(record => record.PhysicalOrder)
+                    .ToList();
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile target transaction summary: " +
+                $"fileRef={targetFileReference}, " +
+                $"segment={targetSegment:N0}, " +
+                $"transaction=0x{transactionId:X8}, " +
+                $"records={transactionRecords.Count:N0}.");
+
+            foreach (var record in transactionRecords)
+            {
+                var selectedOperation =
+                    record.RedoOperation != 0
+                        ? record.RedoOperation
+                        : record.UndoOperation;
+
+                var operationName =
+                    selectedOperation switch
+                    {
+                        0x0002 => "InitializeFileRecordSegment",
+                        DeallocateFileRecordSegment => "DeallocateFileRecordSegment",
+                        UpdateResidentValue => "UpdateResidentValue",
+                        UpdateNonresidentValue => "UpdateNonresidentValue",
+                        UpdateMappingPairs => "UpdateMappingPairs",
+                        SetNewAttributeSizes => "SetNewAttributeSizes",
+                        OpenNonresidentAttribute => "OpenNonresidentAttribute",
+                        SetBitsInNonresidentBitmap => "SetBitsInNonresidentBitmap",
+                        ClearBitsInNonresidentBitmap => "ClearBitsInNonresidentBitmap",
+                        PrepareTransaction => "PrepareTransaction",
+                        CommitTransaction => "CommitTransaction",
+                        ForgetTransaction => "ForgetTransaction",
+                        0x001D => "OpenAttributeTableDump",
+                        _ => $"0x{selectedOperation:X4}"
+                    };
+
+                var openReference =
+                    string.Empty;
+
+                var openName =
+                    string.Empty;
+
+                if (record.RedoOperation == OpenNonresidentAttribute &&
+                    record.RedoData.Length > 0)
+                {
+                    if (TryReadOpenAttributeFileReference(
+                            record.RedoData,
+                            out var openedReference))
+                    {
+                        openReference =
+                            $" openFileRef={openedReference}";
+
+                        openName =
+                            $" openName='{DecodeUnicodeString(record.UndoData)}'";
+                    }
+                    else
+                    {
+                        openReference = " openFileRef=(unreadable)";
+                    }
+                }
+
+                var redoPreview =
+                    record.RedoData.Length == 0
+                        ? string.Empty
+                        : Convert.ToHexString(
+                            record.RedoData.AsSpan(
+                                0,
+                                Math.Min(32, record.RedoData.Length)));
+
+                var undoPreview =
+                    record.UndoData.Length == 0
+                        ? string.Empty
+                        : Convert.ToHexString(
+                            record.UndoData.AsSpan(
+                                0,
+                                Math.Min(32, record.UndoData.Length)));
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile target transaction record: " +
+                    $"fileRef={targetFileReference}, " +
+                    $"segment={targetSegment:N0}, " +
+                    $"transaction=0x{transactionId:X8}, " +
+                    $"lsn=0x{record.Lsn:X16}, " +
+                    $"previousLsn=0x{record.ClientPreviousLsn:X16}, " +
+                    $"undoNextLsn=0x{record.ClientUndoNextLsn:X16}, " +
+                    $"redo=0x{record.RedoOperation:X4}/{record.RedoData.Length:N0}, " +
+                    $"undo=0x{record.UndoOperation:X4}/{record.UndoData.Length:N0}, " +
+                    $"operation={operationName}, " +
+                    $"targetAttribute=0x{record.TargetAttribute:X4}, " +
+                    $"recordTargetOffset=0x{record.RecordOffset:X}, " +
+                    $"attributeTargetOffset=0x{record.AttributeOffset:X}, " +
+                    $"targetVcn={record.TargetVcn:N0}, " +
+                    $"clusterBlockOffset={record.ClusterBlockOffset}, " +
+                    $"targetBlockSize={record.TargetBlockSize}, " +
+                    $"redoHex={redoPreview}, " +
+                    $"undoHex={undoPreview}." +
+                    openReference +
+                    openName);
+            }
+        }
     }
 
     private static void TraceCurrentMftRecordEvidence(
