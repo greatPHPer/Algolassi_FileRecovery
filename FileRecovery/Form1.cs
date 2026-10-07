@@ -41,6 +41,9 @@ public partial class Form1 : Form
         _usnMonitor = usnMonitor;
 
         InitializeComponent();
+
+        lblStatus.Cursor = Cursors.Hand;
+        lblStatus.Click += lblStatus_Click;
         _history.Changed += History_Changed;
     }
 
@@ -160,6 +163,23 @@ public partial class Form1 : Form
         }
 
         lblStatus.Text = statusText;
+    }
+
+    private void lblStatus_Click(object? sender, EventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(lblStatus.Text))
+        {
+            return;
+        }
+
+        try
+        {
+            Clipboard.SetText(lblStatus.Text);
+        }
+        catch
+        {
+            // Clipboard access can fail when Windows temporarily owns the clipboard.
+        }
     }
 
     private void History_Changed(object? sender, EventArgs e)
