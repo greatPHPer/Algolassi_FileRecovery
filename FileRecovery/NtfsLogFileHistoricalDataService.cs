@@ -2930,6 +2930,13 @@ public sealed class NtfsLogFileHistoricalDataService
                         continue;
                     }
 
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS $LogFile restart client: " +
+                        $"page={restartPageIndex}, " +
+                        $"clientIndex={clientIndex}, " +
+                        $"restartLsn=0x{clientRestartLsn:X16}, " +
+                        $"seqBits={sequenceNumberBits}.");
+
                     TraceRestartOpenAttributeTableChain(
                         input,
                         geometry,
@@ -2995,6 +3002,11 @@ public sealed class NtfsLogFileHistoricalDataService
                 BinaryPrimitives.ReadUInt64LittleEndian(
                     clientData.AsSpan(0x10, 8));
 
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile restart record: " +
+                $"restartLsn=0x{currentLsn:X16}, " +
+                $"openAttributeTableLsn=0x{openAttributeTableLsn:X16}.");
+
             var previousRestartRecordLsn =
                 BinaryPrimitives.ReadUInt64LittleEndian(
                     clientData.AsSpan(0x48, 8));
@@ -3057,13 +3069,20 @@ public sealed class NtfsLogFileHistoricalDataService
                         absoluteOffset %
                         checked((ulong)geometry.LogPageSize)));
 
-            if (pageNumber >=
-                (ulong)(input.Length / geometry.LogPageSize))
+            var totalPages =
+                checked(
+                    (int)(
+                        input.Length /
+                        geometry.LogPageSize));
+
+            if (pageNumber >= (ulong)totalPages ||
+                pageOffset < geometry.LogPageDataOffset ||
+                pageOffset + geometry.RecordHeaderLength > geometry.LogPageSize)
             {
                 return false;
             }
 
-            var page =
+            var firstPage =
                 new byte[geometry.LogPageSize];
 
             input.Position =
@@ -3071,54 +3090,129 @@ public sealed class NtfsLogFileHistoricalDataService
                     pageNumber *
                     checked((ulong)geometry.LogPageSize)));
 
-            if (input.Read(page, 0, page.Length) != page.Length)
+            if (input.Read(firstPage, 0, firstPage.Length) != firstPage.Length ||
+                !TryApplyLogPageFixups(
+                    firstPage,
+                    checked((int)bytesPerSector)) ||
+                EncodingAscii(firstPage, 0, 4) != "RCRD")
             {
                 return false;
             }
 
-            if (!TryApplyLogPageFixups(
-                    page,
-                    checked((int)bytesPerSector)))
-            {
-                return false;
-            }
+            var thisLsn =
+                BinaryPrimitives.ReadUInt64LittleEndian(
+                    firstPage.AsSpan(pageOffset, 8));
 
-            if (pageOffset < geometry.LogPageDataOffset ||
-                pageOffset + geometry.RecordHeaderLength > page.Length)
+            if (thisLsn != lsn)
             {
                 return false;
             }
 
             var clientDataLength =
                 BinaryPrimitives.ReadUInt32LittleEndian(
-                    page.AsSpan(pageOffset + 24, 4));
+                    firstPage.AsSpan(pageOffset + 24, 4));
 
             recordType =
                 BinaryPrimitives.ReadUInt32LittleEndian(
-                    page.AsSpan(pageOffset + 32, 4));
+                    firstPage.AsSpan(pageOffset + 32, 4));
+
+            if (clientDataLength == 0 ||
+                clientDataLength > 64 * 1024 * 1024)
+            {
+                return false;
+            }
+
+            var recordFlags =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    firstPage.AsSpan(pageOffset + 40, 2));
 
             var clientStart =
                 checked(
                     pageOffset +
                     geometry.RecordHeaderLength);
 
-            var clientEnd =
+            var firstAvailable =
                 checked(
-                    clientStart +
-                    (long)clientDataLength);
+                    geometry.LogPageSize -
+                    clientStart);
 
-            if (clientDataLength == 0 ||
-                clientEnd > page.Length)
+            if ((recordFlags & 0x0001) == 0 &&
+                clientDataLength > (uint)firstAvailable)
             {
                 return false;
             }
 
-            clientData =
-                page.AsSpan(
-                        clientStart,
-                        checked((int)clientDataLength))
-                    .ToArray();
+            var result =
+                new byte[checked((int)clientDataLength)];
 
+            var remaining =
+                checked((int)clientDataLength);
+
+            var destinationOffset = 0;
+            var currentPageNumber = pageNumber;
+            var currentOffset = clientStart;
+
+            while (remaining > 0)
+            {
+                var page =
+                    new byte[geometry.LogPageSize];
+
+                input.Position =
+                    checked((long)(
+                        currentPageNumber *
+                        checked((ulong)geometry.LogPageSize)));
+
+                if (input.Read(page, 0, page.Length) != page.Length ||
+                    !TryApplyLogPageFixups(
+                        page,
+                        checked((int)bytesPerSector)) ||
+                    EncodingAscii(page, 0, 4) != "RCRD")
+                {
+                    return false;
+                }
+
+                var available =
+                    geometry.LogPageSize -
+                    currentOffset;
+
+                var copyLength =
+                    Math.Min(
+                        remaining,
+                        available);
+
+                if (copyLength <= 0)
+                {
+                    return false;
+                }
+
+                Buffer.BlockCopy(
+                    page,
+                    currentOffset,
+                    result,
+                    destinationOffset,
+                    copyLength);
+
+                destinationOffset += copyLength;
+                remaining -= copyLength;
+
+                if (remaining == 0)
+                {
+                    break;
+                }
+
+                currentPageNumber++;
+
+                if (currentPageNumber >= (ulong)totalPages)
+                {
+                    currentPageNumber =
+                        checked((ulong)geometry.WrappedStartPage);
+                }
+
+                currentOffset =
+                    geometry.LogPageDataOffset;
+            }
+
+            clientData = result;
             return true;
         }
         catch
