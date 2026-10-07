@@ -401,6 +401,13 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
                 volumeInfo.BytesPerCluster,
                 volumeInfo.BytesPerFileRecordSegment);
 
+            TraceCurrentMftRecordEvidence(
+                rawHandle,
+                volumeInfo,
+                fileReferenceNumber,
+                expectedFileName,
+                fileSizeBytes);
+
             var restartOpenAttributeHistories =
                 ReadRestartOpenAttributeHistories(
                     _historicalLogWorkspace!.Path,
@@ -1305,6 +1312,387 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
         }
 
         return definitions.Count > 0;
+    }
+
+    private static void TraceCurrentMftRecordEvidence(
+        SafeFileHandle rawVolumeHandle,
+        NtfsVolumeInfo volumeInfo,
+        ulong targetFileReference,
+        string expectedFileName,
+        long expectedSize)
+    {
+        var targetSegment =
+            targetFileReference &
+            0x0000FFFFFFFFFFFFUL;
+
+        var targetSequence =
+            checked((ushort)(targetFileReference >> 48));
+
+        if (volumeInfo.BytesPerCluster == 0 ||
+            volumeInfo.BytesPerFileRecordSegment == 0 ||
+            volumeInfo.MftStartLcn < 0 ||
+            volumeInfo.MftValidDataLength <= 0)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS current MFT evidence skipped: " +
+                $"segment={targetSegment:N0}, invalid NTFS MFT geometry.");
+            return;
+        }
+
+        var relativeOffset =
+            checked(
+                (long)targetSegment *
+                volumeInfo.BytesPerFileRecordSegment);
+
+        var absoluteOffset =
+            checked(
+                volumeInfo.MftStartLcn *
+                (long)volumeInfo.BytesPerCluster +
+                relativeOffset);
+
+        if (relativeOffset < 0 ||
+            relativeOffset + volumeInfo.BytesPerFileRecordSegment >
+            volumeInfo.MftValidDataLength)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS current MFT evidence skipped: " +
+                $"segment={targetSegment:N0}, " +
+                $"relativeOffset={relativeOffset:N0}, " +
+                $"mftValidDataLength={volumeInfo.MftValidDataLength:N0}.");
+            return;
+        }
+
+        try
+        {
+            var record = new byte[
+                checked((int)volumeInfo.BytesPerFileRecordSegment)];
+
+            ReadRawExact(
+                rawVolumeHandle,
+                absoluteOffset,
+                record,
+                0,
+                record.Length);
+
+            if (record.Length < 48 ||
+                EncodingAscii(record, 0, 4) != "FILE")
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS current MFT evidence: " +
+                    $"segment={targetSegment:N0}, " +
+                    $"absoluteOffset={absoluteOffset:N0}, invalid FILE signature.");
+                return;
+            }
+
+            if (!TryApplyMftRecordFixups(
+                    record,
+                    checked((int)volumeInfo.BytesPerSector)))
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS current MFT evidence: " +
+                    $"segment={targetSegment:N0}, MFT update-sequence fixup failed.");
+                return;
+            }
+
+            var actualSequence =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(16, 2));
+
+            var flags =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(22, 2));
+
+            var usedLength =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(24, 4));
+
+            var totalLength =
+                BinaryPrimitives.ReadUInt32LittleEndian(
+                    record.AsSpan(28, 4));
+
+            var baseReference =
+                BinaryPrimitives.ReadUInt64LittleEndian(
+                    record.AsSpan(32, 8));
+
+            var attributesOffset =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(20, 2));
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS current MFT evidence: " +
+                $"fileRef={targetFileReference}, " +
+                $"name='{expectedFileName}', " +
+                $"segment={targetSegment:N0}, " +
+                $"expectedSequence={targetSequence}, " +
+                $"actualSequence={actualSequence}, " +
+                $"flags=0x{flags:X4}, " +
+                $"baseRef={baseReference}, " +
+                $"attributesOffset=0x{attributesOffset:X}, " +
+                $"usedLength={usedLength:N0}, " +
+                $"totalLength={totalLength:N0}, " +
+                $"expectedSize={expectedSize:N0}.");
+
+            if (attributesOffset < 24 ||
+                attributesOffset >= record.Length)
+            {
+                return;
+            }
+
+            var cursor = (int)attributesOffset;
+            var foundData = false;
+
+            while (cursor + 16 <= record.Length)
+            {
+                var type =
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        record.AsSpan(cursor, 4));
+
+                if (type == 0xFFFFFFFF)
+                {
+                    break;
+                }
+
+                var attributeLength =
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        record.AsSpan(cursor + 4, 4));
+
+                if (attributeLength < 24 ||
+                    cursor + attributeLength > record.Length)
+                {
+                    break;
+                }
+
+                var nonResident = record[cursor + 8] != 0;
+                var nameLength = record[cursor + 9];
+
+                if (type == NtfsAttributeTypeData &&
+                    nameLength == 0)
+                {
+                    foundData = true;
+
+                    if (!nonResident)
+                    {
+                        var valueLength =
+                            BinaryPrimitives.ReadUInt32LittleEndian(
+                                record.AsSpan(cursor + 16, 4));
+
+                        var valueOffset =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                record.AsSpan(cursor + 18, 2));
+
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS current MFT unnamed $DATA: " +
+                            $"form=resident, " +
+                            $"attributeOffset=0x{cursor:X}, " +
+                            $"attributeLength={attributeLength:N0}, " +
+                            $"valueOffset=0x{valueOffset:X}, " +
+                            $"valueLength={valueLength:N0}.");
+
+                        if (valueOffset >= 24 &&
+                            valueOffset + valueLength <= attributeLength)
+                        {
+                            var previewLength =
+                                Math.Min(64, checked((int)valueLength));
+
+                            var preview =
+                                previewLength == 0
+                                    ? string.Empty
+                                    : Convert.ToHexString(
+                                        record.AsSpan(
+                                            cursor + valueOffset,
+                                            previewLength));
+
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS current MFT resident $DATA preview: " +
+                                $"bytes={previewLength:N0}, hex={preview}.");
+                        }
+                    }
+                    else if (attributeLength >= 64)
+                    {
+                        var startingVcn =
+                            BinaryPrimitives.ReadInt64LittleEndian(
+                                record.AsSpan(cursor + 16, 8));
+
+                        var endingVcn =
+                            BinaryPrimitives.ReadInt64LittleEndian(
+                                record.AsSpan(cursor + 24, 8));
+
+                        var mappingPairsOffset =
+                            BinaryPrimitives.ReadUInt16LittleEndian(
+                                record.AsSpan(cursor + 32, 2));
+
+                        var allocatedSize =
+                            BinaryPrimitives.ReadInt64LittleEndian(
+                                record.AsSpan(cursor + 40, 8));
+
+                        var dataSize =
+                            BinaryPrimitives.ReadInt64LittleEndian(
+                                record.AsSpan(cursor + 48, 8));
+
+                        var validDataSize =
+                            BinaryPrimitives.ReadInt64LittleEndian(
+                                record.AsSpan(cursor + 56, 8));
+
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS current MFT unnamed $DATA: " +
+                            $"form=nonresident, " +
+                            $"attributeOffset=0x{cursor:X}, " +
+                            $"attributeLength={attributeLength:N0}, " +
+                            $"startingVcn={startingVcn:N0}, " +
+                            $"endingVcn={endingVcn:N0}, " +
+                            $"mappingPairsOffset=0x{mappingPairsOffset:X}, " +
+                            $"allocatedSize={allocatedSize:N0}, " +
+                            $"dataSize={dataSize:N0}, " +
+                            $"validDataSize={validDataSize:N0}.");
+
+                        if (mappingPairsOffset >= 64 &&
+                            mappingPairsOffset < attributeLength)
+                        {
+                            var mappingStart =
+                                checked(cursor + mappingPairsOffset);
+
+                            var availableMappingLength =
+                                Math.Min(
+                                    checked((int)attributeLength - mappingPairsOffset),
+                                    record.Length - mappingStart);
+
+                            var terminator =
+                                record.AsSpan(
+                                        mappingStart,
+                                        availableMappingLength)
+                                    .IndexOf((byte)0);
+
+                            if (terminator >= 0)
+                            {
+                                var mappingBytes =
+                                    record.AsSpan(
+                                        mappingStart,
+                                        terminator);
+
+                                try
+                                {
+                                    var extents =
+                                        NtfsMappingPairsParser.Parse(
+                                            mappingBytes,
+                                            startingVcn);
+
+                                    var extentSummary =
+                                        string.Join(
+                                            "; ",
+                                            extents
+                                                .Take(32)
+                                                .Select(
+                                                    extent =>
+                                                        $"VCN={extent.VirtualClusterNumber:N0}+" +
+                                                        $"{extent.ClusterCount:N0}->" +
+                                                        $"{(extent.IsSparse
+                                                            ? "SPARSE"
+                                                            : extent.LogicalClusterNumber.ToString("N0"))}"));
+
+                                    if (extents.Count > 32)
+                                    {
+                                        extentSummary += "; ...";
+                                    }
+
+                                    System.Diagnostics.Trace.WriteLine(
+                                        $"NTFS current MFT $DATA runlist: " +
+                                        $"extentCount={extents.Count:N0}, " +
+                                        $"extents=[{extentSummary}].");
+                                }
+                                catch (Exception ex)
+                                {
+                                    System.Diagnostics.Trace.WriteLine(
+                                        $"NTFS current MFT $DATA mapping parse failed: " +
+                                        $"{ex.GetType().Name}: {ex.Message}");
+                                }
+                            }
+                            else
+                            {
+                                System.Diagnostics.Trace.WriteLine(
+                                    $"NTFS current MFT $DATA mapping parse skipped: " +
+                                    $"no terminator within available attribute bytes.");
+                            }
+                        }
+                    }
+                }
+
+                cursor += checked((int)attributeLength);
+            }
+
+            if (!foundData)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    "NTFS current MFT evidence: no unnamed $DATA attribute present.");
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS current MFT evidence failed: " +
+                $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static bool TryApplyMftRecordFixups(
+        byte[] record,
+        int bytesPerSector)
+    {
+        if (record.Length < 48 ||
+            bytesPerSector <= 0)
+        {
+            return false;
+        }
+
+        var usaOffset =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                record.AsSpan(4, 2));
+
+        var usaCount =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                record.AsSpan(6, 2));
+
+        if (usaOffset < 8 ||
+            usaCount < 2 ||
+            usaOffset + usaCount * 2 > record.Length)
+        {
+            return false;
+        }
+
+        var sequence =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                record.AsSpan(usaOffset, 2));
+
+        for (var i = 1; i < usaCount; i++)
+        {
+            var trailerOffset =
+                checked(i * bytesPerSector - 2);
+
+            if (trailerOffset + 2 > record.Length)
+            {
+                return false;
+            }
+
+            var onDisk =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(trailerOffset, 2));
+
+            if (onDisk != sequence)
+            {
+                return false;
+            }
+
+            var replacement =
+                BinaryPrimitives.ReadUInt16LittleEndian(
+                    record.AsSpan(
+                        usaOffset + i * 2,
+                        2));
+
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                record.AsSpan(trailerOffset, 2),
+                replacement);
+        }
+
+        return true;
     }
 
     private static void TraceTargetHistoricalEvidence(
