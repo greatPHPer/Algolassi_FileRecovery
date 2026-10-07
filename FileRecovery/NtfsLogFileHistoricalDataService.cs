@@ -3548,10 +3548,37 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
             $"retainedRecords={records.Count:N0}, " +
             $"relevantOpenOrMappingRecords={relevantOpenOrMappingCount:N0}.");
 
+        var targetAttributeSlots =
+            records
+                .Where(record =>
+                    CalculateTargetMftSegment(
+                        record,
+                        bytesPerCluster,
+                        bytesPerFileRecordSegment) == targetSegment)
+                .Select(record => record.TargetAttribute)
+                .Where(attribute => attribute != 0)
+                .Distinct()
+                .ToHashSet();
+
+        if (targetAttributeSlots.Count > 0)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile target attribute slots: " +
+                $"fileRef={targetFileReference}, " +
+                $"segment={targetSegment:N0}, " +
+                $"slots=[{string.Join(
+                    ", ",
+                    targetAttributeSlots
+                        .OrderBy(value => value)
+                        .Select(value => $"0x{value:X4}"))}].");
+        }
+
         var mappingRecordCount = 0;
         var mappingWithPayloadCount = 0;
         var targetMftMappingCount = 0;
         var targetOpenAttributeMappingCount = 0;
+        var targetAttributeSlotMappingCount = 0;
+        var targetAttributeSlotDiagnosticSamples = 0;
         var targetMftParsedCount = 0;
         var targetOpenAttributeParsedCount = 0;
         var targetMftParseFailureCount = 0;
@@ -3662,8 +3689,38 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
                 targetOpenAttributeMappingCount++;
             }
 
+            var exactTargetAttributeSlot =
+                targetAttributeSlots.Contains(
+                    record.TargetAttribute);
+
+            if (exactTargetAttributeSlot)
+            {
+                targetAttributeSlotMappingCount++;
+
+                if (targetAttributeSlotDiagnosticSamples < 12)
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS $LogFile target-attribute-slot mapping diagnostic: " +
+                        $"fileRef={targetFileReference}, " +
+                        $"targetSegment={targetSegment:N0}, " +
+                        $"lsn=0x{record.Lsn:X16}, " +
+                        $"transaction=0x{record.TransactionId:X8}, " +
+                        $"targetAttribute=0x{record.TargetAttribute:X4}, " +
+                        $"recordTargetOffset=0x{record.RecordOffset:X}, " +
+                        $"attributeTargetOffset=0x{record.AttributeOffset:X}, " +
+                        $"targetVcn={record.TargetVcn:N0}, " +
+                        $"clusterBlockOffset={record.ClusterBlockOffset}, " +
+                        $"targetBlockSize={record.TargetBlockSize}, " +
+                        $"mappingBytes={mappingBytes.Length:N0}, " +
+                        $"openAttributeExact={exactOpenAttributeTarget}.");
+
+                    targetAttributeSlotDiagnosticSamples++;
+                }
+            }
+
             if (!exactMftTarget &&
-                !exactOpenAttributeTarget)
+                !exactOpenAttributeTarget &&
+                !exactTargetAttributeSlot)
             {
                 continue;
             }
@@ -3764,6 +3821,7 @@ public sealed class NtfsLogFileHistoricalDataService : IDisposable
             $"mappingWithPayload={mappingWithPayloadCount:N0}, " +
             $"targetMftMappings={targetMftMappingCount:N0}, " +
             $"targetOpenAttributeMappings={targetOpenAttributeMappingCount:N0}, " +
+            $"targetAttributeSlotMappings={targetAttributeSlotMappingCount:N0}, " +
             $"targetMftParsed={targetMftParsedCount:N0}, " +
             $"targetOpenAttributeParsed={targetOpenAttributeParsedCount:N0}, " +
             $"targetMftParseFailures={targetMftParseFailureCount:N0}, " +
