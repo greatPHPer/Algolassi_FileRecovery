@@ -1501,6 +1501,7 @@ public sealed class NtfsLogFileHistoricalDataService
             new Dictionary<ushort, List<ParsedLogRecord>>();
 
         var allOpenAttributeCount = 0;
+        var historicalDumpOpenAttributeCount = 0;
         var allUpdateNonresidentValueCount = 0;
 
         if (restartOpenAttributeHistories is not null)
@@ -1524,6 +1525,29 @@ public sealed class NtfsLogFileHistoricalDataService
                 opens.Add(history);
                 allOpenAttributeCount++;
             }
+        }
+
+        // A retained OpenAttributeTableDump is a historical snapshot of the
+        // open-attribute table. TargetAttribute in subsequent nonresident
+        // updates is the byte offset of the corresponding table entry, so these
+        // snapshots can reconstruct an exact fileRef -> TargetAttribute mapping
+        // even when the OpenNonresidentAttribute record itself has wrapped out.
+        foreach (var history in
+                 FindHistoricalOpenAttributeDumpHistories(
+                     records,
+                     targetFileReference))
+        {
+            if (!opensByAttribute.TryGetValue(
+                    history.TargetAttribute,
+                    out var opens))
+            {
+                opens = [];
+                opensByAttribute[history.TargetAttribute] = opens;
+            }
+
+            opens.Add(history);
+            historicalDumpOpenAttributeCount++;
+            allOpenAttributeCount++;
         }
 
         foreach (var record in records)
@@ -1662,6 +1686,7 @@ public sealed class NtfsLogFileHistoricalDataService
             $"segment={targetSegment:N0}, " +
             $"size={fileSizeBytes:N0}, " +
             $"allOpenAttributes={allOpenAttributeCount:N0}, " +
+            $"historicalDumpOpenAttributes={historicalDumpOpenAttributeCount:N0}, " +
             $"exactOpenAttributes={exactOpens.Count:N0}, " +
             $"allUpdateNonresidentValue={allUpdateNonresidentValueCount:N0}, " +
             $"candidateUpdates={candidateUpdates.Count:N0}, " +
@@ -1862,6 +1887,159 @@ public sealed class NtfsLogFileHistoricalDataService
             0x000000B0 or
             0x000000C0 or
             0x000000D0;
+
+    private static List<OpenAttributeHistory> FindHistoricalOpenAttributeDumpHistories(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetFileReference)
+    {
+        var matches = new List<OpenAttributeHistory>();
+
+        foreach (var record in records
+                     .Where(item =>
+                         item.RedoOperation == 0x001D &&
+                         item.RedoData.Length >= 24)
+                     .OrderBy(item => item.Lsn)
+                     .ThenBy(item => item.PhysicalOrder))
+        {
+            try
+            {
+                var entrySize =
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        record.RedoData.AsSpan(0, 2));
+
+                var entryCount =
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        record.RedoData.AsSpan(2, 2));
+
+                const int tableHeaderLength = 24;
+
+                if (entrySize < 0x20 ||
+                    entryCount == 0 ||
+                    entrySize > 4096)
+                {
+                    continue;
+                }
+
+                var tableLength =
+                    checked(
+                        tableHeaderLength +
+                        (long)entrySize * entryCount);
+
+                if (tableLength > record.RedoData.Length)
+                {
+                    continue;
+                }
+
+                for (var index = 0; index < entryCount; index++)
+                {
+                    var entryOffset =
+                        checked(tableHeaderLength + index * entrySize);
+
+                    var entry =
+                        record.RedoData.AsSpan(
+                            entryOffset,
+                            entrySize);
+
+                    if (entry.Length < 0x20 ||
+                        BinaryPrimitives.ReadUInt32LittleEndian(
+                            entry.Slice(0, 4)) != 0xFFFFFFFF)
+                    {
+                        continue;
+                    }
+
+                    ulong fileReference = 0;
+                    ulong openLsn = 0;
+                    uint attributeType = 0;
+                    var attributeNamePresent = false;
+
+                    // NTFS client v1.0 open-attribute entry:
+                    //   +0x08 AttributeTypeCode
+                    //   +0x10 FileReference
+                    //   +0x18 LsnOfOpenRecord
+                    //   +0x20 PointerToAttributeName
+                    //
+                    // NTFS client v0.0 entry:
+                    //   +0x08 FileReference
+                    //   +0x10 LsnOfOpenRecord
+                    //   +0x19 AttributeNamePresent
+                    //   +0x1C AttributeTypeCode
+                    var typeAt08 =
+                        BinaryPrimitives.ReadUInt32LittleEndian(
+                            entry.Slice(8, 4));
+
+                    var typeAt1c =
+                        BinaryPrimitives.ReadUInt32LittleEndian(
+                            entry.Slice(0x1C, 4));
+
+                    if (IsLikelyNtfsAttributeType(typeAt08))
+                    {
+                        attributeType = typeAt08;
+                        fileReference =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                entry.Slice(0x10, 8));
+                        openLsn =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                entry.Slice(0x18, 8));
+
+                        // Client v1.0 does not carry the v0.0
+                        // AttributeNamePresent flag at 0x19.
+                        attributeNamePresent = false;
+                    }
+                    else if (IsLikelyNtfsAttributeType(typeAt1c))
+                    {
+                        attributeType = typeAt1c;
+                        fileReference =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                entry.Slice(8, 8));
+                        openLsn =
+                            BinaryPrimitives.ReadUInt64LittleEndian(
+                                entry.Slice(0x10, 8));
+                        attributeNamePresent =
+                            entry[0x19] != 0;
+                    }
+
+                    if (attributeType != NtfsAttributeTypeData ||
+                        fileReference != targetFileReference ||
+                        attributeNamePresent)
+                    {
+                        continue;
+                    }
+
+                    // TargetAttribute is the BYTE OFFSET of this entry in the
+                    // open-attribute table, not the ordinal entry number.
+                    var targetAttribute =
+                        checked((ushort)entryOffset);
+
+                    var effectiveLsn =
+                        openLsn != 0
+                            ? openLsn
+                            : record.Lsn;
+
+                    matches.Add(
+                        new OpenAttributeHistory(
+                            effectiveLsn,
+                            targetAttribute,
+                            fileReference,
+                            string.Empty));
+
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS $LogFile historical open-attribute dump mapping: " +
+                        $"fileRef={fileReference}, " +
+                        $"targetAttribute=0x{targetAttribute:X4}, " +
+                        $"entryIndex={index:N0}, " +
+                        $"entrySize={entrySize:N0}, " +
+                        $"openLsn=0x{openLsn:X16}, " +
+                        $"dumpLsn=0x{record.Lsn:X16}.");
+                }
+            }
+            catch
+            {
+                // Ignore incompatible or malformed historical dump data.
+            }
+        }
+
+        return matches;
+    }
 
     private static List<string> FindOpenAttributeTableDumpMatches(
         IReadOnlyList<ParsedLogRecord> records,
@@ -3491,6 +3669,20 @@ public sealed class NtfsLogFileHistoricalDataService
                             history.AttributeName);
                 }
             }
+        }
+
+        // Historical checkpoint dumps can recover the same open-attribute slot
+        // even when OpenNonresidentAttribute itself is no longer retained.
+        foreach (var history in
+                 FindHistoricalOpenAttributeDumpHistories(
+                     records,
+                     targetFileReference)
+                     .OrderBy(item => item.Lsn))
+        {
+            openAttributes[history.TargetAttribute] =
+                new OpenAttributeState(
+                    history.FileReference,
+                    history.AttributeName);
         }
 
         // ParseTargetRecordsFromFile already walks the journal from the
