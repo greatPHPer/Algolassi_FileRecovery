@@ -5255,13 +5255,13 @@ public sealed class NtfsLogFileHistoricalDataService
                 "A deleted NTFS file reference must contain a nonzero MFT sequence number.");
         }
 
-        // NTFS increments the MFT sequence when the record is freed. Therefore
-        // a deleted file reference carries the post-free sequence, while the
-        // historical FILE record/data belong to the immediately preceding
-        // sequence. NTFS skips sequence zero.
-        return targetSequence == 1
-            ? ushort.MaxValue
-            : checked((ushort)(targetSequence - 1));
+        // The USN/file reference identifies the exact MFT generation that
+        // the journal event referred to. When the MFT slot is later reused,
+        // the current record's sequence changes; the historical $LogFile
+        // generation we need is therefore the sequence carried by the target
+        // file reference itself. Do not subtract one here: doing so skips the
+        // exact deleted generation recorded by the USN journal.
+        return targetSequence;
     }
 
     private static ulong BuildHistoricalFileReference(
