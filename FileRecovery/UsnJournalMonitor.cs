@@ -1799,14 +1799,20 @@ public sealed class UsnJournalMonitor : IDisposable
             return false;
         }
 
-        // FSCTL_ENUM_USN_DATA enumerates current MFT records. A file that has
-        // already been deleted may therefore be absent even though its deletion
-        // is present in the USN journal. For the live snapshot path, read the
-        // actual USN journal tail with FSCTL_READ_USN_JOURNAL instead.
-        const long recentUsnWindow = 1_000_000;
-        var lowUsn = Math.Max(
-            Math.Max(journal.FirstUsn, journal.LowestValidUsn),
-            journal.NextUsn - recentUsnWindow);
+        // FSCTL_ENUM_USN_DATA can use an arbitrary LowUsn/HighUsn range, but
+        // FSCTL_READ_USN_JOURNAL StartUsn must identify a valid journal position.
+        // Do not manufacture a recent StartUsn by subtracting a numeric window
+        // from NextUsn. Prefer the monitor's persisted cursor; otherwise start
+        // from the journal's first valid USN.
+        var searchStartUsn = journal.FirstUsn;
+
+        if (_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) &&
+            cursor.JournalId == journal.JournalId &&
+            cursor.NextUsn >= journal.FirstUsn &&
+            cursor.NextUsn <= journal.NextUsn)
+        {
+            searchStartUsn = cursor.NextUsn;
+        }
 
         var normalizedTarget = NormalizePath(fullPath);
         var targetFileName = Path.GetFileName(normalizedTarget);
@@ -1817,7 +1823,7 @@ public sealed class UsnJournalMonitor : IDisposable
 
         var fallbackMatches = new List<(UsnRecord Record, string? Directory, double DeltaMinutes, bool IsFileDelete)>();
 
-        var nextUsn = lowUsn;
+        var nextUsn = searchStartUsn;
         const int maxBatches = 64;
 
         for (var batch = 0;
