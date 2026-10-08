@@ -235,12 +235,11 @@ public sealed class NtfsByteRecoveryService
             cancellationToken.ThrowIfCancellationRequested();
 
             var chunk = (int)Math.Min(buffer.Length, remaining);
-            if (!ReadAt(volumeHandle, offset, buffer, chunk))
-            {
-                throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    $"Could not read deleted-file data at byte offset {offset:N0}.");
-            }
+            ReadAt(
+                volumeHandle,
+                offset,
+                buffer,
+                chunk);
 
             output.Write(buffer, 0, chunk);
             offset = checked(offset + chunk);
@@ -248,7 +247,7 @@ public sealed class NtfsByteRecoveryService
         }
     }
 
-    private static bool ReadAt(
+    private static void ReadAt(
         SafeFileHandle handle,
         long offset,
         byte[] buffer,
@@ -291,13 +290,16 @@ public sealed class NtfsByteRecoveryService
                     var error = Marshal.GetLastWin32Error();
                     if (error != ErrorIoPending)
                     {
-                        return false;
+                        throw new Win32Exception(
+                            error,
+                            $"Raw NTFS data read failed to start at byte offset {offset:N0}.");
                     }
                 }
 
                 if (!completionEvent.WaitOne())
                 {
-                    return false;
+                    throw new IOException(
+                        $"Raw NTFS data read completion wait failed at byte offset {offset:N0}.");
                 }
 
                 if (!GetOverlappedResult(
@@ -306,10 +308,18 @@ public sealed class NtfsByteRecoveryService
                         out var bytesRead,
                         bWait: false))
                 {
-                    return false;
+                    var error = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(
+                        error,
+                        $"Raw NTFS data read completion failed at byte offset {offset:N0}.");
                 }
 
-                return bytesRead == (uint)count;
+                if (bytesRead != (uint)count)
+                {
+                    throw new IOException(
+                        $"Raw NTFS data read returned {bytesRead:N0} bytes at byte offset {offset:N0}; " +
+                        $"expected {count:N0}.");
+                }
             }
             finally
             {
