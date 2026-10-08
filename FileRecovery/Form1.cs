@@ -1194,23 +1194,17 @@ public partial class Form1 : Form
                 .Where(path => !string.IsNullOrWhiteSpace(path))
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+            // Every exact historical USN reference is a forensic recovery target.
+            // Do not suppress a historical MFT preflight merely because the current
+            // reused MFT record happens to expose a stream with the same byte length.
+            // Same path + same size does not identify the same NTFS generation.
             var historicalRawMftTargets = targetRecords
                 .Where(target =>
                     !string.IsNullOrWhiteSpace(target.FullPath) &&
                     target.FileReferenceNumber is ulong fileReferenceNumber &&
                     fileReferenceNumber != 0 &&
                     target.ParentFileReferenceNumber is ulong parentFileReferenceNumber &&
-                    parentFileReferenceNumber != 0 &&
-                    !candidates.Any(candidate =>
-                        string.Equals(
-                            NormalizePath(candidate.FullPath),
-                            NormalizePath(target.FullPath),
-                            StringComparison.OrdinalIgnoreCase) &&
-                        candidate.DataStreamFound &&
-                        target.FileSizeBytes is long historicalSize &&
-                        historicalSize > 0 &&
-                        candidate.FileSizeBytes > 0 &&
-                        candidate.FileSizeBytes == historicalSize))
+                    parentFileReferenceNumber != 0)
                 .Select(target => (
                     FullPath: NormalizePath(target.FullPath),
                     FileReferenceNumber: target.FileReferenceNumber is ulong fileReferenceNumber
@@ -1230,6 +1224,12 @@ public partial class Form1 : Form
                     .OrderByDescending(target => target.DeletedAtUtc)
                     .First())
                 .ToList();
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS historical raw-MFT target selection: " +
+                $"candidates={candidates.Count:N0}, " +
+                $"historicalTargets={historicalRawMftTargets.Count:N0}. " +
+                "Historical USN references remain eligible even when a current/reused candidate has the same file size.");
 
             // Historical USN/MFT targets can reach the raw-MFT scanner without a
             // persisted file size. Recover the exact historical size from $LogFile
@@ -1406,6 +1406,18 @@ public partial class Form1 : Form
                 })
                 .ToList();
 
+            var trustedHistoricalReferenceByPath = historicalRawMftTargets
+                .GroupBy(
+                    target => NormalizePath(target.FullPath),
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .OrderByDescending(target => target.DeletedAtUtc)
+                        .Select(target => target.FileReferenceNumber)
+                        .First(),
+                    StringComparer.OrdinalIgnoreCase);
+
             var rawMftReferences = historicalRawMftTargets
                 .Concat(
                     exhaustiveMftCandidates
@@ -1543,9 +1555,30 @@ public partial class Form1 : Form
                                 return fallback;
                             }
 
+                            // An exact historical USN file reference is stronger
+                            // evidence than a current/reused candidate for the same path.
+                            // The current record can have the same byte size while belonging
+                            // to a different NTFS generation, so size equality is not enough
+                            // to keep the current stream.
+                            if (trustedHistoricalReferenceByPath.TryGetValue(
+                                    NormalizePath(candidate.FullPath),
+                                    out var trustedHistoricalReference) &&
+                                fallback.FileReferenceNumber == trustedHistoricalReference &&
+                                candidate.FileReferenceNumber != trustedHistoricalReference)
+                            {
+                                System.Diagnostics.Trace.WriteLine(
+                                    $"NTFS raw-MFT fallback candidate replaced reused current stream by exact historical reference: " +
+                                    $"path={candidate.FullPath}, " +
+                                    $"currentFileRef={candidate.FileReferenceNumber}, " +
+                                    $"historicalFileRef={trustedHistoricalReference}, " +
+                                    $"historicalSize={fallback.FileSizeBytes:N0}.");
+
+                                return fallback;
+                            }
+
                             // A structurally validated historical raw-MFT candidate
-                            // must replace a conflicting current/reused stream even
-                            // when the current candidate reports DataStreamFound=true.
+                            // must also replace a conflicting current/reused stream when
+                            // the byte lengths differ.
                             if (fallback.FileSizeBytes > 0 &&
                                 candidate.FileSizeBytes > 0 &&
                                 fallback.FileSizeBytes != candidate.FileSizeBytes)
