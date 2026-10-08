@@ -691,7 +691,8 @@ public sealed class NtfsLogFileHistoricalDataService
         var initializations =
             records
                 .Where(record =>
-                    record.RedoOperation == 0x0002 &&
+                    (record.RedoOperation == 0x0002 ||
+                     record.UndoOperation == 0x0002) &&
                     CalculateTargetMftSegment(
                         record,
                         bytesPerCluster,
@@ -714,8 +715,13 @@ public sealed class NtfsLogFileHistoricalDataService
         {
             var initialization = initializations[i];
 
-            if (!TryFindUnnamedNonresidentDataAttributes(
-                    initialization.RedoData,
+            if (!TryGetInitializeOperationData(
+                    initialization,
+                    out var initializationData,
+                    out var initializationSequence) ||
+                initializationSequence != historicalGenerationSequence ||
+                !TryFindUnnamedNonresidentDataAttributes(
+                    initializationData,
                     historicalGenerationSequence,
                     expectedSize: 0,
                     out var definitions))
@@ -1119,7 +1125,8 @@ public sealed class NtfsLogFileHistoricalDataService
         var initializations =
             records
                 .Where(record =>
-                    record.RedoOperation == 0x0002 &&
+                    (record.RedoOperation == 0x0002 ||
+                     record.UndoOperation == 0x0002) &&
                     CalculateTargetMftSegment(
                         record,
                         bytesPerCluster,
@@ -1135,8 +1142,13 @@ public sealed class NtfsLogFileHistoricalDataService
         {
             var record = initializations[i];
 
-            if (!TryFindUnnamedResidentDataAttributes(
-                    record.RedoData,
+            if (!TryGetInitializeOperationData(
+                    record,
+                    out var initializationData,
+                    out var initializationSequence) ||
+                initializationSequence != targetSequence ||
+                !TryFindUnnamedResidentDataAttributes(
+                    initializationData,
                     targetSequence,
                     expectedSize,
                     out var initialized))
@@ -1397,12 +1409,13 @@ public sealed class NtfsLogFileHistoricalDataService
 
         var exactInitializationSequences =
             initializationRecords
-                .Select(record => record.RedoData)
-                .Where(data => data.Length >= 24 &&
-                               EncodingAscii(data, 0, Math.Min(4, data.Length)) == "FILE")
-                .Select(data =>
-                    BinaryPrimitives.ReadUInt16LittleEndian(
-                        data.AsSpan(16, 2)))
+                .SelectMany(record =>
+                    TryGetInitializeOperationData(
+                        record,
+                        out _,
+                        out var initializationSequence)
+                        ? new[] { initializationSequence }
+                        : Array.Empty<ushort>())
                 .Distinct()
                 .OrderBy(sequence => sequence)
                 .ToArray();
@@ -1450,11 +1463,15 @@ public sealed class NtfsLogFileHistoricalDataService
 
         foreach (var record in initializationRecords)
         {
-            var actualSequence =
-                record.RedoData.Length >= 24
-                    ? BinaryPrimitives.ReadUInt16LittleEndian(
-                        record.RedoData.AsSpan(16, 2))
-                    : (ushort)0;
+            TryGetInitializeOperationData(
+                record,
+                out _,
+                out var actualSequence);
+
+            var source =
+                record.RedoOperation == 0x0002
+                    ? "redo"
+                    : "undo";
 
             System.Diagnostics.Trace.WriteLine(
                 $"NTFS $LogFile target initialization evidence: " +
@@ -1462,6 +1479,7 @@ public sealed class NtfsLogFileHistoricalDataService
                 $"segment={targetSegment:N0}, " +
                 $"expectedSequence={targetSequence}, " +
                 $"actualSequence={actualSequence}, " +
+                $"source={source}, " +
                 $"lsn=0x{record.Lsn:X16}, " +
                 $"transaction=0x{record.TransactionId:X8}, " +
                 $"redoOperation=0x{record.RedoOperation:X4}, " +
@@ -2214,7 +2232,8 @@ public sealed class NtfsLogFileHistoricalDataService
         var initializations =
             records
                 .Where(record =>
-                    record.RedoOperation == 0x0002 &&
+                    (record.RedoOperation == 0x0002 ||
+                     record.UndoOperation == 0x0002) &&
                     CalculateTargetMftSegment(
                         record,
                         bytesPerCluster,
@@ -2233,8 +2252,13 @@ public sealed class NtfsLogFileHistoricalDataService
 
         foreach (var initialization in initializations)
         {
-            if (!TryFindUnnamedNonresidentDataAttributes(
-                    initialization.RedoData,
+            if (!TryGetInitializeOperationData(
+                    initialization,
+                    out var initializationData,
+                    out var initializationSequence) ||
+                initializationSequence != historicalGenerationSequence ||
+                !TryFindUnnamedNonresidentDataAttributes(
+                    initializationData,
                     historicalGenerationSequence,
                     fileSizeBytes,
                     out var definitions))
@@ -4762,10 +4786,9 @@ public sealed class NtfsLogFileHistoricalDataService
         var targetOpenAttributes =
             new Dictionary<ushort, bool>();
 
-        // MFT segment numbers are reused. Track the generation sequence of the
-        // latest target-segment initialization so later operations cannot silently
-        // mix unrelated generations of the same MFT slot.
-        ushort? latestTargetGenerationSequence = null;
+        // The circular $LogFile must be correlated by chronological LSN order.
+        // Do not assign generations from physical scan order: wrapped journal pages
+        // are not guaranteed to be chronological.
 
         // Retain transaction/bitmap records only after the exact target MFT
         // deallocation transaction has been identified. Retaining every
@@ -4985,28 +5008,21 @@ public sealed class NtfsLogFileHistoricalDataService
                                 : (long)bytesPerFileRecordSegment)) ==
                             (long)targetSegment;
 
-                    ushort? mftGenerationSequence =
-                        exactMftTarget
-                            ? latestTargetGenerationSequence
-                            : null;
+                    ushort? mftGenerationSequence = null;
 
+                    // Initialization/deallocation operations carry their own MFT
+                    // generation in the FILE-header payload. Use that direct payload
+                    // evidence while parsing; ordinary operations are annotated
+                    // chronologically after the full circular-log scan.
                     if (exactMftTarget &&
-                        redoOperation == 0x0002 &&
-                        TryReadMftRecordSequence(
+                        TryGetOperationMftGenerationSequence(
+                            redoOperation,
                             redoData,
-                            out var initializedSequence))
+                            undoOperation,
+                            undoData,
+                            out var operationGenerationSequence))
                     {
-                        latestTargetGenerationSequence = initializedSequence;
-                        mftGenerationSequence = initializedSequence;
-                    }
-                    else if (exactMftTarget &&
-                             undoOperation == 0x0002 &&
-                             TryReadMftRecordSequence(
-                                 undoData,
-                                 out var undoInitializedSequence))
-                    {
-                        latestTargetGenerationSequence = undoInitializedSequence;
-                        mftGenerationSequence = undoInitializedSequence;
+                        mftGenerationSequence = operationGenerationSequence;
                     }
 
                     var isOpenAttribute =
@@ -5186,11 +5202,92 @@ public sealed class NtfsLogFileHistoricalDataService
             }
         }
 
+        result =
+            ApplyChronologicalMftGenerationSequences(
+                result,
+                targetSegment,
+                bytesPerCluster,
+                bytesPerFileRecordSegment);
+
         progress?.Report(
             $"Parsed targeted historical NTFS $LogFile: " +
             $"{result.Count:N0} retained target-relevant record(s).");
 
         return result;
+    }
+
+    private static List<ParsedLogRecord> ApplyChronologicalMftGenerationSequences(
+        IReadOnlyList<ParsedLogRecord> records,
+        ulong targetSegment,
+        uint bytesPerCluster,
+        uint bytesPerFileRecordSegment)
+    {
+        var orderedTargetRecords =
+            records
+                .Where(record =>
+                    CalculateTargetMftSegment(
+                        record,
+                        bytesPerCluster,
+                        bytesPerFileRecordSegment) == targetSegment)
+                .OrderBy(record => record.Lsn)
+                .ThenBy(record => record.PhysicalOrder)
+                .ToList();
+
+        if (orderedTargetRecords.Count == 0)
+        {
+            return records.ToList();
+        }
+
+        var generationsByPhysicalOrder =
+            new Dictionary<long, ushort?>(
+                orderedTargetRecords.Count);
+
+        ushort? currentGenerationSequence = null;
+
+        foreach (var record in orderedTargetRecords)
+        {
+            ushort? generationForRecord =
+                currentGenerationSequence;
+
+            if (record.RedoOperation == 0x0002 &&
+                TryReadMftRecordSequence(
+                    record.RedoData,
+                    out var redoInitializationSequence))
+            {
+                // A redo-side InitializeFileRecordSegment advances the active
+                // generation. This is the authoritative forward lifecycle event.
+                currentGenerationSequence =
+                    redoInitializationSequence;
+                generationForRecord =
+                    redoInitializationSequence;
+            }
+            else if (record.UndoOperation == 0x0002 &&
+                     TryReadMftRecordSequence(
+                         record.UndoData,
+                         out var undoInitializationSequence))
+            {
+                // An undo-side InitializeFileRecordSegment identifies the older
+                // generation restored/referenced by a deallocation transaction.
+                // It does not move the forward generation cursor backward.
+                generationForRecord =
+                    undoInitializationSequence;
+            }
+
+            generationsByPhysicalOrder[record.PhysicalOrder] =
+                generationForRecord;
+        }
+
+        return records
+            .Select(record =>
+                generationsByPhysicalOrder.TryGetValue(
+                    record.PhysicalOrder,
+                    out var generation)
+                    ? record with
+                    {
+                        MftGenerationSequence = generation
+                    }
+                    : record)
+            .ToList();
     }
 
     private static bool ContainsTargetFileReference(
@@ -5243,6 +5340,67 @@ public sealed class NtfsLogFileHistoricalDataService
         return sequence != 0;
     }
 
+    private static bool TryGetInitializeOperationData(
+        ParsedLogRecord record,
+        out byte[] initializationData,
+        out ushort sequence)
+    {
+        initializationData = [];
+        sequence = 0;
+
+        if (record.RedoOperation == 0x0002 &&
+            TryReadMftRecordSequence(
+                record.RedoData,
+                out var redoSequence))
+        {
+            initializationData = record.RedoData;
+            sequence = redoSequence;
+            return true;
+        }
+
+        if (record.UndoOperation == 0x0002 &&
+            TryReadMftRecordSequence(
+                record.UndoData,
+                out var undoSequence))
+        {
+            initializationData = record.UndoData;
+            sequence = undoSequence;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryGetOperationMftGenerationSequence(
+        ushort redoOperation,
+        byte[] redoData,
+        ushort undoOperation,
+        byte[] undoData,
+        out ushort sequence)
+    {
+        sequence = 0;
+
+        if (redoOperation == 0x0002 &&
+            TryReadMftRecordSequence(
+                redoData,
+                out var redoSequence))
+        {
+            sequence = redoSequence;
+            return true;
+        }
+
+        if (undoOperation == 0x0002 &&
+            TryReadMftRecordSequence(
+                undoData,
+                out var undoSequence))
+        {
+            sequence = undoSequence;
+            return true;
+        }
+
+        return false;
+    }
+
     private static ushort GetHistoricalGenerationSequence(
         ulong targetFileReference)
     {
@@ -5256,11 +5414,10 @@ public sealed class NtfsLogFileHistoricalDataService
         }
 
         // The USN/file reference identifies the exact MFT generation that
-        // the journal event referred to. When the MFT slot is later reused,
-        // the current record's sequence changes; the historical $LogFile
-        // generation we need is therefore the sequence carried by the target
-        // file reference itself. Do not subtract one here: doing so skips the
-        // exact deleted generation recorded by the USN journal.
+        // the journal event referred to. The parser correlates retained
+        // $LogFile operations to that sequence using FILE-header payloads in
+        // chronological LSN order. Do not subtract one here: doing so skips
+        // the exact deleted generation recorded by the USN journal.
         return targetSequence;
     }
 
