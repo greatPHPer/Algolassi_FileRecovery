@@ -1818,7 +1818,7 @@ public sealed class UsnJournalMonitor : IDisposable
         var targetFileName = Path.GetFileName(normalizedTarget);
 
         System.Diagnostics.Debug.WriteLine(
-            $"NTFS live deletion snapshot: journal tail start={lowUsn}, " +
+            $"NTFS live deletion snapshot: journal start={searchStartUsn}, " +
             $"high={journal.NextUsn}, target={normalizedTarget}.");
 
         var fallbackMatches = new List<(UsnRecord Record, string? Directory, double DeltaMinutes, bool IsFileDelete)>();
@@ -1974,7 +1974,7 @@ public sealed class UsnJournalMonitor : IDisposable
 
         System.Diagnostics.Debug.WriteLine(
             $"NTFS live deletion snapshot: journal tail search found no uniquely matching delete " +
-            $"for path={normalizedTarget}, start={lowUsn}, high={journal.NextUsn}.");
+            $"for path={normalizedTarget}, start={searchStartUsn}, high={journal.NextUsn}.");
 
         return false;
     }
