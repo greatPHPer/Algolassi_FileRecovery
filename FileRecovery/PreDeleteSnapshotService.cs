@@ -518,7 +518,8 @@ public sealed class PreDeleteSnapshotService : IDisposable
                         CacheFileMatchesLength(entry))
                     .ToList();
 
-                plannedBytes = validEntries.Sum(entry => entry.Length);
+                plannedBytes = checked(GetDurableSnapshotBytes() +
+                    validEntries.Sum(entry => entry.Length));
                 plannedEntries = validEntries.Count;
             }
 
@@ -820,7 +821,17 @@ public sealed class PreDeleteSnapshotService : IDisposable
                 return;
             }
 
-            long totalBytes = _entries.Values.Sum(entry => entry.Length);
+            var durableBytes = GetDurableSnapshotBytes();
+            if (durableBytes > MaximumStorageBytes - before.Length)
+            {
+                TryDeleteFile(temporary);
+                System.Diagnostics.Trace.WriteLine(
+                    $"Pre-delete snapshot skipped for {path}: durable protected snapshots already use " +
+                    $"{durableBytes:N0} byte(s) of the {MaximumStorageBytes:N0}-byte storage budget.");
+                return;
+            }
+
+            long totalBytes = checked(durableBytes + _entries.Values.Sum(entry => entry.Length));
             var entryCount = _entries.Count;
 
             if (_entries.TryGetValue(path, out var oldEntry))
@@ -846,7 +857,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
                 {
                     TryDeleteFile(temporary);
                     System.Diagnostics.Trace.WriteLine(
-                        $"Pre-delete snapshot skipped for {path}: configured cache budget is full.");
+                        $"Pre-delete snapshot skipped for {path}: configured total protected-storage budget is full.");
                     return;
                 }
 
@@ -969,7 +980,16 @@ public sealed class PreDeleteSnapshotService : IDisposable
             RemoveEntryLocked(path);
         }
 
-        long totalBytes = _entries.Values.Sum(entry => entry.Length);
+        long totalBytes;
+        try
+        {
+            totalBytes = checked(GetDurableSnapshotBytes() +
+                _entries.Values.Sum(entry => entry.Length));
+        }
+        catch (OverflowException)
+        {
+            totalBytes = long.MaxValue;
+        }
 
         while (_entries.Count > MaximumCacheEntries || totalBytes > MaximumStorageBytes)
         {
@@ -985,6 +1005,52 @@ public sealed class PreDeleteSnapshotService : IDisposable
             totalBytes -= oldest.Value.Length;
             RemoveEntryLocked(oldest.Key);
         }
+
+        if (totalBytes > MaximumStorageBytes)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"Pre-delete protected storage is over its configured limit because durable snapshots alone " +
+                $"use {totalBytes:N0} byte(s); durable snapshots are retained and new protection may be skipped.");
+        }
+    }
+
+    private long GetDurableSnapshotBytes()
+    {
+        var directory = Path.Combine(_storageRoot, "NtfsSnapshots");
+        if (!Directory.Exists(directory))
+        {
+            return 0;
+        }
+
+        long total = 0;
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(directory, "*.bin", SearchOption.TopDirectoryOnly))
+            {
+                try
+                {
+                    var length = new FileInfo(file).Length;
+                    if (length > long.MaxValue - total)
+                    {
+                        return long.MaxValue;
+                    }
+
+                    total += length;
+                }
+                catch
+                {
+                    // A concurrently promoted/deleted snapshot can briefly be unavailable.
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"Pre-delete storage budget could not enumerate durable snapshots: {ex.Message}");
+            return long.MaxValue;
+        }
+
+        return total;
     }
 
     private void RemoveEntryLocked(string path)
