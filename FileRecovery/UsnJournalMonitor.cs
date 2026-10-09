@@ -161,26 +161,31 @@ public sealed class UsnJournalMonitor : IDisposable
                     ? previousCursor!.NextUsn
                     : 0L;
 
-                var hasPreStartBacklog =
+                var sameJournalHasBacklog =
                     hadPreviousCursor &&
                     previousCursor!.JournalId == journal.JournalId &&
-                    previousNextUsn >= journal.FirstUsn &&
-                    previousNextUsn >= journal.LowestValidUsn &&
+                    previousNextUsn > 0 &&
                     previousNextUsn < journal.NextUsn;
 
+                var previousCursorIsRetained =
+                    sameJournalHasBacklog &&
+                    previousNextUsn >= journal.FirstUsn &&
+                    previousNextUsn >= journal.LowestValidUsn;
+
                 // Preserve live-deletion priority, but replay at most the most recent
-                // 4 MiB of USN address space when the previous cursor is still valid.
-                // Older history remains available through "Scan NTFS Deleted Files".
+                // 4 MiB of USN address space after a restart. If the saved cursor has
+                // fallen outside retained history, use the retained tail window rather
+                // than silently skipping all recent pre-start deletions.
                 var startupNextUsn = journal.NextUsn;
-                if (hasPreStartBacklog)
+                if (sameJournalHasBacklog)
                 {
                     var recentWindowStart = Math.Max(
                         journal.LowestValidUsn,
                         journal.NextUsn - MaxStartupCatchUpUsnBytes);
 
-                    startupNextUsn = Math.Max(
-                        previousNextUsn,
-                        recentWindowStart);
+                    startupNextUsn = previousCursorIsRetained
+                        ? Math.Max(previousNextUsn, recentWindowStart)
+                        : recentWindowStart;
                 }
 
                 var startupCursor = new VolumeJournalCursor
@@ -199,11 +204,12 @@ public sealed class UsnJournalMonitor : IDisposable
                     $"startupNextUsn={startupNextUsn}, journalNextUsn={journal.NextUsn}, " +
                     $"catchUpUsnBytes={Math.Max(0, journal.NextUsn - startupNextUsn):N0}, " +
                     $"catchUpLimitBytes={MaxStartupCatchUpUsnBytes:N0}, " +
-                    $"skippedOlderBacklog={(hasPreStartBacklog && startupNextUsn > previousNextUsn)}.");
+                    $"previousCursorRetained={previousCursorIsRetained}, " +
+                    $"skippedOlderBacklog={(sameJournalHasBacklog && startupNextUsn > previousNextUsn)}.");
 
                 StatusChanged?.Invoke(
                     this,
-                    hasPreStartBacklog && startupNextUsn < journal.NextUsn
+                    sameJournalHasBacklog && startupNextUsn < journal.NextUsn
                         ? $"USN monitoring armed for {volumeKey}; checking a bounded recent deletion backlog before continuing live monitoring. Use Scan NTFS Deleted Files for older history."
                         : $"USN journal armed for {volumeKey}. New deletions will be tracked.");
             }
