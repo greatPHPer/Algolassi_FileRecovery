@@ -5,6 +5,7 @@ namespace FileRecovery;
 public sealed class RecoverySettings
 {
     public bool NotificationsMuted { get; set; }
+    public List<string> IgnoredDirectories { get; set; } = [];
     public Dictionary<string, VolumeJournalCursor> UsnCursors { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -26,6 +27,7 @@ public sealed class RecoverySettings
             var settings = JsonSerializer.Deserialize<RecoverySettings>(File.ReadAllText(SettingsPath))
                 ?? new RecoverySettings();
 
+            settings.IgnoredDirectories ??= [];
             settings.UsnCursors ??= new Dictionary<string, VolumeJournalCursor>(StringComparer.OrdinalIgnoreCase);
             return settings;
         }
