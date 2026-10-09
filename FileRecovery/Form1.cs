@@ -8,6 +8,7 @@ public partial class Form1 : Form
         string DeletedDate,
         string Size);
 
+    private sealed record DirectoryPathSegment(string Label, string DirectoryPath);
 
     private readonly DeletionHistoryStore _history;
     private readonly RecycleBinService _recycleBinService;
@@ -186,6 +187,232 @@ public partial class Form1 : Form
     private void btnShowHistory_Click(object? sender, EventArgs e)
     {
         ShowHistoryRows();
+    }
+
+    private void btnManageIgnoredDirectories_Click(object? sender, EventArgs e)
+    {
+        using var dialog = new IgnoredDirectoriesForm();
+        dialog.ShowDialog(this);
+        RefreshFromHistory();
+        lblStatus.Text = $"Ignored directory settings loaded ({RecoveryMonitoringExclusions.GetIgnoredDirectories().Count:N0} path(s)).";
+    }
+
+    private void lstDirectories_DrawItem(object? sender, DrawItemEventArgs e)
+    {
+        if (e.Index < 0 || e.Index >= lstDirectories.Items.Count)
+        {
+            return;
+        }
+
+        e.DrawBackground();
+
+        var itemText = lstDirectories.Items[e.Index]?.ToString() ?? string.Empty;
+        if (string.Equals(itemText, "All recent deletions", StringComparison.OrdinalIgnoreCase))
+        {
+            TextRenderer.DrawText(
+                e.Graphics,
+                itemText,
+                e.Font,
+                e.Bounds,
+                (e.State & DrawItemState.Selected) != 0
+                    ? SystemColors.HighlightText
+                    : lstDirectories.ForeColor,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            e.DrawFocusRectangle();
+            return;
+        }
+
+        var segments = BuildDirectoryPathSegments(itemText);
+        var x = e.Bounds.Left + 4;
+        var buttonY = e.Bounds.Top + Math.Max(2, (e.Bounds.Height - 23) / 2);
+
+        foreach (var segment in segments)
+        {
+            var desiredWidth = GetDirectorySegmentButtonWidth(segment.Label, e.Font);
+            if (x >= e.Bounds.Right - 2)
+            {
+                break;
+            }
+
+            var visibleWidth = Math.Min(desiredWidth, e.Bounds.Right - x - 2);
+            if (visibleWidth <= 0)
+            {
+                break;
+            }
+
+            var buttonBounds = new Rectangle(x, buttonY, visibleWidth, 23);
+            using (var background = new SolidBrush(SystemColors.Control))
+            using (var border = new Pen(SystemColors.ControlDark))
+            {
+                e.Graphics.FillRectangle(background, buttonBounds);
+                e.Graphics.DrawRectangle(border, buttonBounds);
+            }
+
+            var textBounds = Rectangle.Inflate(buttonBounds, -6, 0);
+            TextRenderer.DrawText(
+                e.Graphics,
+                segment.Label,
+                e.Font,
+                textBounds,
+                SystemColors.ControlText,
+                TextFormatFlags.HorizontalCenter |
+                TextFormatFlags.VerticalCenter |
+                TextFormatFlags.NoPrefix |
+                TextFormatFlags.EndEllipsis |
+                TextFormatFlags.NoPadding);
+
+            x += desiredWidth;
+            if (segment != segments[^1])
+            {
+                var slashBounds = new Rectangle(x, e.Bounds.Top, 14, e.Bounds.Height);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    "/",
+                    e.Font,
+                    slashBounds,
+                    (e.State & DrawItemState.Selected) != 0
+                        ? SystemColors.HighlightText
+                        : lstDirectories.ForeColor,
+                    TextFormatFlags.HorizontalCenter |
+                    TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.NoPrefix);
+                x += 14;
+            }
+        }
+
+        e.DrawFocusRectangle();
+    }
+
+    private void lstDirectories_MouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left)
+        {
+            return;
+        }
+
+        var index = lstDirectories.IndexFromPoint(e.Location);
+        if (index < 0 || index >= lstDirectories.Items.Count)
+        {
+            return;
+        }
+
+        var itemText = lstDirectories.Items[index]?.ToString();
+        if (string.IsNullOrWhiteSpace(itemText) ||
+            string.Equals(itemText, "All recent deletions", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var segment = FindDirectorySegmentAtX(itemText, e.X);
+        if (segment is null)
+        {
+            return;
+        }
+
+        lstDirectories.SelectedIndex = index;
+
+        var menu = new ContextMenuStrip();
+        menu.Items.Add(
+            "Ignore directory",
+            null,
+            (_, _) => IgnoreDirectoryFromBreadcrumb(segment.DirectoryPath));
+        menu.Closed += (_, _) => menu.Dispose();
+        menu.Show(lstDirectories, e.Location);
+    }
+
+    private DirectoryPathSegment? FindDirectorySegmentAtX(string path, int mouseX)
+    {
+        var x = lstDirectories.ClientRectangle.Left + 4;
+        var segments = BuildDirectoryPathSegments(path);
+
+        foreach (var segment in segments)
+        {
+            var width = GetDirectorySegmentButtonWidth(segment.Label, lstDirectories.Font);
+            if (mouseX >= x && mouseX < x + width)
+            {
+                return segment;
+            }
+
+            x += width + 14;
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyList<DirectoryPathSegment> BuildDirectoryPathSegments(string path)
+    {
+        var normalized = NormalizePath(path);
+        var root = Path.GetPathRoot(normalized);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return [];
+        }
+
+        var result = new List<DirectoryPathSegment>
+        {
+            new(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), root)
+        };
+
+        var current = root;
+        var remaining = normalized[root.Length..];
+        var components = remaining.Split(
+            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+            StringSplitOptions.RemoveEmptyEntries);
+
+        foreach (var component in components)
+        {
+            current = Path.Combine(current, component);
+            result.Add(new DirectoryPathSegment(component, current));
+        }
+
+        return result;
+    }
+
+    private static int GetDirectorySegmentButtonWidth(string label, Font font)
+    {
+        var textWidth = TextRenderer.MeasureText(
+            label,
+            font,
+            new Size(1000, 30),
+            TextFormatFlags.NoPadding).Width;
+
+        return Math.Max(30, textWidth + 14);
+    }
+
+    private void IgnoreDirectoryFromBreadcrumb(string directoryPath)
+    {
+        var normalized = Path.GetFullPath(directoryPath);
+        var root = Path.GetPathRoot(normalized);
+        if (!string.IsNullOrWhiteSpace(root) &&
+            string.Equals(normalized, root, StringComparison.OrdinalIgnoreCase))
+        {
+            var confirm = MessageBox.Show(
+                this,
+                $"Ignore the entire {root} volume? All deletion paths on this volume will be excluded from automatic monitoring and new history entries.",
+                "Confirm Entire Volume Exclusion",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+
+            if (confirm != DialogResult.Yes)
+            {
+                return;
+            }
+        }
+
+        if (!RecoveryMonitoringExclusions.AddIgnoredDirectory(normalized))
+        {
+            MessageBox.Show(
+                this,
+                "This directory is already ignored, or the path cannot be added.",
+                "Directory Not Added",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        RefreshFromHistory();
+        lblStatus.Text = $"Ignoring {normalized} and all its subdirectories for automatic monitoring.";
     }
 
     private void ShowHistoryRows()
@@ -3921,6 +4148,7 @@ public partial class Form1 : Form
         btnShowHistory.Enabled = !busy;
         btnClearHistory.Enabled = !busy;
         btnScanNtfs.Enabled = !busy;
+        btnManageIgnoredDirectories.Enabled = !busy;
         txtScanPath.Enabled = !busy;
         btnBrowseScanPath.Enabled = !busy;
         chkScanSubdirectories.Enabled = !busy;
