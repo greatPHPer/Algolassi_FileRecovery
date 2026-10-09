@@ -11,8 +11,7 @@ partial class Form1
     private ListBox lstDirectories = null!;
     private Button btnScanDirectory = null!;
     private Button btnScanNtfs = null!;
-    private Button btnRawVolumeMarker = null!;
-    private Button btnTargetedHistorical = null!;
+    private Button btnManageIgnoredDirectories = null!;
     private TextBox txtScanPath = null!;
     private Button btnBrowseScanPath = null!;
     private CheckBox chkScanSubdirectories = null!;
@@ -48,8 +47,7 @@ partial class Form1
         lstDirectories = new ListBox();
         btnScanDirectory = new Button();
         btnScanNtfs = new Button();
-        btnRawVolumeMarker = new Button();
-        btnTargetedHistorical = new Button();
+        btnManageIgnoredDirectories = new Button();
         txtScanPath = new TextBox();
         btnBrowseScanPath = new Button();
         chkScanSubdirectories = new CheckBox();
@@ -89,14 +87,18 @@ partial class Form1
         lblDirectories.Text = "Recent directories";
 
         lstDirectories.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left;
+        lstDirectories.DrawMode = DrawMode.OwnerDrawFixed;
         lstDirectories.FormattingEnabled = true;
         lstDirectories.HorizontalScrollbar = true;
+        lstDirectories.HorizontalExtent = 1400;
         lstDirectories.IntegralHeight = false;
-        lstDirectories.ItemHeight = 20;
+        lstDirectories.ItemHeight = 30;
         lstDirectories.Location = new Point(24, 122);
         lstDirectories.Name = "lstDirectories";
         lstDirectories.Size = new Size(300, 447);
         lstDirectories.SelectedIndexChanged += lstDirectories_SelectedIndexChanged;
+        lstDirectories.DrawItem += lstDirectories_DrawItem;
+        lstDirectories.MouseDown += lstDirectories_MouseDown;
 
         btnScanDirectory.Location = new Point(344, 82);
         btnScanDirectory.Size = new Size(190, 36);
@@ -134,19 +136,12 @@ partial class Form1
         btnScanNtfs.UseVisualStyleBackColor = true;
         btnScanNtfs.Click += btnScanNtfs_Click;
 
-        btnRawVolumeMarker.Location = new Point(704, 158);
-        btnRawVolumeMarker.Size = new Size(156, 36);
-        btnRawVolumeMarker.Text = "Raw Volume Marker Test";
-        btnRawVolumeMarker.Visible = false;
-        btnRawVolumeMarker.UseVisualStyleBackColor = true;
-        btnRawVolumeMarker.Click += btnRawVolumeMarker_Click;
-
-        btnTargetedHistorical.Location = new Point(870, 158);
-        btnTargetedHistorical.Size = new Size(150, 36);
-        btnTargetedHistorical.Text = "Targeted Historical";
-        btnTargetedHistorical.Visible = false;
-        btnTargetedHistorical.UseVisualStyleBackColor = true;
-        btnTargetedHistorical.Click += btnTargetedHistorical_Click;
+        btnManageIgnoredDirectories.Location = new Point(704, 158);
+        btnManageIgnoredDirectories.Name = "btnManageIgnoredDirectories";
+        btnManageIgnoredDirectories.Size = new Size(156, 36);
+        btnManageIgnoredDirectories.Text = "Ignored Directories...";
+        btnManageIgnoredDirectories.UseVisualStyleBackColor = true;
+        btnManageIgnoredDirectories.Click += btnManageIgnoredDirectories_Click;
 
         chkScanSubdirectories.AutoSize = true;
         chkScanSubdirectories.Checked = true;
@@ -239,8 +234,7 @@ partial class Form1
         Controls.Add(lblFiles);
         Controls.Add(chkScanSubdirectories);
         Controls.Add(btnScanNtfs);
-        Controls.Add(btnRawVolumeMarker);
-        Controls.Add(btnTargetedHistorical);
+        Controls.Add(btnManageIgnoredDirectories);
         Controls.Add(btnBrowseScanPath);
         Controls.Add(txtScanPath);
         Controls.Add(btnClearHistory);
