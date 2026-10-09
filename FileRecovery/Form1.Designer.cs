@@ -137,12 +137,14 @@ partial class Form1
         btnRawVolumeMarker.Location = new Point(704, 158);
         btnRawVolumeMarker.Size = new Size(156, 36);
         btnRawVolumeMarker.Text = "Raw Volume Marker Test";
+        btnRawVolumeMarker.Visible = false;
         btnRawVolumeMarker.UseVisualStyleBackColor = true;
         btnRawVolumeMarker.Click += btnRawVolumeMarker_Click;
 
         btnTargetedHistorical.Location = new Point(870, 158);
         btnTargetedHistorical.Size = new Size(150, 36);
         btnTargetedHistorical.Text = "Targeted Historical";
+        btnTargetedHistorical.Visible = false;
         btnTargetedHistorical.UseVisualStyleBackColor = true;
         btnTargetedHistorical.Click += btnTargetedHistorical_Click;
 
