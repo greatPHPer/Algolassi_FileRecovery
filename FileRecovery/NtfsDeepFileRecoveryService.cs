@@ -313,7 +313,11 @@ public sealed class NtfsDeepFileRecoveryService
             return knownFileSizeBytes > 0;
         }
 
-        return SupportsExtension(extension);
+        // Unknown extensions are eligible for signature-based carving. The
+        // actual bytes, not the filename suffix, determine whether a known format
+        // can be reconstructed. Unknown binary formats still require a dedicated
+        // parser; small, known-length text files use the conservative fallback below.
+        return true;
     }
 
     private static bool SupportsExtension(string extension) =>
@@ -343,6 +347,76 @@ public sealed class NtfsDeepFileRecoveryService
         startOffset = 0;
         length = 0;
         format = string.Empty;
+
+        // For an unfamiliar extension, inspect the content for formats that this
+        // carver already knows how to validate. Keep the original filename/extension
+        // at the destination, but record the detected content format as evidence.
+        if (!SupportsExtension(extension))
+        {
+            if (TryFindJpeg(buffer, out startOffset, out length))
+            {
+                format = "JPEG (extension-independent)";
+                return true;
+            }
+            if (TryFindPng(buffer, out startOffset, out length))
+            {
+                format = "PNG (extension-independent)";
+                return true;
+            }
+            if (TryFindGif(buffer, out startOffset, out length))
+            {
+                format = "GIF (extension-independent)";
+                return true;
+            }
+            if (TryFindBmp(buffer, out startOffset, out length))
+            {
+                format = "BMP (extension-independent)";
+                return true;
+            }
+            if (TryFindWav(buffer, out startOffset, out length))
+            {
+                format = "WAV (extension-independent)";
+                return true;
+            }
+            if (TryFindWebp(buffer, out startOffset, out length))
+            {
+                format = "WebP (extension-independent)";
+                return true;
+            }
+            if (TryFindPdf(buffer, out startOffset, out length))
+            {
+                format = "PDF (extension-independent)";
+                return true;
+            }
+            if (TryFindZip(buffer, out startOffset, out length))
+            {
+                format = "ZIP (extension-independent; may include Office formats)";
+                return true;
+            }
+
+            // Conservative text fallback: only use a known, small original length.
+            // Text has no intrinsic boundary, so never guess a length for unknown
+            // extensions and never treat large/binary files as text.
+            if (knownFileSizeBytes > 0 &&
+                knownFileSizeBytes <= 1024L * 1024L &&
+                bytesPerCluster > 0 &&
+                knownFileSizeBytes <= int.MaxValue &&
+                TryFindText(
+                    buffer,
+                    checked((int)knownFileSizeBytes),
+                    checked((int)bytesPerCluster),
+                    out startOffset))
+            {
+                length = checked((int)knownFileSizeBytes);
+                format = "Plain text (unknown-extension heuristic)";
+                return true;
+            }
+
+            startOffset = 0;
+            length = 0;
+            format = string.Empty;
+            return false;
+        }
 
         if (extension.Equals(".txt", StringComparison.OrdinalIgnoreCase))
         {
