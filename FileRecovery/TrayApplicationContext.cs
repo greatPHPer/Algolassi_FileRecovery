@@ -39,6 +39,10 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _menu = new ContextMenuStrip();
         _menu.Items.Add("Open Recovery Center", null, (_, _) => OpenMainWindow());
+        _menu.Items.Add(
+            "Why must AlgoLassi stay running?",
+            null,
+            (_, _) => ShowMonitoringInformation());
         _menu.Items.Add(_notificationsMenuItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add("Exit", null, (_, _) => ExitApplication());
@@ -46,7 +50,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         _trayIcon = new NotifyIcon
         {
             Icon = SystemIcons.Application,
-            Text = "AlgoLassi File Recovery",
+            Text = "AlgoLassi: keep running in tray to monitor deletions",
+            BalloonTipTitle = "AlgoLassi monitoring is active",
+            BalloonTipText =
+                "Keep AlgoLassi running in the system tray before deleting files. " +
+                "Closing the Recovery Center window is safe; choosing Exit stops monitoring.",
+            BalloonTipIcon = ToolTipIcon.Info,
             Visible = true,
             ContextMenuStrip = _menu
         };
@@ -63,6 +72,24 @@ public sealed class TrayApplicationContext : ApplicationContext
         _usnMonitor.Start();
         _monitor.Start();
         _recycleBinMonitor.Start();
+
+        // The application starts resident in the tray, so explain the always-on
+        // monitoring requirement even when the user never opens the Recovery Center.
+        _trayIcon.ShowBalloonTip(10000);
+    }
+
+    private void ShowMonitoringInformation()
+    {
+        MessageBox.Show(
+            "AlgoLassi monitors deletion events continuously while it is running in the Windows notification area (system tray).\r\n\r\n" +
+            "Start AlgoLassi before deleting files and leave it running. You may close the Recovery Center window; " +
+            "that only hides the window and monitoring continues in the tray.\r\n\r\n" +
+            "Choose Exit from the tray menu or end the process, and monitoring stops. This is continuous background " +
+            "monitoring, not a full-volume recovery scan every second. Recovery depends on the evidence Windows still " +
+            "retains and is not guaranteed.",
+            "Keep AlgoLassi Running",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information);
     }
 
     private void OpenMainWindow()
