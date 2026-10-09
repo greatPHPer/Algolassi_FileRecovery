@@ -12,7 +12,7 @@ public sealed class RecoverySettings
     // The default is used only after the user explicitly enables protected folders.
     public string PreDeleteStorageDirectory { get; set; } = string.Empty;
     public long PreDeleteMaxFileSizeBytes { get; set; } = 10L * 1024L * 1024L * 1024L;
-    public long PreDeleteCacheLimitBytes { get; set; } = 50L * 1024L * 1024L * 1024L;
+    public long PreDeleteStorageLimitBytes { get; set; } = 50L * 1024L * 1024L * 1024L;
 
     public string EffectivePreDeleteStorageDirectory
     {
@@ -33,8 +33,8 @@ public sealed class RecoverySettings
     public long EffectivePreDeleteMaxFileSizeBytes =>
         Math.Clamp(PreDeleteMaxFileSizeBytes, 1L * 1024L * 1024L, 1024L * 1024L * 1024L * 1024L);
 
-    public long EffectivePreDeleteCacheLimitBytes =>
-        Math.Clamp(PreDeleteCacheLimitBytes, 1L * 1024L * 1024L, 4096L * 1024L * 1024L * 1024L);
+    public long EffectivePreDeleteStorageLimitBytes =>
+        Math.Clamp(PreDeleteStorageLimitBytes, 1L * 1024L * 1024L, 4096L * 1024L * 1024L * 1024L);
 
     public Dictionary<string, VolumeJournalCursor> UsnCursors { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
