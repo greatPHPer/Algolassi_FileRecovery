@@ -720,11 +720,12 @@ public sealed class UsnJournalMonitor : IDisposable
                     RecoveryStrength = "Weak"
                 };
 
-                // For deletions that occurred after AlgoLassi armed the USN journal,
-                // capture the exact MFT generation BEFORE resolving the parent path.
-                // Parent-directory resolution reads additional filesystem metadata and
-                // can give NTFS enough time to reuse the just-deleted MFT segment.
-                // The historical/pre-start scan deliberately stays on the old path.
+                // For live deletions, capture before resolving the parent path because
+                // extra metadata reads can let NTFS advance the deleted MFT record's sequence.
+                // Permit the reader's bounded delete-transition fallback here: it still requires
+                // a small forward sequence advance, a deleted/non-directory record, and matching
+                // filename, parent/path, and FILE_NAME timestamp. Historical/pre-start recovery
+                // continues to require the exact original MFT generation.
                 if (record.TimestampUtc >= _monitorStartedAtUtc &&
                     record.TimestampUtc <= DateTime.UtcNow.AddMinutes(1))
                 {
@@ -742,7 +743,7 @@ public sealed class UsnJournalMonitor : IDisposable
                         record.ParentFileReferenceNumber,
                         record.FileName,
                         cachedDirectory ?? "(Parent directory unavailable)",
-                        allowBoundedDeleteTransition: false);
+                        allowBoundedDeleteTransition: true);
 
                     if (deletion.NtfsDataSnapshot?.IsComplete == true)
                     {
