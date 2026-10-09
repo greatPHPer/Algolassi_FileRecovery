@@ -164,7 +164,6 @@ public partial class Form1 : Form
 
     private void StartEntranceAnimation(Point start, Point target)
     {
-        StopEntranceAnimation();
         Location = start;
         Opacity = 0;
 
