@@ -3705,43 +3705,36 @@ public partial class Form1 : Form
 
                         try
                         {
-                            if (logMarkerService.TryFindMarkerInHistoricalLogFile(
-                                    wholeVolumeRoot,
-                                    forensicMarker,
-                                    out var logMarkerEvidence))
-                            {
-                                MessageBox.Show(
+                            var markerFoundInLog = logMarkerService.TryFindMarkerInHistoricalLogFile(
+                                wholeVolumeRoot,
+                                forensicMarker,
+                                out var logMarkerEvidence);
+
+                            var proceedWithFullVolume = markerFoundInLog
+                                ? MessageBox.Show(
                                     this,
-                                    $"The marker was found inside the retained NTFS $LogFile.\r\n\r\n" +
-                                    logMarkerEvidence,
-                                    "NTFS $LogFile Marker Found",
-                                    MessageBoxButtons.OK,
-                                    MessageBoxIcon.Information);
-
-                                failures.Add(
-                                    $"{candidate.Name}: the supplied marker is retained in NTFS $LogFile. " +
-                                    "The 122 GB whole-volume scan was not started because the journal contains a possible historical content fragment. " +
-                                    logMarkerEvidence);
-
-                                continue;
-                            }
-
-                            var proceedWithFullVolume = MessageBox.Show(
-                                this,
-                                $"The marker was not found in the retained NTFS $LogFile.\r\n\r\n" +
-                                "Starting the raw-volume forensic scan will read the entire source volume. " +
-                                "For the current 1 MB test this is approximately 122 GB.\r\n\r\n" +
-                                "Start the full-volume scan now?",
-                                "Start Full-Volume Forensic Scan",
-                                MessageBoxButtons.YesNo,
-                                MessageBoxIcon.Question,
-                                MessageBoxDefaultButton.Button2);
+                                    "The marker was found in NTFS $LogFile, but that only confirms a possible historical text fragment; it does not recover the complete file.\r\n\r\n" +
+                                    "A separate raw-volume scan may still find the text in volume data. It reads the entire source volume and can take a long time.\r\n\r\n" +
+                                    "Continue with the full-volume scan?",
+                                    "Marker Found in NTFS $LogFile",
+                                    MessageBoxButtons.YesNo,
+                                    MessageBoxIcon.Warning,
+                                    MessageBoxDefaultButton.Button2)
+                                : MessageBox.Show(
+                                    this,
+                                    "The marker was not found in the retained NTFS $LogFile.\r\n\r\n" +
+                                    "Starting the raw-volume forensic scan will read the entire source volume and can take a long time.\r\n\r\n" +
+                                    "Start the full-volume scan now?",
+                                    "Start Full-Volume Forensic Scan",
+                                    MessageBoxButtons.YesNo,
+                                    MessageBoxIcon.Question,
+                                    MessageBoxDefaultButton.Button2);
 
                             if (proceedWithFullVolume != DialogResult.Yes)
                             {
                                 failures.Add(
-                                    $"{candidate.Name}: marker was not found in the retained NTFS $LogFile and the full-volume forensic scan was skipped. " +
-                                    logMarkerEvidence);
+                                    $"{candidate.Name}: raw-volume marker scan was skipped by the user. " +
+                                    $"markerFoundInLog={markerFoundInLog}; {logMarkerEvidence}");
                                 continue;
                             }
                         }
