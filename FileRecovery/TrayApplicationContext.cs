@@ -20,8 +20,9 @@ public sealed class TrayApplicationContext : ApplicationContext
     public TrayApplicationContext()
     {
         _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
-        _history = new DeletionHistoryStore();
         _settings = RecoverySettings.Load();
+        RecoveryMonitoringExclusions.Configure(_settings);
+        _history = new DeletionHistoryStore();
         _monitor = new DeletionMonitor();
         _usnMonitor = new UsnJournalMonitor(_settings);
         _recycleBinMonitor = new RecycleBinMonitor();
@@ -39,6 +40,10 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _menu = new ContextMenuStrip();
         _menu.Items.Add("Open Recovery Center", null, (_, _) => OpenMainWindow());
+        _menu.Items.Add(
+            "Manage ignored directories...",
+            null,
+            (_, _) => OpenIgnoredDirectoriesManager());
         _menu.Items.Add(
             "Why must AlgoLassi stay running?",
             null,
@@ -76,6 +81,25 @@ public sealed class TrayApplicationContext : ApplicationContext
         // The application starts resident in the tray, so explain the always-on
         // monitoring requirement even when the user never opens the Recovery Center.
         _trayIcon.ShowBalloonTip(10000);
+    }
+
+    private void OpenIgnoredDirectoriesManager()
+    {
+        using var dialog = new IgnoredDirectoriesForm();
+
+        if (_mainForm is { IsDisposed: false, Visible: true } owner)
+        {
+            dialog.ShowDialog(owner);
+        }
+        else
+        {
+            dialog.ShowDialog();
+        }
+
+        if (_mainForm is { IsDisposed: false } mainForm)
+        {
+            mainForm.RefreshFromHistory();
+        }
     }
 
     private void ShowMonitoringInformation()
