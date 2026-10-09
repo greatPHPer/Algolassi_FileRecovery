@@ -12,6 +12,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly DeletionMonitor _monitor;
     private readonly UsnJournalMonitor _usnMonitor;
     private readonly RecycleBinMonitor _recycleBinMonitor;
+    private readonly PreDeleteSnapshotService _preDeleteSnapshots;
     private readonly SynchronizationContext _uiContext;
     private Form1? _mainForm;
     private DeletionNotificationForm? _notificationForm;
@@ -26,6 +27,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _monitor = new DeletionMonitor();
         _usnMonitor = new UsnJournalMonitor(_settings);
         _recycleBinMonitor = new RecycleBinMonitor();
+        _preDeleteSnapshots = new PreDeleteSnapshotService(_settings);
 
         _notificationsMenuItem = new ToolStripMenuItem("Notifications")
         {
@@ -44,6 +46,10 @@ public sealed class TrayApplicationContext : ApplicationContext
             "Manage ignored directories...",
             null,
             (_, _) => OpenIgnoredDirectoriesManager());
+        _menu.Items.Add(
+            "Manage pre-delete protected folders...",
+            null,
+            (_, _) => OpenPreDeleteProtectedFoldersManager());
         _menu.Items.Add(
             "Why must AlgoLassi stay running?",
             null,
@@ -72,6 +78,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         _usnMonitor.StatusChanged += OnMonitorStatusChanged;
         _recycleBinMonitor.DeletionDetected += OnDeletionDetected;
         _recycleBinMonitor.StatusChanged += OnMonitorStatusChanged;
+        _preDeleteSnapshots.StatusChanged += OnMonitorStatusChanged;
+
+        // Start optional proactive protection first so configured folders begin
+        // their bounded baseline scan as soon as the tray app starts.
+        _preDeleteSnapshots.Start();
+
         // Arm the USN journals before FileSystemWatcher starts so a very early
         // Shift+Delete cannot be missed during application startup.
         _usnMonitor.Start();
@@ -100,6 +112,39 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             mainForm.RefreshFromHistory();
         }
+    }
+
+    private void OpenPreDeleteProtectedFoldersManager()
+    {
+        using var dialog = new ProtectedFoldersForm(
+            _settings.ProtectedDirectories ?? []);
+
+        DialogResult result;
+        if (_mainForm is { IsDisposed: false, Visible: true } owner)
+        {
+            result = dialog.ShowDialog(owner);
+        }
+        else
+        {
+            result = dialog.ShowDialog();
+        }
+
+        if (result != DialogResult.OK)
+        {
+            return;
+        }
+
+        _preDeleteSnapshots.SetProtectedDirectories(dialog.ProtectedDirectories);
+
+        var count = dialog.ProtectedDirectories.Count;
+        MessageBox.Show(
+            _mainForm is { IsDisposed: false, Visible: true } activeOwner ? activeOwner : null,
+            count == 0
+                ? "Pre-delete protection is off. No folders will be proactively snapshotted."
+                : $"Pre-delete protection is configured for {count:N0} folder(s). AlgoLassi will scan eligible existing files and watch changes while it remains running. Files over 25 MB are skipped; the rolling cache is capped at 512 MB and entries expire after 7 days.",
+            "Pre-delete Protection",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information);
     }
 
     private void ShowMonitoringInformation()
@@ -254,6 +299,29 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
+        // Prefer a verified copy made while the file still existed. If the cache
+        // has a matching source version, attach it before attempting post-delete MFT
+        // reads so recovery uses the preserved bytes.
+        if (e.Record.NtfsDataSnapshot?.IsComplete != true)
+        {
+            try
+            {
+                var attached = await Task.Run(
+                    () => _preDeleteSnapshots.TryAttachSnapshot(e.Record));
+
+                if (attached)
+                {
+                    await Task.Run(() => _history.Upsert(e.Record));
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"Pre-delete snapshot promotion failed for {e.Record.FullPath}: " +
+                    $"{ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         // FileSystemWatcher normally gives us the first live event, but the
         // USN monitor can be the first/only source when the watcher buffer is busy.
         // A fresh USN delete (known file reference and very recent timestamp) must
@@ -347,6 +415,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         _monitor.Dispose();
         _usnMonitor.Dispose();
         _recycleBinMonitor.Dispose();
+        _preDeleteSnapshots.StatusChanged -= OnMonitorStatusChanged;
+        _preDeleteSnapshots.Dispose();
 
         ExitThread();
     }
