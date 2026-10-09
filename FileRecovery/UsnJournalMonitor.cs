@@ -931,6 +931,38 @@ public sealed class UsnJournalMonitor : IDisposable
                     : $"NTFS $DATA metadata was captured at deletion time, but content capture was limited to {DeleteSnapshotMaxBytes:N0} bytes."
             };
 
+            // A retained pre-start USN deletion may have a matching one-step MFT
+            // transition even after the original data clusters have been discarded
+            // (for example, by SSD TRIM). Do not label a non-empty all-zero buffer
+            // from this conservative catch-up path as a complete/strong snapshot.
+            // A genuinely all-zero file can exist, so preserve its metadata as a
+            // metadata-only result instead of treating the bytes as trustworthy.
+            var isBoundedPreStartCapture =
+                allowBoundedDeleteTransition &&
+                maxBoundedDeleteSequenceAdvance == 1;
+            var isAllZeroCapture =
+                capturedData.Length > 0 &&
+                capturedData.All(static value => value == 0);
+
+            if (isBoundedPreStartCapture &&
+                capturedData.LongLength == stream.FileSizeBytes &&
+                isAllZeroCapture)
+            {
+                snapshot.Evidence =
+                    "Pre-start catch-up returned an all-zero buffer after a bounded MFT transition. " +
+                    "Original contents may have been discarded by storage TRIM or the current runlist " +
+                    "may no longer reference the original allocation; content was not marked captured.";
+
+                deletion.NtfsDataSnapshot = snapshot;
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS pre-start catch-up capture REJECTED all-zero content: " +
+                    $"path={deletion.FullPath}, fileRef={fileReferenceNumber}, " +
+                    $"size={capturedData.LongLength:N0}; metadata retained, no strong snapshot saved.");
+
+                return;
+            }
+
             if (capturedData.LongLength == stream.FileSizeBytes &&
                 _snapshotStore.TrySave(
                     deletion.Id,
