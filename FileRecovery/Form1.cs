@@ -3702,6 +3702,8 @@ public partial class Form1 : Form
                     const long minSizeOnlyTextCarveBytes = 64L * 1024L;
                     const long maxSizeOnlyTextCarveBytes = 64L * 1024L * 1024L;
 
+                    var sizeOnlyTextScanExhausted = false;
+
                     if (candidate.FileSizeBytes >= minSizeOnlyTextCarveBytes &&
                         candidate.FileSizeBytes <= maxSizeOnlyTextCarveBytes)
                     {
@@ -3742,14 +3744,36 @@ public partial class Form1 : Form
                                 $"content identity remains heuristic.");
                             continue;
                         }
+                        catch (InvalidOperationException ex) when (
+                            ex.Message.StartsWith(
+                                "No structurally valid .txt file was found in the first ",
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            sizeOnlyTextScanExhausted = true;
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS size-only text carve exhausted all currently free clusters " +
+                                $"without a candidate: path={candidate.FullPath}, " +
+                                $"expectedBytes={candidate.FileSizeBytes:N0}, error={ex.Message}; " +
+                                $"skipping the additional whole-volume marker scan.");
+                        }
                         catch (Exception ex)
                         {
                             System.Diagnostics.Trace.WriteLine(
-                                $"NTFS size-only text carve found no candidate: path={candidate.FullPath}, " +
+                                $"NTFS size-only text carve failed unexpectedly: path={candidate.FullPath}, " +
                                 $"expectedBytes={candidate.FileSizeBytes:N0}, " +
                                 $"error={ex.GetType().Name}: {ex.Message}; " +
                                 $"continuing to marker-driven forensic recovery.");
                         }
+                    }
+
+                    if (sizeOnlyTextScanExhausted)
+                    {
+                        failures.Add(
+                            $"{candidate.Name}: the exact-size text scan examined all currently free NTFS clusters " +
+                            $"without finding a {candidate.FileSizeBytes:N0}-byte text candidate. " +
+                            "The additional whole-volume marker scan was skipped as configured.");
+
+                        continue;
                     }
 
                     var markerKey = NormalizePath(candidate.FullPath);
