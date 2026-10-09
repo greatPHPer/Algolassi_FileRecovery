@@ -117,7 +117,10 @@ public sealed class TrayApplicationContext : ApplicationContext
     private void OpenPreDeleteProtectedFoldersManager()
     {
         using var dialog = new ProtectedFoldersForm(
-            _settings.ProtectedDirectories ?? []);
+            _settings.ProtectedDirectories ?? [],
+            _settings.EffectivePreDeleteStorageDirectory,
+            _settings.EffectivePreDeleteMaxFileSizeBytes,
+            _settings.EffectivePreDeleteStorageLimitBytes);
 
         DialogResult result;
         if (_mainForm is { IsDisposed: false, Visible: true } owner)
@@ -134,14 +137,33 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        _preDeleteSnapshots.SetProtectedDirectories(dialog.ProtectedDirectories);
+        try
+        {
+            _preDeleteSnapshots.SetConfiguration(
+                dialog.ProtectedDirectories,
+                dialog.StorageDirectory,
+                dialog.MaximumFileSizeBytes,
+                dialog.TotalStorageLimitBytes);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                _mainForm is { IsDisposed: false, Visible: true } errorOwner ? errorOwner : null,
+                $"Pre-delete protection settings could not be applied: {ex.Message}",
+                "Pre-delete Protection",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
 
         var count = dialog.ProtectedDirectories.Count;
+        var maxFileGiB = dialog.MaximumFileSizeBytes / (1024d * 1024d * 1024d);
+        var totalGiB = dialog.TotalStorageLimitBytes / (1024d * 1024d * 1024d);
         MessageBox.Show(
             _mainForm is { IsDisposed: false, Visible: true } activeOwner ? activeOwner : null,
             count == 0
                 ? "Pre-delete protection is off. No folders will be proactively snapshotted."
-                : $"Pre-delete protection is configured for {count:N0} folder(s). AlgoLassi will scan eligible existing files and watch changes while it remains running. Files over 25 MB are skipped; the rolling cache is capped at 512 MB and entries expire after 7 days.",
+                : $"Pre-delete protection is configured for {count:N0} folder(s). Maximum file size: {maxFileGiB:N0} GiB. Total storage limit (rolling cache + preserved snapshots): {totalGiB:N0} GiB. Choose a storage folder with sufficient free space, preferably on another physical drive. When the limit is full, new protection is skipped rather than deleting existing recoverable snapshots.",
             "Pre-delete Protection",
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
