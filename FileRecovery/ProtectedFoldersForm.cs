@@ -42,7 +42,8 @@ public sealed class ProtectedFoldersForm : Form
             Size = new Size(748, 68),
             Text =
                 "Choose folders where AlgoLassi should keep rolling copies of files before deletion. " +
-                "Files are captured with streamed I/O, not one giant memory buffer. " +
+                "Files are captured with streamed I/O, not one giant memory buffer. The safe default is 1 GiB per file and 2 GiB total storage. " +
+                "Increase these only when you have enough free space, preferably on another physical drive. " +
                 "Protection is best-effort and is not a substitute for a separate backup."
         };
 
@@ -88,7 +89,7 @@ public sealed class ProtectedFoldersForm : Form
             Maximum = 1024,
             Increment = 1,
             DecimalPlaces = 0,
-            Value = ToGiBCeiling(maximumFileSizeBytes, 10)
+            Value = ToGiBCeiling(maximumFileSizeBytes, 1)
         };
 
         var maxFileUnit = new Label
@@ -113,7 +114,7 @@ public sealed class ProtectedFoldersForm : Form
             Maximum = 4096,
             Increment = 1,
             DecimalPlaces = 0,
-            Value = ToGiBCeiling(totalStorageLimitBytes, 50)
+            Value = ToGiBCeiling(totalStorageLimitBytes, 2)
         };
         _totalStorageLimitGiB.ValueChanged += (_, _) => ClampIndividualFileLimit();
 
