@@ -149,21 +149,46 @@ public sealed class UsnJournalMonitor : IDisposable
                     }
                 }
 
-                if (!_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) ||
-                    cursor.JournalId != journal.JournalId ||
-                    cursor.NextUsn <= 0)
-                {
-                    _settings.UsnCursors[volumeKey] = new VolumeJournalCursor
-                    {
-                        JournalId = journal.JournalId,
-                        NextUsn = journal.NextUsn
-                    };
-                    _settings.Save();
+                var hadPreviousCursor =
+                    _settings.UsnCursors.TryGetValue(volumeKey, out var previousCursor);
 
-                    StatusChanged?.Invoke(
-                        this,
-                        $"USN journal armed for {volumeKey}. New deletions will be tracked.");
-                }
+                var previousNextUsn = hadPreviousCursor
+                    ? previousCursor!.NextUsn
+                    : 0L;
+
+                var hasPreStartBacklog =
+                    hadPreviousCursor &&
+                    previousCursor!.JournalId == journal.JournalId &&
+                    previousNextUsn >= journal.FirstUsn &&
+                    previousNextUsn < journal.NextUsn;
+
+                // The persisted cursor may be far behind after a restart. Replaying
+                // that entire offline backlog on the live-monitor worker can delay
+                // capture of newly deleted nonresident files until their MFT runlists
+                // are gone. The explicit "Scan NTFS Deleted Files" operation reads the
+                // retained historical journal separately. Keep this worker at the
+                // current journal tail so it prioritizes deletions while monitoring.
+                var startupCursor = new VolumeJournalCursor
+                {
+                    JournalId = journal.JournalId,
+                    NextUsn = journal.NextUsn
+                };
+
+                _settings.UsnCursors[volumeKey] = startupCursor;
+                _settings.Save();
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"USN monitor startup cursor: volume={volumeKey}, " +
+                    $"previousJournalId={(hadPreviousCursor ? previousCursor!.JournalId.ToString() : "(none)")}, " +
+                    $"previousNextUsn={(hadPreviousCursor ? previousNextUsn.ToString() : "(none)")}, " +
+                    $"startupNextUsn={journal.NextUsn}, " +
+                    $"skippedPreStartBacklog={hasPreStartBacklog}.");
+
+                StatusChanged?.Invoke(
+                    this,
+                    hasPreStartBacklog
+                        ? $"USN live monitoring armed for {volumeKey} at the current journal tail. Use Scan NTFS Deleted Files to search deletions from before startup."
+                        : $"USN journal armed for {volumeKey}. New deletions will be tracked.");
             }
             catch (UnauthorizedAccessException)
             {
