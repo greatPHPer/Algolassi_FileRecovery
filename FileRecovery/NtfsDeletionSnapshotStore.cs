@@ -282,18 +282,19 @@ public sealed class NtfsDeletionSnapshotStore
                        FileShare.Read,
                        CopyBufferSize,
                        FileOptions.SequentialScan))
-            using (var output = new FileStream(
-                       temporary,
-                       FileMode.CreateNew,
-                       FileAccess.Write,
-                       FileShare.None,
-                       CopyBufferSize,
-                       FileOptions.SequentialScan))
             {
                 if (input.Length != expectedLength)
                 {
                     return false;
                 }
+
+                using var output = new FileStream(
+                    temporary,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    CopyBufferSize,
+                    FileOptions.SequentialScan);
 
                 var buffer = new byte[CopyBufferSize];
                 int read;
