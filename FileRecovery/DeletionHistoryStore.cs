@@ -36,12 +36,16 @@ public sealed class DeletionHistoryStore
             // Always surface them even when they are older than the ordinary history
             // window, otherwise the recovery UI cannot discover the snapshot that was
             // intentionally preserved by Upsert().
-            var snapshotRecords = _records
+            var visibleRecords = _records
+                .Where(x => !RecoveryMonitoringExclusions.IsExcludedPath(x.FullPath))
+                .ToList();
+
+            var snapshotRecords = visibleRecords
                 .Where(x => x.NtfsDataSnapshot?.IsComplete == true)
                 .OrderByDescending(x => x.DeletedAtUtc)
                 .ToList();
 
-            var ordinaryRecords = _records
+            var ordinaryRecords = visibleRecords
                 .Where(x => x.NtfsDataSnapshot?.IsComplete != true)
                 .OrderByDescending(x => x.DeletedAtUtc)
                 .Take(limit)
@@ -60,6 +64,7 @@ public sealed class DeletionHistoryStore
         lock (_gate)
         {
             return _records
+                .Where(x => !RecoveryMonitoringExclusions.IsExcludedPath(x.FullPath))
                 .OrderByDescending(x => x.DeletedAtUtc)
                 .Select(x => x.DirectoryPath)
                 .Where(x => !string.IsNullOrWhiteSpace(x))
