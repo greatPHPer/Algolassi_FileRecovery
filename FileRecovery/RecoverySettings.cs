@@ -6,6 +6,7 @@ public sealed class RecoverySettings
 {
     public bool NotificationsMuted { get; set; }
     public List<string> IgnoredDirectories { get; set; } = [];
+    public List<string> ProtectedDirectories { get; set; } = [];
     public Dictionary<string, VolumeJournalCursor> UsnCursors { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -30,6 +31,7 @@ public sealed class RecoverySettings
                 ?? new RecoverySettings();
 
             settings.IgnoredDirectories ??= [];
+            settings.ProtectedDirectories ??= [];
             settings.UsnCursors ??= new Dictionary<string, VolumeJournalCursor>(StringComparer.OrdinalIgnoreCase);
             return settings;
         }
