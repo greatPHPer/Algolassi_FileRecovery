@@ -296,6 +296,7 @@ public partial class Form1 : Form
             ForeColor = Color.FromArgb(224, 236, 248),
             Font = new Font("Segoe UI", 12F, FontStyle.Regular),
             Cursor = Cursors.Hand,
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
             UseVisualStyleBackColor = false,
             TabStop = false
         };
