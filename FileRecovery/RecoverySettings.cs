@@ -11,8 +11,8 @@ public sealed class RecoverySettings
     // The rolling pre-delete cache and promoted snapshots share this storage root.
     // The default is used only after the user explicitly enables protected folders.
     public string PreDeleteStorageDirectory { get; set; } = string.Empty;
-    public long PreDeleteMaxFileSizeBytes { get; set; } = 10L * 1024L * 1024L * 1024L;
-    public long PreDeleteStorageLimitBytes { get; set; } = 50L * 1024L * 1024L * 1024L;
+    public long PreDeleteMaxFileSizeBytes { get; set; } = 1L * 1024L * 1024L * 1024L;
+    public long PreDeleteStorageLimitBytes { get; set; } = 2L * 1024L * 1024L * 1024L;
 
     public string EffectivePreDeleteStorageDirectory
     {
