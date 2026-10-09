@@ -1183,33 +1183,34 @@ public partial class Form1 : Form
             var historicalSnapshotCutoffUtc = DateTime.UtcNow.AddMinutes(-15);
             var historicalSnapshotRecords = new List<DeletionRecord>();
 
-            var deletedRecords = _usnMonitor.ScanDeletedDirectory(
-                scanDirectory,
-                includeSubdirectories,
-                CancellationToken.None,
-                deletedRecord =>
-                {
-                    if (deletedRecord.DeletedAtUtc < historicalSnapshotCutoffUtc)
+            var deletedRecords = await Task.Run(() =>
+                _usnMonitor.ScanDeletedDirectory(
+                    scanDirectory,
+                    includeSubdirectories,
+                    CancellationToken.None,
+                    deletedRecord =>
                     {
-                        return;
-                    }
-
-                    try
-                    {
-                        if (_usnMonitor.TryCaptureHistoricalDeletionSnapshot(
-                                deletedRecord,
-                                out var snapshotRecord))
+                        if (deletedRecord.DeletedAtUtc < historicalSnapshotCutoffUtc)
                         {
-                            historicalSnapshotRecords.Add(snapshotRecord);
+                            return;
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        System.Diagnostics.Debug.WriteLine(
-                            $"NTFS historical deletion snapshot failed: " +
-                            $"{deletedRecord.FullPath}: {ex.GetType().Name}: {ex.Message}");
-                    }
-                });
+
+                        try
+                        {
+                            if (_usnMonitor.TryCaptureHistoricalDeletionSnapshot(
+                                    deletedRecord,
+                                    out var snapshotRecord))
+                            {
+                                historicalSnapshotRecords.Add(snapshotRecord);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine(
+                                $"NTFS historical deletion snapshot failed: " +
+                                $"{deletedRecord.FullPath}: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    }));
 
             foreach (var snapshotRecord in historicalSnapshotRecords)
             {
@@ -1475,11 +1476,12 @@ public partial class Form1 : Form
                     // exact path for only those recent targets. The timestamp guard
                     // prevents an unrelated older deletion of the same path from
                     // being promoted.
-                    var pathCandidates = _mftCandidateScanner.ScanForPaths(
-                        rootPath,
-                        recentTargetRecordsByPath.Keys.ToList(),
-                        CancellationToken.None,
-                        maxPages: 128);
+                    var pathCandidates = await Task.Run(() =>
+                        _mftCandidateScanner.ScanForPaths(
+                            rootPath,
+                            recentTargetRecordsByPath.Keys.ToList(),
+                            CancellationToken.None,
+                            maxPages: 128));
 
                     directLiveCandidates = pathCandidates
                         .Where(candidate =>
@@ -1509,10 +1511,11 @@ public partial class Form1 : Form
                 }
             }
 
-            var candidates = _mftCandidateScanner.ScanForFileReferences(
-                rootPath,
-                targetRecords,
-                CancellationToken.None)
+            var candidates = (await Task.Run(() =>
+                    _mftCandidateScanner.ScanForFileReferences(
+                        rootPath,
+                        targetRecords,
+                        CancellationToken.None)))
                 .ToList();
 
             var candidatePaths = candidates
