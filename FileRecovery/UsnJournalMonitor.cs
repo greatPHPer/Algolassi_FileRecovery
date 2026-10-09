@@ -910,6 +910,23 @@ public sealed class UsnJournalMonitor : IDisposable
                     ? stream.FileSizeBytes
                     : deletion.FileSizeBytes;
 
+            // A retained pre-start USN deletion may have a matching one-step MFT
+            // transition even after the original data clusters have been discarded
+            // (for example, by SSD TRIM). Do not label a non-empty all-zero buffer
+            // from this conservative catch-up path as a complete/strong snapshot.
+            // A genuinely all-zero file can exist, so preserve its metadata as a
+            // metadata-only result instead of treating the bytes as trustworthy.
+            var isBoundedPreStartCapture =
+                allowBoundedDeleteTransition &&
+                maxBoundedDeleteSequenceAdvance == 1;
+            var isAllZeroCapture =
+                capturedData.Length > 0 &&
+                capturedData.All(static value => value == 0);
+            var rejectAllZeroPreStartCapture =
+                isBoundedPreStartCapture &&
+                capturedData.LongLength == stream.FileSizeBytes &&
+                isAllZeroCapture;
+
             var snapshot = new NtfsDeletionDataSnapshot
             {
                 DataCaptured = false,
@@ -926,33 +943,17 @@ public sealed class UsnJournalMonitor : IDisposable
                     })
                     .ToList(),
                 CapturedAtUtc = DateTime.UtcNow,
-                Evidence = capturedData.LongLength == stream.FileSizeBytes
-                    ? "NTFS $DATA was captured immediately when the USN deletion was observed."
-                    : $"NTFS $DATA metadata was captured at deletion time, but content capture was limited to {DeleteSnapshotMaxBytes:N0} bytes."
+                Evidence = rejectAllZeroPreStartCapture
+                    ? "Pre-start catch-up returned an all-zero buffer after a bounded MFT transition. " +
+                      "Original contents may have been discarded by storage TRIM or the current runlist " +
+                      "may no longer reference the original allocation; content was not marked captured."
+                    : capturedData.LongLength == stream.FileSizeBytes
+                        ? "NTFS $DATA was captured immediately when the USN deletion was observed."
+                        : $"NTFS $DATA metadata was captured at deletion time, but content capture was limited to {DeleteSnapshotMaxBytes:N0} bytes."
             };
 
-            // A retained pre-start USN deletion may have a matching one-step MFT
-            // transition even after the original data clusters have been discarded
-            // (for example, by SSD TRIM). Do not label a non-empty all-zero buffer
-            // from this conservative catch-up path as a complete/strong snapshot.
-            // A genuinely all-zero file can exist, so preserve its metadata as a
-            // metadata-only result instead of treating the bytes as trustworthy.
-            var isBoundedPreStartCapture =
-                allowBoundedDeleteTransition &&
-                maxBoundedDeleteSequenceAdvance == 1;
-            var isAllZeroCapture =
-                capturedData.Length > 0 &&
-                capturedData.All(static value => value == 0);
-
-            if (isBoundedPreStartCapture &&
-                capturedData.LongLength == stream.FileSizeBytes &&
-                isAllZeroCapture)
+            if (rejectAllZeroPreStartCapture)
             {
-                snapshot.Evidence =
-                    "Pre-start catch-up returned an all-zero buffer after a bounded MFT transition. " +
-                    "Original contents may have been discarded by storage TRIM or the current runlist " +
-                    "may no longer reference the original allocation; content was not marked captured.";
-
                 deletion.NtfsDataSnapshot = snapshot;
 
                 System.Diagnostics.Debug.WriteLine(
