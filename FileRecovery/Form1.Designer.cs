@@ -8,7 +8,7 @@ partial class Form1
     private Label lblTitle = null!;
     private Label lblSubtitle = null!;
     private Label lblDirectories = null!;
-    private ListBox lstDirectories = null!;
+    private BufferedDirectoryListBox lstDirectories = null!;
     private Button btnScanDirectory = null!;
     private Button btnScanNtfs = null!;
     private Button btnManageIgnoredDirectories = null!;
@@ -44,7 +44,7 @@ partial class Form1
         lblTitle = new Label();
         lblSubtitle = new Label();
         lblDirectories = new Label();
-        lstDirectories = new ListBox();
+        lstDirectories = new BufferedDirectoryListBox();
         btnScanDirectory = new Button();
         btnScanNtfs = new Button();
         btnManageIgnoredDirectories = new Button();
