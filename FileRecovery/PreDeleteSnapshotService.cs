@@ -745,19 +745,19 @@ public sealed class PreDeleteSnapshotService : IDisposable
                        FileShare.ReadWrite | FileShare.Delete,
                        CopyBufferSize,
                        FileOptions.SequentialScan))
-            using (var output = new FileStream(
-                       temporary,
-                       FileMode.CreateNew,
-                       FileAccess.Write,
-                       FileShare.None,
-                       CopyBufferSize,
-                       FileOptions.SequentialScan))
             {
                 if (input.Length != before.Length)
                 {
-                    TryDeleteFile(temporary);
                     return;
                 }
+
+                using var output = new FileStream(
+                    temporary,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    CopyBufferSize,
+                    FileOptions.SequentialScan);
 
                 var buffer = new byte[CopyBufferSize];
                 int read;
@@ -932,6 +932,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
                                     StringComparison.Ordinal) ||
                                 entry.Length <= 0 ||
                                 entry.Length > MaximumFileBytes ||
+                                entry.Length > MaximumCacheBytes ||
                                 !File.Exists(Path.Combine(_cacheDirectory, entry.CacheFileName)))
                             {
                                 continue;
@@ -1069,6 +1070,54 @@ public sealed class PreDeleteSnapshotService : IDisposable
 
     private bool IsProtectedPathLocked(string path) =>
         _protectedDirectories.Any(root => IsSameOrDescendant(path, root));
+
+    private bool IsInternalStoragePath(string path)
+    {
+        try
+        {
+            var normalized = NormalizeFilePath(path);
+            string storageRoot;
+            lock (_gate)
+            {
+                storageRoot = _storageRoot;
+            }
+
+            return IsSameOrDescendant(normalized, storageRoot);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool HasAvailableSpace(string directory, long requestedBytes)
+    {
+        try
+        {
+            var fullPath = Path.GetFullPath(directory);
+            var root = Path.GetPathRoot(fullPath);
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                return false;
+            }
+
+            var drive = new DriveInfo(root);
+            if (!drive.IsReady)
+            {
+                return false;
+            }
+
+            const long reserveBytes = 256L * 1024L * 1024L;
+            return drive.AvailableFreeSpace >= requestedBytes &&
+                   drive.AvailableFreeSpace - requestedBytes >= reserveBytes;
+        }
+        catch
+        {
+            // If available space cannot be measured, skip rather than risking an
+            // uncontrolled out-of-space condition while writing a large cache file.
+            return false;
+        }
+    }
 
     private static string NormalizeDirectoryPath(string path)
     {
