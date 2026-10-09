@@ -744,12 +744,12 @@ public sealed class UsnJournalMonitor : IDisposable
                 };
 
                 // Capture a live deletion before resolving its parent path: extra
-                // metadata reads can let NTFS advance the deleted MFT sequence. The live
-                // path may use its guarded bounded sequence-transition fallback.
+                // metadata reads can let NTFS advance the deleted MFT sequence.
                 //
-                // During startup catch-up, also try very recent pre-start deletions, but
-                // only against the exact original MFT generation. Never accept a sequence
-                // transition for a file deleted while AlgoLassi was not monitoring.
+                // During startup catch-up, only a one-step sequence transition may be
+                // considered, and only through the reader's deleted-record, exact
+                // filename/parent, and timestamp guards. A larger change is rejected.
+  
                 var isLiveDeletion =
                     record.TimestampUtc >= _monitorStartedAtUtc &&
                     record.TimestampUtc <= DateTime.UtcNow.AddMinutes(1);
@@ -765,13 +765,16 @@ public sealed class UsnJournalMonitor : IDisposable
                         ? "NTFS deletion-time capture-first"
                         : "NTFS pre-start catch-up capture";
 
+                    var maxSequenceAdvance = isLiveDeletion ? 8 : 1;
+
                     System.Diagnostics.Trace.WriteLine(
                         $"{captureLabel}: " +
                         $"path={record.FileName}, " +
                         $"fileRef={record.FileReferenceNumber}, " +
                         $"parentRef={record.ParentFileReferenceNumber}, " +
                         $"deleteTime={record.TimestampUtc:O}, " +
-                        $"exactGenerationOnly={!isLiveDeletion}.");
+                        $"maxSequenceAdvance={maxSequenceAdvance}, " +
+                        $"identityGuard=deleted-record+filename+parent+timestamp.");
 
                     CaptureNtfsDeletionSnapshot(
                         deletion,
@@ -780,7 +783,8 @@ public sealed class UsnJournalMonitor : IDisposable
                         record.ParentFileReferenceNumber,
                         record.FileName,
                         cachedDirectory ?? "(Parent directory unavailable)",
-                        allowBoundedDeleteTransition: isLiveDeletion);
+                        allowBoundedDeleteTransition: true,
+                        maxBoundedDeleteSequenceAdvance: maxSequenceAdvance);
 
                     if (deletion.NtfsDataSnapshot?.IsComplete == true)
                     {
@@ -868,7 +872,8 @@ public sealed class UsnJournalMonitor : IDisposable
         ulong parentFileReferenceNumber,
         string fileName,
         string directoryPath,
-        bool allowBoundedDeleteTransition = true)
+        bool allowBoundedDeleteTransition = true,
+        int maxBoundedDeleteSequenceAdvance = 8)
     {
         try
         {
@@ -894,7 +899,8 @@ public sealed class UsnJournalMonitor : IDisposable
                     out var capturedData,
                     expectedDeletedAtUtc: deletion.DeletedAtUtc,
                     allowBoundedDeleteTransition: allowBoundedDeleteTransition,
-                    expectedFileSizeBytes: deletion.FileSizeBytes ?? 0))
+                    expectedFileSizeBytes: deletion.FileSizeBytes ?? 0,
+                    maxBoundedDeleteSequenceAdvance: maxBoundedDeleteSequenceAdvance))
             {
                 return;
             }
