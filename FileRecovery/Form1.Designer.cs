@@ -176,7 +176,7 @@ partial class Form1
         dgvResults.ReadOnly = true;
         dgvResults.RowHeadersVisible = false;
         dgvResults.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        dgvResults.Size = new Size(662, 372);
+        dgvResults.Size = new Size(662, 338);
         dgvResults.SelectionChanged += dgvResults_SelectionChanged;
 
         colName.DataPropertyName = "Name";
