@@ -211,18 +211,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         // Replay the last monitor state captured while the app was tray-only.
         _mainForm.SetMonitorStatus(_lastMonitoringStatus);
 
-        if (!_mainForm.Visible)
-        {
-            _mainForm.Show();
-        }
-
-        if (_mainForm.WindowState == FormWindowState.Minimized)
-        {
-            _mainForm.WindowState = FormWindowState.Normal;
-        }
-
-        _mainForm.BringToFront();
-        _mainForm.Activate();
+        _mainForm.ShowFromTrayAnimated();
     }
 
     private async Task attmp(DeletionDetectedEventArgs e)
