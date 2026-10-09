@@ -9,6 +9,8 @@ public sealed class RecoverySettings
     public Dictionary<string, VolumeJournalCursor> UsnCursors { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
 
+    private static readonly object SaveGate = new();
+
     private static readonly string SettingsPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "AlgoLassi",
@@ -39,16 +41,19 @@ public sealed class RecoverySettings
 
     public void Save()
     {
-        try
+        lock (SaveGate)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
-            var temp = SettingsPath + ".tmp";
-            File.WriteAllText(temp, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
-            File.Move(temp, SettingsPath, overwrite: true);
-        }
-        catch
-        {
-            // Settings are non-critical; monitoring should continue if persistence fails.
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+                var temp = SettingsPath + ".tmp";
+                File.WriteAllText(temp, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+                File.Move(temp, SettingsPath, overwrite: true);
+            }
+            catch
+            {
+                // Settings are non-critical; monitoring should continue if persistence fails.
+            }
         }
     }
 }
