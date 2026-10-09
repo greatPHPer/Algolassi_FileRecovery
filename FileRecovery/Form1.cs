@@ -319,7 +319,18 @@ public partial class Form1 : Form
             "Ignore directory",
             null,
             (_, _) => IgnoreDirectoryFromBreadcrumb(segment.DirectoryPath));
-        menu.Closed += (_, _) => menu.Dispose();
+
+        // WinForms may continue processing the click/close sequence after Closed fires.
+        // Disposing synchronously here can make that same sequence access a disposed
+        // ContextMenuStrip and throw ObjectDisposedException. Dispose on the next UI turn.
+        menu.Closed += (_, _) =>
+        {
+            if (!lstDirectories.IsDisposed && lstDirectories.IsHandleCreated)
+            {
+                lstDirectories.BeginInvoke(new Action(menu.Dispose));
+            }
+        };
+
         menu.Show(lstDirectories, e.Location);
     }
 
