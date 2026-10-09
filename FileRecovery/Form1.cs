@@ -1145,22 +1145,8 @@ public partial class Form1 : Form
 
         var includeSubdirectories = chkScanSubdirectories.Checked;
 
-        var answer = MessageBox.Show(
-            this,
-            $"Scan deleted NTFS metadata under:\r\n\r\n{scanDirectory}\r\n\r\n" +
-            (includeSubdirectories
-                ? "Include all subdirectories."
-                : "Scan this directory only, not its subdirectories.") +
-            "\r\n\r\nThis reads filesystem metadata only and does not write to the source volume.",
-            "NTFS Deleted-File Scan",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Question);
-
-        if (answer != DialogResult.Yes)
-        {
-            return;
-        }
-
+        // This operation reads NTFS metadata only. Start immediately from the
+        // button click instead of requiring a separate Yes/No confirmation click.
         SetBusy(
             true,
             $"Scanning deleted NTFS metadata under {scanDirectory}...");
@@ -3666,6 +3652,25 @@ public partial class Form1 : Form
                         ".txt",
                         StringComparison.OrdinalIgnoreCase))
                 {
+                    // The raw-volume recovery service requires a destination on a
+                    // different volume. Validate this before prompting for a marker
+                    // or beginning an expensive scan so the user can correct the path.
+                    var sourceVolumeRoot = GetSourceVolumeRoot(candidate.FullPath);
+                    var destinationVolumeRoot = GetSourceVolumeRoot(destinationDirectory);
+
+                    if (!string.IsNullOrWhiteSpace(sourceVolumeRoot) &&
+                        !string.IsNullOrWhiteSpace(destinationVolumeRoot) &&
+                        string.Equals(
+                            sourceVolumeRoot,
+                            destinationVolumeRoot,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        failures.Add(
+                            $"{candidate.Name}: choose a recovery destination on a different volume from the source. " +
+                            $"Source volume: {sourceVolumeRoot}; destination: {destinationDirectory}.");
+                        continue;
+                    }
+
                     var markerKey = NormalizePath(candidate.FullPath);
                     string? forensicMarker = null;
 
