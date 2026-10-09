@@ -153,6 +153,8 @@ public sealed class TrayApplicationContext : ApplicationContext
             "AlgoLassi monitors deletion events continuously while it is running in the Windows notification area (system tray).\r\n\r\n" +
             "Start AlgoLassi before deleting files and leave it running. You may close the Recovery Center window; " +
             "that only hides the window and monitoring continues in the tray.\r\n\r\n" +
+            "For proactive pre-delete copies, choose Manage pre-delete protected folders from this tray menu. " +
+            "Only selected folders are scanned and watched; the cache is bounded and protection is best-effort.\\r\\n\\r\\n" +
             "Choose Exit from the tray menu or end the process, and monitoring stops. This is continuous background " +
             "monitoring, not a full-volume recovery scan every second. Recovery depends on the evidence Windows still " +
             "retains and is not guaranteed.",
