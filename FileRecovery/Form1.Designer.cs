@@ -80,7 +80,7 @@ partial class Form1
         lblSubtitle.ForeColor = Color.DimGray;
         lblSubtitle.Location = new Point(27, 56);
         lblSubtitle.Size = new Size(730, 15);
-        lblSubtitle.Text = "Resident monitoring is active in the system tray. Select a recent deletion location to inspect recoverable items.";
+        lblSubtitle.Text = "Keep AlgoLassi running in the system tray BEFORE deleting files. Closing this window is safe; Exit stops monitoring.";
 
         lblDirectories.AutoSize = true;
         lblDirectories.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
