@@ -750,11 +750,6 @@ public sealed class UsnJournalMonitor : IDisposable
                 _settings.UsnCursors[volumeKey] = cursor;
                 _settings.Save();
 
-                if (!retryingRecentTail)
-                {
-                    _error87RecentTailRetryPending.TryRemove(volumeKey, out _);
-                }
-
                 var recoveryReason = cursorStillRetained
                     ? "Windows rejected a cursor still within the journal's reported retained range"
                     : "the cursor or journal generation was outside the current retained range";
