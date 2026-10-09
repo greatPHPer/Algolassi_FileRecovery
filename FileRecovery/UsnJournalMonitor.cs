@@ -1980,11 +1980,24 @@ public sealed class UsnJournalMonitor : IDisposable
         // FSCTL_ENUM_USN_DATA enumerates current MFT records. A file that has
         // already been deleted may therefore be absent even though its deletion
         // is present in the USN journal. For the live snapshot path, read the
-        // actual USN journal tail with FSCTL_READ_USN_JOURNAL instead.
-        const long recentUsnWindow = 1_000_000;
-        var lowUsn = Math.Max(
-            Math.Max(journal.FirstUsn, journal.LowestValidUsn),
-            journal.NextUsn - recentUsnWindow);
+        // actual USN journal using a cursor returned by a prior successful journal
+        // read. USNs are record sequence numbers, not byte offsets; subtracting
+        // an arbitrary recent-window size from NextUsn can land between records
+        // and cause FSCTL_READ_USN_JOURNAL to fail with ERROR_INVALID_PARAMETER.
+        const long maximumRecentBacklog = 1_000_000;
+        var lowUsn = journal.NextUsn;
+
+        if (_settings.UsnCursors.TryGetValue(volumeKey, out var savedCursor) &&
+            savedCursor.JournalId == journal.JournalId &&
+            savedCursor.NextUsn >= journal.FirstUsn &&
+            savedCursor.NextUsn >= journal.LowestValidUsn &&
+            savedCursor.NextUsn <= journal.NextUsn &&
+            journal.NextUsn - savedCursor.NextUsn <= maximumRecentBacklog)
+        {
+            // This is the exact continuation USN returned by FSCTL_READ_USN_JOURNAL,
+            // so it is a real journal cursor, not an estimated byte-range boundary.
+            lowUsn = savedCursor.NextUsn;
+        }
 
         var normalizedTarget = NormalizePath(fullPath);
         var targetFileName = Path.GetFileName(normalizedTarget);
