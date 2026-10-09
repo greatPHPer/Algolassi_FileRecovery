@@ -618,22 +618,67 @@ public sealed class PreDeleteSnapshotService : IDisposable
 
         CancellationTokenSource cancellation;
 
+        var storageBudgetSkip = false;
+
         lock (_gate)
         {
-            if (_disposed || !_started || !IsProtectedPathLocked(normalized))
+            if (_disposed || !_started || !_storageAvailable || !IsProtectedPathLocked(normalized))
             {
                 return;
             }
 
             _observedVersions[normalized] = version;
 
+            if (_entries.TryGetValue(normalized, out var existing) &&
+                existing.Length == version.Length &&
+                existing.LastWriteTimeUtcTicks == version.LastWriteTimeUtcTicks &&
+                CacheFileMatchesLength(existing))
+            {
+                return;
+            }
+
             if (_pending.TryGetValue(normalized, out var previous))
             {
                 previous.Cancel();
+                _pending.Remove(normalized);
             }
 
-            cancellation = new CancellationTokenSource();
-            _pending[normalized] = cancellation;
+            long durableBytes = GetDurableSnapshotBytes();
+            long otherCacheBytes = _entries
+                .Where(pair => !string.Equals(
+                    pair.Key,
+                    normalized,
+                    StringComparison.OrdinalIgnoreCase))
+                .Sum(pair => pair.Value.Length);
+
+            storageBudgetSkip =
+                durableBytes > MaximumStorageBytes ||
+                otherCacheBytes > MaximumStorageBytes - durableBytes ||
+                version.Length > MaximumStorageBytes - durableBytes - otherCacheBytes;
+
+            if (storageBudgetSkip)
+            {
+                if (_entries.TryGetValue(normalized, out existing))
+                {
+                    RemoveEntryLocked(normalized);
+                    SaveIndexLocked();
+                }
+
+                cancellation = null!;
+            }
+            else
+            {
+                cancellation = new CancellationTokenSource();
+                _pending[normalized] = cancellation;
+            }
+        }
+
+        if (storageBudgetSkip)
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"Pre-delete snapshot not queued for {normalized}: the configured total protected-storage " +
+                $"limit of {MaximumStorageBytes:N0} bytes is already in use.");
+            return;
         }
 
         _ = Task.Run(() => RunQueuedSnapshotAsync(normalized, cancellation));
