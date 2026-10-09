@@ -3067,28 +3067,9 @@ public partial class Form1 : Form
         var snapshot = candidate.NtfsDataSnapshot;
         if (snapshot is null ||
             !snapshot.IsComplete ||
-            string.IsNullOrWhiteSpace(snapshot.DataFileName))
+            (string.IsNullOrWhiteSpace(snapshot.DataFileName) &&
+             string.IsNullOrWhiteSpace(snapshot.DataFilePath)))
         {
-            return false;
-        }
-
-        var store = new NtfsDeletionSnapshotStore();
-
-        if (!store.TryLoad(snapshot.DataFileName, out var data))
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"NTFS deletion snapshot recovery: snapshot file is unavailable. " +
-                $"path={candidate.FullPath}, file={snapshot.DataFileName}.");
-            return false;
-        }
-
-        if (data.LongLength != snapshot.FileSizeBytes ||
-            data.LongLength != snapshot.CapturedByteCount)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"NTFS deletion snapshot recovery: size mismatch. " +
-                $"path={candidate.FullPath}, expected={snapshot.FileSizeBytes:N0}, " +
-                $"captured={snapshot.CapturedByteCount:N0}, actual={data.LongLength:N0}.");
             return false;
         }
 
@@ -3103,23 +3084,6 @@ public partial class Form1 : Form
             return false;
         }
 
-        if (!string.IsNullOrWhiteSpace(snapshot.Sha256))
-        {
-            var actualHash = Convert.ToHexString(
-                System.Security.Cryptography.SHA256.HashData(data));
-
-            if (!string.Equals(
-                    actualHash,
-                    snapshot.Sha256,
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                System.Diagnostics.Debug.WriteLine(
-                    $"NTFS deletion snapshot recovery: hash mismatch. " +
-                    $"path={candidate.FullPath}, expected={snapshot.Sha256}, actual={actualHash}.");
-                return false;
-            }
-        }
-
         RecoveryDestinationPolicy.Validate(
             candidate.FullPath,
             destinationDirectory);
@@ -3129,25 +3093,23 @@ public partial class Form1 : Form
                 destinationDirectory,
                 candidate.Name);
 
-        try
+        // Stream snapshots through a fixed-size buffer: recovery of multi-gigabyte
+        // files must not allocate one byte[] the size of the entire file. The helper
+        // verifies the final length and SHA-256 before publishing the output file.
+        var store = new NtfsDeletionSnapshotStore();
+        if (!store.TryCopyVerifiedToFile(
+                snapshot.DataFileName,
+                snapshot.DataFilePath,
+                destinationPath,
+                snapshot.FileSizeBytes,
+                snapshot.CapturedByteCount,
+                snapshot.Sha256))
         {
-            File.WriteAllBytes(destinationPath, data);
-        }
-        catch
-        {
-            try
-            {
-                if (File.Exists(destinationPath))
-                {
-                    File.Delete(destinationPath);
-                }
-            }
-            catch
-            {
-                // Preserve the original write failure.
-            }
-
-            throw;
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS deletion snapshot recovery failed streaming verification: " +
+                $"path={candidate.FullPath}, expectedBytes={snapshot.FileSizeBytes:N0}, " +
+                $"snapshotFile={snapshot.DataFilePath ?? snapshot.DataFileName ?? "(none)"}.");
+            return false;
         }
 
         result = new RecoveryResult
@@ -3155,15 +3117,15 @@ public partial class Form1 : Form
             Success = true,
             SourcePath = candidate.FullPath,
             DestinationPath = destinationPath,
-            BytesRecovered = data.LongLength,
+            BytesRecovered = snapshot.FileSizeBytes,
             Evidence =
-                $"Recovered {data.LongLength:N0} byte(s) from an NTFS $DATA snapshot " +
-                "captured immediately when the deletion was observed by the USN monitor."
+                $"Recovered {snapshot.FileSizeBytes:N0} byte(s) from a stored NTFS/pre-delete snapshot " +
+                "using streaming copy with length and SHA-256 verification."
         };
 
         System.Diagnostics.Debug.WriteLine(
             $"NTFS deletion snapshot recovery succeeded: path={candidate.FullPath}, " +
-            $"bytes={data.LongLength:N0}, destination={destinationPath}.");
+            $"bytes={snapshot.FileSizeBytes:N0}, destination={destinationPath}.");
 
         return true;
     }
