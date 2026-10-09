@@ -673,8 +673,8 @@ public partial class Form1 : Form
                 var slantOffset = Math.Min(slant, visibleWidth / 3);
                 var chipPoints = new[]
                 {
-                    // Both side edges are parallel. The right edge slopes "":
-                    // top-right to bottom-right moves down and left.
+                    // Both side edges are parallel. The right edge slopes
+                    // from the upper-right down toward the lower-left.
                     new Point(x + slantOffset, buttonY),
                     new Point(x + visibleWidth, buttonY),
                     new Point(x + visibleWidth - slantOffset, buttonY + buttonHeight),
