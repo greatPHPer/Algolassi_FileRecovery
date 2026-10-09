@@ -603,7 +603,15 @@ public partial class Form1 : Form
         }
 
         var destinationDirectory = dialog.SelectedPath;
+        var completionStatus =
+            "Targeted historical recovery ended without recovering the target.";
         SetBusy(true, $"Recovering {candidate.Name} directly from historical NTFS $LogFile...");
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS targeted historical recovery started: path={candidate.FullPath}, " +
+            $"fileRef={candidate.FileReferenceNumber}, " +
+            $"parentRef={candidate.ParentFileReferenceNumber}, " +
+            $"expectedSize={candidate.FileSizeBytes:N0}, destination={destinationDirectory}.");
 
         try
         {
@@ -630,6 +638,13 @@ public partial class Form1 : Form
 
             if (recovered is not null)
             {
+                completionStatus =
+                    $"Targeted historical recovery succeeded from $LogFile: {recovered.BytesRecovered:N0} byte(s).";
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS targeted historical recovery completed: path={candidate.FullPath}, " +
+                    $"stage=historical-logfile, result=success, bytes={recovered.BytesRecovered:N0}, " +
+                    $"destination={recovered.DestinationPath}.");
+
                 MessageBox.Show(
                     this,
                     $"Recovered {recovered.BytesRecovered:N0} byte(s) to:{Environment.NewLine}{recovered.DestinationPath}{Environment.NewLine}{Environment.NewLine}" +
@@ -640,18 +655,40 @@ public partial class Form1 : Form
                 return;
             }
 
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS targeted historical recovery: $LogFile reconstruction MISS; " +
+                $"historical mapping-pair search finished without reconstructing target; " +
+                $"path={candidate.FullPath}, fileRef={candidate.FileReferenceNumber}, " +
+                $"expectedSize={candidate.FileSizeBytes:N0}; entering optional marker diagnostic.");
+
             var marker = Microsoft.VisualBasic.Interaction.InputBox(
                 $"The targeted historical $LogFile reconstruction did not recover '{candidate.Name}'.\r\n\r\n" +
-                "Enter a distinctive marker from the deleted text file to test the retained $LogFile and, only if necessary, the raw volume.",
-                "Targeted Historical Recovery — Marker Fallback",
+                "The historical mapping-pair search for this target has finished without reconstructing the file.\r\n\r\n" +
+                "Optional diagnostic only: enter an exact, distinctive text string from a deleted TEXT file on the same volume. " +
+                "This checks whether that text marker remains in $LogFile and, if you approve, in raw-volume bytes; " +
+                "it does NOT reconstruct this JPG.\r\n\r\n" +
+                "Click OK with an empty box, or Cancel, to end this targeted recovery operation now.",
+                "Targeted Historical Recovery — Optional Marker Diagnostic",
                 "");
 
             if (string.IsNullOrWhiteSpace(marker))
             {
+                completionStatus =
+                    "Targeted recovery ended: $LogFile reconstruction missed; marker and raw-volume marker checks skipped.";
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS targeted historical recovery ended: path={candidate.FullPath}, " +
+                    $"fileRef={candidate.FileReferenceNumber}, result=miss, " +
+                    $"historicalMappingPairSearch=completed-no-reconstruction, " +
+                    $"markerFallback=skipped, rawVolumeMarkerScan=skipped, " +
+                    $"reason=empty-or-cancelled-marker; no further JPG reconstruction was scheduled.");
+
                 MessageBox.Show(
                     this,
-                    "Targeted $LogFile recovery did not produce a file. Marker fallback was skipped.",
-                    "Targeted Historical NTFS Recovery",
+                    "The targeted $LogFile reconstruction has finished and did not recover the target. " +
+                    "Its historical mapping-pair search is complete.\r\n\r\n" +
+                    "No marker was supplied, so the optional marker diagnostics were skipped. " +
+                    "This ends this targeted recovery operation; it does not continue into another JPG reconstruction pass.",
+                    "Targeted Historical NTFS Recovery Ended",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
                 return;
@@ -670,6 +707,13 @@ public partial class Form1 : Form
                     marker,
                     out var logMarkerEvidence))
             {
+                completionStatus =
+                    "Targeted JPG reconstruction missed; marker found in retained $LogFile; raw-volume marker scan skipped.";
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS targeted marker diagnostic completed: path={candidate.FullPath}, " +
+                    $"stage=historical-logfile-marker, markerFound=true, " +
+                    $"targetFileRecovered=false, rawVolumeMarkerScan=skipped, evidence={logMarkerEvidence}");
+
                 MessageBox.Show(
                     this,
                     "The marker was found in the retained NTFS $LogFile, but targeted reconstruction still did not produce the complete file.\r\n\r\n" +
@@ -680,10 +724,15 @@ public partial class Form1 : Form
                 return;
             }
 
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS targeted marker diagnostic: path={candidate.FullPath}, " +
+                $"stage=historical-logfile-marker, markerFound=false; asking whether to run raw-volume marker-only scan.");
+
             var proceed = MessageBox.Show(
                 this,
                 "The marker was not found in the retained NTFS $LogFile.\r\n\r\n" +
-                "A raw-volume marker scan would read the entire source volume.",
+                "A raw-volume marker scan would read the entire source volume. This checks only for the supplied text marker; " +
+                "it does not reconstruct the JPG.",
                 "Targeted Historical Recovery",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question,
@@ -691,6 +740,11 @@ public partial class Form1 : Form
 
             if (proceed != DialogResult.Yes)
             {
+                completionStatus =
+                    "Targeted JPG reconstruction missed; raw-volume marker-only scan declined.";
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS targeted marker diagnostic ended: path={candidate.FullPath}, " +
+                    $"stage=raw-volume-marker, result=skipped-by-user, targetFileRecovered=false.");
                 return;
             }
 
@@ -705,12 +759,26 @@ public partial class Form1 : Form
                         $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
                 });
 
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS targeted marker diagnostic started: path={candidate.FullPath}, " +
+                $"stage=raw-volume-marker-only, markerLength={marker.Length}, " +
+                $"volume={root}; this scan does not reconstruct the target file.");
+
             var forensicResult =
                 _ntfsWholeVolumeTextRecoveryService.FindMarkerOnVolume(
                     candidate.FullPath,
                     marker,
                     CancellationToken.None,
                     forensicProgress);
+
+            completionStatus = forensicResult.Found
+                ? "Targeted JPG reconstruction missed; marker found on raw volume; JPG not reconstructed."
+                : "Targeted JPG reconstruction missed; marker not found on raw volume.";
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS targeted marker diagnostic completed: path={candidate.FullPath}, " +
+                $"stage=raw-volume-marker-only, markerFound={forensicResult.Found}, " +
+                $"scannedBytes={forensicResult.ScannedBytes:N0}, targetFileRecovered=false.");
 
             MessageBox.Show(
                 this,
@@ -727,6 +795,12 @@ public partial class Form1 : Form
         }
         catch (Exception ex)
         {
+            completionStatus = $"Targeted historical recovery failed: {ex.GetType().Name}.";
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS targeted historical recovery failed: path={candidate.FullPath}, " +
+                $"fileRef={candidate.FileReferenceNumber}, " +
+                $"exception={ex.GetType().Name}: {ex.Message}");
+
             MessageBox.Show(
                 this,
                 $"{ex.GetType().Name}: {ex.Message}",
@@ -736,8 +810,11 @@ public partial class Form1 : Form
         }
         finally
         {
-            SetBusy(false);
+            SetBusy(false, completionStatus);
             UpdateRecoverButton();
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS targeted historical recovery status finalized: path={candidate.FullPath}, " +
+                $"status={completionStatus}");
         }
     }
 
