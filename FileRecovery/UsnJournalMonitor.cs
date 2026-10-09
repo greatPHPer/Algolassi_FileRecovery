@@ -669,6 +669,20 @@ public sealed class UsnJournalMonitor : IDisposable
                     ? record.FileName
                     : Path.Combine(cachedDirectory, record.FileName);
 
+                // If the parent path is already cached, apply exclusions before touching
+                // the deleted file's MFT generation or $LogFile. This is especially
+                // important for AlgoLassi's own atomically replaced history/settings files:
+                // those USN delete records must not trigger expensive snapshot attempts.
+                if (!string.IsNullOrWhiteSpace(cachedDirectory) &&
+                    RecoveryMonitoringExclusions.IsExcludedPath(initialPath))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"USN monitor skipped excluded path before snapshot capture: " +
+                        $"path={initialPath}, fileRef={record.FileReferenceNumber}, " +
+                        $"parentRef={record.ParentFileReferenceNumber}.");
+                    continue;
+                }
+
                 var deletion = new DeletionRecord
                 {
                     FileReferenceNumber = record.FileReferenceNumber,
