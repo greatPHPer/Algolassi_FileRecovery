@@ -42,12 +42,11 @@ public sealed class NtfsDeepFileRecoveryService
         RecoveryDestinationPolicy.Validate(candidate.FullPath, destinationDirectory);
 
         var extension = Path.GetExtension(candidate.Name);
-        if (!SupportsExtension(extension))
-        {
-            throw new InvalidOperationException(
-                $"Deep file carving does not have a safe structural carver for '{extension}'. " +
-                "This recovery path requires a file type with a recognizable, self-delimiting format.");
-        }
+
+        // Do not reject an unfamiliar suffix here. TryCarve validates known
+        // formats from their byte signatures, then permits a conservative,
+        // exact-length text fallback for small files with a known original size.
+        // Unsupported binary formats (including RAR) still need a dedicated parser.
 
         WindowsPrivilege.EnableSeBackupPrivilege();
 
