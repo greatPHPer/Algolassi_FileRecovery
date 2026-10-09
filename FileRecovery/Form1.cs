@@ -26,9 +26,212 @@ public partial class Form1 : Form
     private bool _operationInProgress;
     private bool _ntfsResultsDisplayed;
     private bool _ntfsScanInProgress;
+    private System.Windows.Forms.Timer? _entranceAnimationTimer;
+
+    private void ApplyHighTechTheme()
+    {
+        var canvas = Color.FromArgb(10, 17, 30);
+        var panel = Color.FromArgb(15, 27, 44);
+        var elevatedPanel = Color.FromArgb(22, 37, 57);
+        var border = Color.FromArgb(43, 62, 83);
+        var foreground = Color.FromArgb(224, 236, 248);
+        var muted = Color.FromArgb(154, 174, 196);
+        var accent = Color.FromArgb(61, 218, 211);
+        var selection = Color.FromArgb(24, 82, 100);
+
+        BackColor = canvas;
+        ForeColor = foreground;
+        Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
+
+        lblTitle.ForeColor = accent;
+        lblSubtitle.ForeColor = muted;
+        lblDirectories.ForeColor = foreground;
+        lblFiles.ForeColor = foreground;
+        lblStatus.ForeColor = muted;
+
+        lstDirectories.BackColor = panel;
+        lstDirectories.ForeColor = foreground;
+        lstDirectories.BorderStyle = BorderStyle.FixedSingle;
+        lstDirectories.DrawMode = DrawMode.OwnerDrawFixed;
+
+        txtScanPath.BackColor = panel;
+        txtScanPath.ForeColor = foreground;
+        txtScanPath.BorderStyle = BorderStyle.FixedSingle;
+
+        chkScanSubdirectories.BackColor = canvas;
+        chkScanSubdirectories.ForeColor = foreground;
+
+        StyleHighTechButton(btnScanDirectory, border, elevatedPanel, accent, primary: false);
+        StyleHighTechButton(btnShowHistory, border, elevatedPanel, accent, primary: false);
+        StyleHighTechButton(btnClearHistory, border, elevatedPanel, accent, primary: false);
+        StyleHighTechButton(btnBrowseScanPath, border, elevatedPanel, accent, primary: false);
+        StyleHighTechButton(btnManageIgnoredDirectories, border, elevatedPanel, accent, primary: false);
+        StyleHighTechButton(btnScanNtfs, border, elevatedPanel, accent, primary: true);
+        StyleHighTechButton(btnSkipRecycleBin, border, elevatedPanel, accent, primary: false);
+        StyleHighTechButton(btnRecover, border, elevatedPanel, accent, primary: true);
+
+        dgvResults.BackgroundColor = panel;
+        dgvResults.GridColor = border;
+        dgvResults.BorderStyle = BorderStyle.FixedSingle;
+        dgvResults.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
+        dgvResults.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single;
+        dgvResults.EnableHeadersVisualStyles = false;
+        dgvResults.ColumnHeadersHeight = 36;
+        dgvResults.RowTemplate.Height = 31;
+
+        dgvResults.ColumnHeadersDefaultCellStyle.BackColor = elevatedPanel;
+        dgvResults.ColumnHeadersDefaultCellStyle.ForeColor = accent;
+        dgvResults.ColumnHeadersDefaultCellStyle.SelectionBackColor = elevatedPanel;
+        dgvResults.ColumnHeadersDefaultCellStyle.SelectionForeColor = accent;
+        dgvResults.ColumnHeadersDefaultCellStyle.Padding = new Padding(8, 4, 8, 4);
+
+        dgvResults.DefaultCellStyle.BackColor = panel;
+        dgvResults.DefaultCellStyle.ForeColor = foreground;
+        dgvResults.DefaultCellStyle.SelectionBackColor = selection;
+        dgvResults.DefaultCellStyle.SelectionForeColor = Color.White;
+        dgvResults.DefaultCellStyle.Padding = new Padding(8, 4, 8, 4);
+
+        dgvResults.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(18, 32, 51);
+        dgvResults.AlternatingRowsDefaultCellStyle.ForeColor = foreground;
+        dgvResults.AlternatingRowsDefaultCellStyle.SelectionBackColor = selection;
+        dgvResults.AlternatingRowsDefaultCellStyle.SelectionForeColor = Color.White;
+        dgvResults.RowHeadersDefaultCellStyle.BackColor = elevatedPanel;
+        dgvResults.RowHeadersDefaultCellStyle.ForeColor = foreground;
+    }
+
+    private static void StyleHighTechButton(
+        Button button,
+        Color border,
+        Color elevatedPanel,
+        Color accent,
+        bool primary)
+    {
+        button.FlatStyle = FlatStyle.Flat;
+        button.FlatAppearance.BorderSize = 1;
+        button.FlatAppearance.BorderColor = primary ? accent : border;
+        button.FlatAppearance.MouseOverBackColor = primary
+            ? Color.FromArgb(26, 139, 151)
+            : Color.FromArgb(31, 51, 74);
+        button.FlatAppearance.MouseDownBackColor = Color.FromArgb(27, 99, 112);
+        button.BackColor = primary
+            ? Color.FromArgb(17, 101, 119)
+            : elevatedPanel;
+        button.ForeColor = Color.FromArgb(230, 241, 251);
+        button.Cursor = Cursors.Hand;
+        button.UseVisualStyleBackColor = false;
+    }
+
+    public void ShowFromTrayAnimated()
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        var workArea = Screen.FromPoint(Cursor.Position).WorkingArea;
+        const int margin = 18;
+        var target = new Point(
+            Math.Max(workArea.Left + margin, workArea.Right - Width - margin),
+            Math.Max(workArea.Top + margin, workArea.Bottom - Height - margin));
+
+        StartPosition = FormStartPosition.Manual;
+
+        if (Visible && WindowState != FormWindowState.Minimized)
+        {
+            StopEntranceAnimation();
+            Location = target;
+            BringToFront();
+            Activate();
+            return;
+        }
+
+        StopEntranceAnimation();
+        var start = new Point(target.X + 28, target.Y + 18);
+
+        Opacity = 0;
+        WindowState = FormWindowState.Normal;
+        Location = start;
+
+        if (!Visible)
+        {
+            Show();
+        }
+
+        BringToFront();
+        Activate();
+        StartEntranceAnimation(start, target);
+    }
+
+    private void StartEntranceAnimation(Point start, Point target)
+    {
+        StopEntranceAnimation();
+        Location = start;
+        Opacity = 0;
+
+        var startedAtUtc = DateTime.UtcNow;
+        var timer = new System.Windows.Forms.Timer { Interval = 15 };
+        _entranceAnimationTimer = timer;
+
+        timer.Tick += (_, _) =>
+        {
+            if (IsDisposed || Disposing)
+            {
+                timer.Stop();
+                timer.Dispose();
+                if (ReferenceEquals(_entranceAnimationTimer, timer))
+                {
+                    _entranceAnimationTimer = null;
+                }
+
+                return;
+            }
+
+            var progress = Math.Clamp(
+                (DateTime.UtcNow - startedAtUtc).TotalMilliseconds / 220d,
+                0d,
+                1d);
+            var eased = 1d - Math.Pow(1d - progress, 3d);
+
+            Location = new Point(
+                start.X + (int)Math.Round((target.X - start.X) * eased),
+                start.Y + (int)Math.Round((target.Y - start.Y) * eased));
+            Opacity = eased;
+
+            if (progress >= 1d)
+            {
+                timer.Stop();
+                timer.Dispose();
+                if (ReferenceEquals(_entranceAnimationTimer, timer))
+                {
+                    _entranceAnimationTimer = null;
+                }
+
+                Location = target;
+                Opacity = 1d;
+            }
+        };
+
+        timer.Start();
+    }
+
+    private void StopEntranceAnimation()
+    {
+        if (_entranceAnimationTimer is not null)
+        {
+            _entranceAnimationTimer.Stop();
+            _entranceAnimationTimer.Dispose();
+            _entranceAnimationTimer = null;
+        }
+
+        if (!IsDisposed)
+        {
+            Opacity = 1d;
+        }
+    }
 
     public void CloseFromApplication()
     {
+        StopEntranceAnimation();
         _allowClose = true;
         Close();
     }
@@ -43,6 +246,7 @@ public partial class Form1 : Form
         _usnMonitor = usnMonitor;
 
         InitializeComponent();
+        ApplyHighTechTheme();
         _history.Changed += History_Changed;
     }
 
@@ -205,86 +409,146 @@ public partial class Form1 : Form
             return;
         }
 
-        e.DrawBackground();
-
-        var itemText = lstDirectories.Items[e.Index]?.ToString() ?? string.Empty;
-        if (string.Equals(itemText, "All recent deletions", StringComparison.OrdinalIgnoreCase))
+        var state = e.Graphics.Save();
+        try
         {
-            TextRenderer.DrawText(
-                e.Graphics,
-                itemText,
-                e.Font,
-                e.Bounds,
-                (e.State & DrawItemState.Selected) != 0
-                    ? SystemColors.HighlightText
-                    : lstDirectories.ForeColor,
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-            e.DrawFocusRectangle();
-            return;
-        }
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 
-        var segments = BuildDirectoryPathSegments(itemText);
-        var x = e.Bounds.Left + 4;
-        var buttonY = e.Bounds.Top + Math.Max(2, (e.Bounds.Height - 23) / 2);
+            var itemText = lstDirectories.Items[e.Index]?.ToString() ?? string.Empty;
+            var selected = (e.State & DrawItemState.Selected) != 0;
+            var rowColor = selected
+                ? Color.FromArgb(18, 43, 62)
+                : e.Index % 2 == 0
+                    ? Color.FromArgb(12, 23, 39)
+                    : Color.FromArgb(14, 26, 43);
 
-        foreach (var segment in segments)
-        {
-            var desiredWidth = GetDirectorySegmentButtonWidth(segment.Label, e.Font);
-            if (x >= e.Bounds.Right - 2)
+            using (var rowBrush = new SolidBrush(rowColor))
             {
-                break;
+                e.Graphics.FillRectangle(rowBrush, e.Bounds);
             }
 
-            var visibleWidth = Math.Min(desiredWidth, e.Bounds.Right - x - 2);
-            if (visibleWidth <= 0)
+            if (string.Equals(itemText, "All recent deletions", StringComparison.OrdinalIgnoreCase))
             {
-                break;
+                using (var accentBrush = new SolidBrush(Color.FromArgb(61, 218, 211)))
+                {
+                    e.Graphics.FillEllipse(
+                        accentBrush,
+                        e.Bounds.Left + 10,
+                        e.Bounds.Top + (e.Bounds.Height - 6) / 2,
+                        6,
+                        6);
+                }
+
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    itemText,
+                    e.Font,
+                    Rectangle.Inflate(e.Bounds, -27, 0),
+                    selected ? Color.White : Color.FromArgb(194, 213, 231),
+                    TextFormatFlags.Left |
+                    TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.NoPrefix |
+                    TextFormatFlags.NoPadding);
+
+                if ((e.State & DrawItemState.Focus) != 0)
+                {
+                    e.DrawFocusRectangle();
+                }
+
+                return;
             }
 
-            var buttonBounds = new Rectangle(x, buttonY, visibleWidth, 23);
-            using (var background = new SolidBrush(SystemColors.Control))
-            using (var border = new Pen(SystemColors.ControlDark))
-            {
-                e.Graphics.FillRectangle(background, buttonBounds);
-                e.Graphics.DrawRectangle(border, buttonBounds);
-            }
+            var segments = BuildDirectoryPathSegments(itemText);
+            const int breadcrumbGap = 8;
+            const int slant = 7;
+            const int horizontalPadding = 8;
+            var x = e.Bounds.Left + horizontalPadding;
+            var buttonY = e.Bounds.Top + 4;
+            var buttonHeight = Math.Max(18, e.Bounds.Height - 8);
 
-            if (visibleWidth > 12)
+            for (var i = 0; i < segments.Count; i++)
             {
-                var textBounds = Rectangle.Inflate(buttonBounds, -6, 0);
+                var segment = segments[i];
+                if (x >= e.Bounds.Right - 4)
+                {
+                    break;
+                }
+
+                var desiredWidth = GetDirectorySegmentButtonWidth(segment.Label, e.Font);
+                var visibleWidth = Math.Min(desiredWidth, e.Bounds.Right - x - 4);
+                if (visibleWidth < 18)
+                {
+                    break;
+                }
+
+                var isLast = i == segments.Count - 1;
+                var chipFill = isLast
+                    ? selected
+                        ? Color.FromArgb(21, 106, 119)
+                        : Color.FromArgb(24, 57, 76)
+                    : selected
+                        ? Color.FromArgb(24, 53, 73)
+                        : Color.FromArgb(22, 36, 54);
+                var chipBorder = isLast
+                    ? Color.FromArgb(61, 190, 194)
+                    : Color.FromArgb(48, 70, 93);
+                var chipText = isLast
+                    ? Color.FromArgb(245, 253, 255)
+                    : Color.FromArgb(190, 209, 228);
+
+                var chipPoints = new[]
+                {
+                    new Point(x, buttonY),
+                    new Point(x + visibleWidth, buttonY),
+                    new Point(x + visibleWidth - Math.Min(slant, visibleWidth / 3), buttonY + buttonHeight),
+                    new Point(x + Math.Min(slant, visibleWidth / 3), buttonY + buttonHeight)
+                };
+
+                using (var chipBrush = new SolidBrush(chipFill))
+                using (var chipPen = new Pen(chipBorder, 1f))
+                {
+                    e.Graphics.FillPolygon(chipBrush, chipPoints);
+                    e.Graphics.DrawPolygon(chipPen, chipPoints);
+                }
+
+                var textBounds = new Rectangle(
+                    x + 6,
+                    buttonY,
+                    Math.Max(1, visibleWidth - 12),
+                    buttonHeight);
                 TextRenderer.DrawText(
                     e.Graphics,
                     segment.Label,
                     e.Font,
                     textBounds,
-                    SystemColors.ControlText,
+                    chipText,
                     TextFormatFlags.HorizontalCenter |
                     TextFormatFlags.VerticalCenter |
                     TextFormatFlags.NoPrefix |
                     TextFormatFlags.EndEllipsis |
                     TextFormatFlags.NoPadding);
+
+                if (visibleWidth < desiredWidth)
+                {
+                    break;
+                }
+
+                x += desiredWidth;
+                if (!isLast)
+                {
+                    x += breadcrumbGap;
+                }
             }
 
-            x += desiredWidth;
-            if (segment != segments[^1])
+            if ((e.State & DrawItemState.Focus) != 0)
             {
-                var slashBounds = new Rectangle(x, e.Bounds.Top, 14, e.Bounds.Height);
-                TextRenderer.DrawText(
-                    e.Graphics,
-                    "/",
-                    e.Font,
-                    slashBounds,
-                    (e.State & DrawItemState.Selected) != 0
-                        ? SystemColors.HighlightText
-                        : lstDirectories.ForeColor,
-                    TextFormatFlags.HorizontalCenter |
-                    TextFormatFlags.VerticalCenter |
-                    TextFormatFlags.NoPrefix);
-                x += 14;
+                e.DrawFocusRectangle();
             }
         }
-
-        e.DrawFocusRectangle();
+        finally
+        {
+            e.Graphics.Restore(state);
+        }
     }
 
     private void lstDirectories_MouseDown(object? sender, MouseEventArgs e)
@@ -337,18 +601,24 @@ public partial class Form1 : Form
 
     private DirectoryPathSegment? FindDirectorySegmentAtX(string path, int mouseX)
     {
-        var x = lstDirectories.ClientRectangle.Left + 4;
+        const int breadcrumbGap = 8;
+        var x = lstDirectories.ClientRectangle.Left + 8;
         var segments = BuildDirectoryPathSegments(path);
 
-        foreach (var segment in segments)
+        for (var i = 0; i < segments.Count; i++)
         {
+            var segment = segments[i];
             var width = GetDirectorySegmentButtonWidth(segment.Label, lstDirectories.Font);
             if (mouseX >= x && mouseX < x + width)
             {
                 return segment;
             }
 
-            x += width + 14;
+            x += width;
+            if (i < segments.Count - 1)
+            {
+                x += breadcrumbGap;
+            }
         }
 
         return null;
@@ -391,7 +661,7 @@ public partial class Form1 : Form
             new Size(1000, 30),
             TextFormatFlags.NoPadding).Width;
 
-        return Math.Max(30, textWidth + 14);
+        return Math.Max(38, textWidth + 20);
     }
 
     private void IgnoreDirectoryFromBreadcrumb(string directoryPath)
@@ -4293,6 +4563,8 @@ public partial class Form1 : Form
 
     private void Form1_FormClosing(object? sender, FormClosingEventArgs e)
     {
+        StopEntranceAnimation();
+
         if (_allowClose)
         {
             return;
