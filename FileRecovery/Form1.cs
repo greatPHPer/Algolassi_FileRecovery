@@ -2976,6 +2976,13 @@ public partial class Form1 : Form
 
         foreach (var candidate in candidates)
         {
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS recovery candidate start: path={candidate.FullPath}, " +
+                $"fileRef={candidate.FileReferenceNumber}, parentRef={candidate.ParentFileReferenceNumber}, " +
+                $"deletedAt={candidate.LastUsnTimestampUtc:O}, size={candidate.FileSizeBytes:N0}, " +
+                $"dataFound={candidate.DataStreamFound}, resident={candidate.DataStreamResident}, " +
+                $"extents={candidate.DataExtents.Count:N0}, dataEvidence={candidate.DataEvidence}");
+
             try
             {
                 var vssEvidence = string.Empty;
@@ -3009,10 +3016,16 @@ public partial class Form1 : Form
                 // a freshly deleted file. It was captured before later MFT generation reuse or
                 // cluster reuse could change the bytes, so Recovery Center must consume it before
                 // attempting any reconstructive source such as $LogFile.
-                if (TryRecoverFromNtfsSnapshot(
-                        candidate,
-                        destinationDirectory,
-                        out var snapshotRecovery))
+                var snapshotRecovered = TryRecoverFromNtfsSnapshot(
+                    candidate,
+                    destinationDirectory,
+                    out var snapshotRecovery);
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS recovery path checkpoint: stage=delete-time-snapshot, " +
+                    $"path={candidate.FullPath}, recovered={snapshotRecovered}.");
+
+                if (snapshotRecovered)
                 {
                     successes.Add(snapshotRecovery);
                     continue;
@@ -3038,6 +3051,16 @@ public partial class Form1 : Form
                         candidate.FullPath,
                         candidate.LastUsnTimestampUtc,
                         out directDataStream);
+
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS recovery path checkpoint: stage=direct-mft, " +
+                        $"path={candidate.FullPath}, fileRef={candidate.FileReferenceNumber}, " +
+                        $"parentRef={candidate.ParentFileReferenceNumber}, " +
+                        $"found={directDataFound && directDataStream.Found}, " +
+                        $"resident={directDataStream.IsResident}, " +
+                        $"size={directDataStream.FileSizeBytes:N0}, " +
+                        $"extents={directDataStream.Extents.Count:N0}, " +
+                        $"evidence={directDataStream.Evidence}");
 
                     if (directDataFound &&
                         directDataStream.Found)
@@ -3124,6 +3147,10 @@ public partial class Form1 : Form
                             },
                             CancellationToken.None)
                             .ConfigureAwait(true);
+
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS recovery path checkpoint: stage=historical-logfile, " +
+                        $"path={candidate.FullPath}, recovered={historicalLogResult.Recovered}.");
 
                     if (historicalLogResult.Recovered)
                     {
@@ -3532,6 +3559,14 @@ public partial class Form1 : Form
 
                 carveProgress.Report(0);
 
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS deep carve starting: path={candidate.FullPath}, " +
+                    $"fileRef={candidate.FileReferenceNumber}, " +
+                    $"parentRef={candidate.ParentFileReferenceNumber}, " +
+                    $"size={candidate.FileSizeBytes:N0}, " +
+                    $"dataFound={candidate.DataStreamFound}, " +
+                    $"dataEvidence={candidate.DataEvidence}");
+
                 var carved = _ntfsDeepFileRecoveryService.Recover(
                     candidate,
                     destinationDirectory,
@@ -3544,6 +3579,12 @@ public partial class Form1 : Form
             }
             catch (Exception ex)
             {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS RECOVERY FAILURE: path={candidate.FullPath}, " +
+                    $"fileRef={candidate.FileReferenceNumber}, " +
+                    $"parentRef={candidate.ParentFileReferenceNumber}, " +
+                    $"exception={ex.GetType().FullName}: {ex.Message}");
+
                 failures.Add($"{candidate.Name}: {ex.Message}");
             }
         }
