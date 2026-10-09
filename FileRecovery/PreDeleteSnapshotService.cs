@@ -12,9 +12,11 @@ namespace FileRecovery;
 /// </summary>
 public sealed class PreDeleteSnapshotService : IDisposable
 {
-    public const long MaximumFileBytes = 25L * 1024 * 1024;
-    public const long MaximumCacheBytes = 512L * 1024 * 1024;
-
+    private const long MinimumFileBytes = 1L * 1024L * 1024L;
+    private const long MaximumAllowedFileBytes = 1024L * 1024L * 1024L * 1024L;
+    private const long MinimumCacheBytes = 1L * 1024L * 1024L;
+    private const long MaximumAllowedCacheBytes = 4096L * 1024L * 1024L * 1024L;
+    private const int CopyBufferSize = 1024 * 1024;
     private const int MaximumCacheEntries = 3000;
     private const int MaximumInitialScanFiles = 20000;
     private const int MaximumInitialSnapshots = 2000;
@@ -22,8 +24,16 @@ public sealed class PreDeleteSnapshotService : IDisposable
     private static readonly TimeSpan CacheRetention = TimeSpan.FromDays(7);
 
     private readonly RecoverySettings _settings;
-    private readonly string _cacheDirectory;
-    private readonly string _indexPath;
+    private string _storageRoot;
+    private string _cacheDirectory;
+    private string _indexPath;
+    private bool _storageAvailable;
+
+    private long MaximumFileBytes =>
+        Math.Clamp(_settings.PreDeleteMaxFileSizeBytes, MinimumFileBytes, MaximumAllowedFileBytes);
+
+    private long MaximumCacheBytes =>
+        Math.Clamp(_settings.PreDeleteCacheLimitBytes, MinimumCacheBytes, MaximumAllowedCacheBytes);
     private readonly object _gate = new();
     private readonly SemaphoreSlim _captureSlots = new(2, 2);
     private readonly Dictionary<string, PreDeleteSnapshotCacheEntry> _entries =
@@ -44,15 +54,22 @@ public sealed class PreDeleteSnapshotService : IDisposable
     public PreDeleteSnapshotService(RecoverySettings settings)
     {
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
-        _cacheDirectory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AlgoLassi",
-            "FileRecovery",
-            "PreDeleteCache");
+        _storageRoot = _settings.EffectivePreDeleteStorageDirectory;
+        _cacheDirectory = Path.Combine(_storageRoot, "PreDeleteCache");
         _indexPath = Path.Combine(_cacheDirectory, "index.json");
 
-        Directory.CreateDirectory(_cacheDirectory);
-        LoadIndex();
+        try
+        {
+            Directory.CreateDirectory(_cacheDirectory);
+            _storageAvailable = true;
+            LoadIndex();
+        }
+        catch (Exception ex)
+        {
+            _storageAvailable = false;
+            System.Diagnostics.Trace.WriteLine(
+                $"Pre-delete storage unavailable at {_storageRoot}: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     public void Start()
@@ -73,13 +90,78 @@ public sealed class PreDeleteSnapshotService : IDisposable
         ApplyProtectedDirectories(roots, persist: false);
     }
 
-    public void SetProtectedDirectories(IEnumerable<string> directories)
+    public void SetConfiguration(
+        IEnumerable<string> directories,
+        string storageDirectory,
+        long maximumFileBytes,
+        long cacheLimitBytes)
     {
         ArgumentNullException.ThrowIfNull(directories);
 
         var normalized = NormalizeProtectedDirectories(directories);
+        var normalizedStorage = Path.GetFullPath(storageDirectory.Trim());
+        var clampedMaxFileBytes = Math.Clamp(
+            maximumFileBytes,
+            MinimumFileBytes,
+            MaximumAllowedFileBytes);
+        var clampedCacheLimitBytes = Math.Clamp(
+            cacheLimitBytes,
+            MinimumCacheBytes,
+            MaximumAllowedCacheBytes);
+
+        Directory.CreateDirectory(normalizedStorage);
+        var probe = Path.Combine(
+            normalizedStorage,
+            $".algolassi-write-test-{Environment.ProcessId}-{Guid.NewGuid():N}.tmp");
+        using (new FileStream(probe, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1, FileOptions.DeleteOnClose))
+        {
+        }
+
         _settings.ProtectedDirectories = normalized.ToList();
+        _settings.PreDeleteStorageDirectory = normalizedStorage;
+        _settings.PreDeleteMaxFileSizeBytes = clampedMaxFileBytes;
+        _settings.PreDeleteCacheLimitBytes = clampedCacheLimitBytes;
         _settings.Save();
+
+        var storageChanged = !string.Equals(
+            normalizedStorage,
+            _storageRoot,
+            StringComparison.OrdinalIgnoreCase);
+
+        if (storageChanged)
+        {
+            // The durable snapshots have their own absolute DataFilePath and remain
+            // recoverable after a storage-location change. Old rolling-cache files
+            // are disposable; clean only entries this service previously recorded.
+            lock (_gate)
+            {
+                foreach (var entry in _entries.Values.ToList())
+                {
+                    TryDeleteFile(Path.Combine(_cacheDirectory, entry.CacheFileName));
+                }
+
+                TryDeleteFile(_indexPath);
+                _entries.Clear();
+                _observedVersions.Clear();
+                _storageRoot = normalizedStorage;
+                _cacheDirectory = Path.Combine(_storageRoot, "PreDeleteCache");
+                _indexPath = Path.Combine(_cacheDirectory, "index.json");
+            }
+
+            try
+            {
+                Directory.CreateDirectory(_cacheDirectory);
+                _storageAvailable = true;
+                LoadIndex();
+            }
+            catch (Exception ex)
+            {
+                _storageAvailable = false;
+                System.Diagnostics.Trace.WriteLine(
+                    $"Pre-delete storage switch failed at {_storageRoot}: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         ApplyProtectedDirectories(normalized, persist: false);
     }
 
