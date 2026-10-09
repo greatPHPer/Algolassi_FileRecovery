@@ -19,6 +19,7 @@ public partial class Form1 : Form
     private readonly NtfsWholeVolumeTextRecoveryService _ntfsWholeVolumeTextRecoveryService = new();
     private bool _allowClose;
     private bool _refreshInProgress;
+    private int _historyRowsRefreshVersion;
     private bool _historyRefreshPending;
     private bool _suppressDirectorySelectionChanged;
     private bool _suppressGridSelectionChanged;
@@ -429,7 +430,7 @@ public partial class Form1 : Form
         lblStatus.Text = $"Ignoring {normalized} and all its subdirectories for automatic monitoring.";
     }
 
-    private void ShowHistoryRows()
+    private async void ShowHistoryRows()
     {
         if (IsDisposed)
         {
@@ -456,20 +457,44 @@ public partial class Form1 : Form
                 (dgvResults.Rows[previousFirstVisibleRow].DataBoundItem as RecoveryDisplayRow)?.HistoryId;
         }
 
-        var records = _history.GetRecent()
-            .Where(record => selectedDirectory is null ||
-                             IsDirectoryMatch(record.DirectoryPath, selectedDirectory))
-            .Select(record => new RecoveryDisplayRow
+        // Complete NTFS snapshots may be numerous and expensive to clone/filter.
+        // Retrieve and project history off the UI thread so ignoring a large volume
+        // does not freeze the Recovery Center.
+        var refreshVersion = ++_historyRowsRefreshVersion;
+        List<RecoveryDisplayRow> records;
+        try
+        {
+            records = await Task.Run(() => _history.GetRecent()
+                .Where(record => selectedDirectory is null ||
+                                 IsDirectoryMatch(record.DirectoryPath, selectedDirectory))
+                .Select(record => new RecoveryDisplayRow
+                {
+                    HistoryId = record.Id,
+                    Name = record.FileName,
+                    DeletedOn = record.DeletedAtUtc.ToLocalTime().ToString("g"),
+                    FileSize = record.FileSizeBytes.HasValue
+                        ? FormatSize(record.FileSizeBytes.Value)
+                        : "Unknown",
+                    RecoveryStrength = record.RecoveryStrength
+                })
+                .ToList());
+        }
+        catch (Exception ex)
+        {
+            if (!IsDisposed && refreshVersion == _historyRowsRefreshVersion)
             {
-                HistoryId = record.Id,
-                Name = record.FileName,
-                DeletedOn = record.DeletedAtUtc.ToLocalTime().ToString("g"),
-                FileSize = record.FileSizeBytes.HasValue
-                    ? FormatSize(record.FileSizeBytes.Value)
-                    : "Unknown",
-                RecoveryStrength = record.RecoveryStrength
-            })
-            .ToList();
+                lblStatus.Text = $"Could not refresh deletion history: {ex.Message}";
+            }
+
+            return;
+        }
+
+        // Ignore stale results if another selection/refresh started while this
+        // background query was running.
+        if (IsDisposed || refreshVersion != _historyRowsRefreshVersion)
+        {
+            return;
+        }
 
         _suppressGridSelectionChanged = true;
         try
