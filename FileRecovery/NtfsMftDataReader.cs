@@ -4169,40 +4169,82 @@ public sealed class NtfsMftDataReader
         byte[] destination,
         int destinationOffset)
     {
-        var offset = checked(logicalClusterNumber * (long)bytesPerCluster);
-        var buffer = new byte[RawReadBufferSize];
+        var clusterSize = checked((long)bytesPerCluster);
+        if (clusterSize <= 0)
+        {
+            throw new InvalidDataException(
+                "The NTFS volume reported an invalid cluster size for a raw data read.");
+        }
+
+        // Raw volume reads should stay aligned to whole NTFS clusters. A deleted
+        // file's logical size (for example, 1,500,000 bytes) may end partway
+        // through a cluster; requesting that unaligned final byte count can make
+        // the volume read fail even though the full allocated clusters are readable.
+        var maxAlignedReadBytesLong = RawReadBufferSize -
+            (RawReadBufferSize % clusterSize);
+        if (maxAlignedReadBytesLong <= 0)
+        {
+            throw new InvalidDataException(
+                $"The NTFS cluster size {clusterSize:N0} exceeds the raw read buffer size.");
+        }
+
+        var maxAlignedReadBytes = checked((int)maxAlignedReadBytesLong);
+        var buffer = new byte[maxAlignedReadBytes];
+        var offset = checked(logicalClusterNumber * clusterSize);
         var remaining = byteCount;
         var targetOffset = destinationOffset;
 
         while (remaining > 0)
         {
-            var chunk = (int)Math.Min(buffer.Length, remaining);
+            // Copy only the requested logical bytes, but read a cluster-aligned
+            // amount from the volume. The rounded-up tail remains inside the
+            // allocated cluster range described by the caller's extent.
+            var bytesToCopy = checked((int)Math.Min(
+                maxAlignedReadBytes,
+                remaining));
+            var alignedReadBytesLong = checked(
+                ((bytesToCopy + clusterSize - 1) / clusterSize) * clusterSize);
+            var alignedReadBytes = checked((int)alignedReadBytesLong);
 
             if (!SetFilePointerEx(volumeHandle, offset, out _, 0))
             {
+                var error = Marshal.GetLastWin32Error();
                 throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    "Could not seek to a nonresident NTFS data extent.");
+                    error,
+                    $"Could not seek to a nonresident NTFS data extent at byte offset {offset:N0}.");
             }
 
             if (!ReadFile(
                     volumeHandle,
                     buffer,
-                    (uint)chunk,
+                    (uint)alignedReadBytes,
                     out var bytesRead,
-                    IntPtr.Zero) ||
-                bytesRead != (uint)chunk)
+                    IntPtr.Zero))
             {
+                var error = Marshal.GetLastWin32Error();
                 throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    "Could not read a nonresident NTFS data extent.");
+                    error,
+                    $"Could not read a nonresident NTFS data extent at byte offset {offset:N0}; " +
+                    $"requestedBytes={alignedReadBytes:N0}.");
             }
 
-            Buffer.BlockCopy(buffer, 0, destination, targetOffset, chunk);
+            if (bytesRead != (uint)alignedReadBytes)
+            {
+                throw new IOException(
+                    $"Partial raw NTFS data read at byte offset {offset:N0}: " +
+                    $"requestedBytes={alignedReadBytes:N0}, bytesRead={bytesRead:N0}.");
+            }
 
-            offset = checked(offset + chunk);
-            targetOffset = checked(targetOffset + chunk);
-            remaining -= chunk;
+            Buffer.BlockCopy(
+                buffer,
+                0,
+                destination,
+                targetOffset,
+                bytesToCopy);
+
+            offset = checked(offset + bytesToCopy);
+            targetOffset = checked(targetOffset + bytesToCopy);
+            remaining -= bytesToCopy;
         }
     }
 
