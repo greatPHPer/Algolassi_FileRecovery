@@ -189,10 +189,13 @@ public sealed class PreDeleteSnapshotService : IDisposable
 
         PreDeleteSnapshotCacheEntry entry;
         ObservedFileVersion observed;
+        string cacheDirectory;
+        string storageRoot;
 
         lock (_gate)
         {
             if (_disposed ||
+                !_storageAvailable ||
                 !IsProtectedPathLocked(path) ||
                 !_entries.TryGetValue(path, out var cached) ||
                 !_observedVersions.TryGetValue(path, out observed))
@@ -201,10 +204,13 @@ public sealed class PreDeleteSnapshotService : IDisposable
             }
 
             entry = cached.Clone();
+            cacheDirectory = _cacheDirectory;
+            storageRoot = _storageRoot;
         }
 
         if (entry.Length <= 0 ||
             entry.Length > MaximumFileBytes ||
+            entry.Length > MaximumCacheBytes ||
             observed.Length != entry.Length ||
             observed.LastWriteTimeUtcTicks != entry.LastWriteTimeUtcTicks ||
             (deletion.FileSizeBytes.HasValue &&
@@ -229,66 +235,67 @@ public sealed class PreDeleteSnapshotService : IDisposable
             return false;
         }
 
-        var cachePath = Path.Combine(_cacheDirectory, entry.CacheFileName);
-        byte[] data;
-
-        try
-        {
-            var info = new FileInfo(cachePath);
-            if (!info.Exists || info.Length != entry.Length)
-            {
-                System.Diagnostics.Trace.WriteLine(
-                    $"Pre-delete snapshot not used: cache file is missing or has the wrong size for path={path}.");
-                return false;
-            }
-
-            data = File.ReadAllBytes(cachePath);
-        }
-        catch (Exception ex)
+        var cachePath = Path.Combine(cacheDirectory, entry.CacheFileName);
+        var cacheInfo = new FileInfo(cachePath);
+        if (!cacheInfo.Exists ||
+            cacheInfo.Length != entry.Length ||
+            string.IsNullOrWhiteSpace(entry.Sha256))
         {
             System.Diagnostics.Trace.WriteLine(
-                $"Pre-delete snapshot not used: cache read failed for path={path}: " +
-                $"{ex.GetType().Name}: {ex.Message}");
+                $"Pre-delete snapshot not used: cache file is missing or has the wrong size/hash metadata for path={path}.");
             return false;
         }
 
-        var actualHash = Convert.ToHexString(SHA256.HashData(data));
-        if (data.LongLength != entry.Length ||
-            !string.Equals(actualHash, entry.Sha256, StringComparison.OrdinalIgnoreCase))
+        // Promotion is a same-storage-root move rather than a second in-memory or
+        // on-disk copy. The recovery stage validates SHA-256 while streaming the
+        // promoted file to the user's destination.
+        var store = new NtfsDeletionSnapshotStore(storageRoot);
+        if (!store.TryPromoteFile(
+                deletion.Id,
+                cachePath,
+                entry.Length,
+                entry.Sha256,
+                out var snapshotFileName,
+                out var snapshotFilePath))
         {
             System.Diagnostics.Trace.WriteLine(
-                $"Pre-delete snapshot not used: cache hash/size validation failed for path={path}.");
+                $"Pre-delete snapshot not used: could not promote cache file for path={path}.");
             return false;
         }
 
-        var store = new NtfsDeletionSnapshotStore();
-        if (!store.TrySave(deletion.Id, data, out var snapshotFileName, out var savedHash))
-        {
-            System.Diagnostics.Trace.WriteLine(
-                $"Pre-delete snapshot not used: could not promote verified cache for path={path}.");
-            return false;
-        }
-
-        deletion.FileSizeBytes = data.LongLength;
+        deletion.FileSizeBytes = entry.Length;
         deletion.RecoveryStrength = "Strong";
         deletion.NtfsDataSnapshot = new NtfsDeletionDataSnapshot
         {
             DataCaptured = true,
             IsResident = false,
-            FileSizeBytes = data.LongLength,
-            ValidDataLengthBytes = data.LongLength,
-            CapturedByteCount = data.LongLength,
+            FileSizeBytes = entry.Length,
+            ValidDataLengthBytes = entry.Length,
+            CapturedByteCount = entry.Length,
             DataFileName = snapshotFileName,
-            Sha256 = savedHash,
+            DataFilePath = snapshotFilePath,
+            Sha256 = entry.Sha256,
             CapturedAtUtc = entry.CapturedAtUtc,
             Evidence =
-                "A rolling pre-delete snapshot was copied from a user-protected directory " +
-                "and verified by size and SHA-256 before being attached to the deletion record."
+                "A rolling pre-delete snapshot was streamed from a user-protected directory " +
+                "and retained for recovery. Its SHA-256 is checked again during restore."
         };
+
+        lock (_gate)
+        {
+            if (_entries.TryGetValue(path, out var current) &&
+                string.Equals(current.CacheFileName, entry.CacheFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                // The cache file has been moved into the durable snapshot store.
+                _entries.Remove(path);
+                SaveIndexLocked();
+            }
+        }
 
         System.Diagnostics.Trace.WriteLine(
             $"Pre-delete snapshot promoted to recovery history: path={path}, " +
-            $"size={data.LongLength:N0}, capturedAt={entry.CapturedAtUtc:O}, sha256={savedHash}.");
+            $"size={entry.Length:N0}, capturedAt={entry.CapturedAtUtc:O}, " +
+            $"sha256={entry.Sha256}, dataFile={snapshotFilePath}.");
 
         return true;
     }
