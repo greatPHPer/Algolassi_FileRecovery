@@ -57,6 +57,12 @@ public sealed class UsnJournalMonitor : IDisposable
     private bool _started;
     private DateTime _monitorStartedAtUtc;
 
+    // Tracks a consecutive ERROR_INVALID_PARAMETER recovery streak per volume.
+    // If one bounded-tail retry fails too, the next recovery resumes at current
+    // journal end instead of repeatedly chasing a moving recent-tail boundary.
+    private readonly ConcurrentDictionary<string, byte> _error87RecentTailRetryPending =
+        new(StringComparer.OrdinalIgnoreCase);
+
     public event EventHandler<DeletionDetectedEventArgs>? DeletionDetected;
     public event EventHandler<string>? StatusChanged;
 
@@ -694,6 +700,8 @@ public sealed class UsnJournalMonitor : IDisposable
                     journal.JournalId,
                     nextUsn,
                     out returnedNextUsn);
+                // A successful read breaks a consecutive error-87 recovery streak.
+                _error87RecentTailRetryPending.TryRemove(volumeKey, out _);
             }
             catch (Win32Exception ex) when (ex.NativeErrorCode == 87)
             {
@@ -726,10 +734,13 @@ public sealed class UsnJournalMonitor : IDisposable
                     Math.Max(refreshedJournal.FirstUsn, refreshedJournal.LowestValidUsn),
                     Math.Max(0L, refreshedJournal.NextUsn - MaxStartupCatchUpUsnBytes));
 
-                // First re-arm at the retained recent tail to preserve as much useful
-                // backlog as possible. If Windows rejects that position too, move to the
-                // current journal end on the next cycle rather than looping on error 87.
-                var retryingRecentTail = nextUsn != recentTailStart;
+                // Attempt the bounded recent tail once during a consecutive error-87
+                // streak. Do not compare nextUsn with a freshly calculated recentTailStart:
+                // that boundary moves as new USN records arrive and would make every poll
+                // look like a first retry. If the tail read fails too, resume at the latest
+                // queried journal end to recover live monitoring rather than loop forever.
+                var retryingRecentTail =
+                    _error87RecentTailRetryPending.TryAdd(volumeKey, 0);
                 var resumeUsn = retryingRecentTail
                     ? recentTailStart
                     : refreshedJournal.NextUsn;
@@ -739,12 +750,17 @@ public sealed class UsnJournalMonitor : IDisposable
                 _settings.UsnCursors[volumeKey] = cursor;
                 _settings.Save();
 
+                if (!retryingRecentTail)
+                {
+                    _error87RecentTailRetryPending.TryRemove(volumeKey, out _);
+                }
+
                 var recoveryReason = cursorStillRetained
                     ? "Windows rejected a cursor still within the journal's reported retained range"
                     : "the cursor or journal generation was outside the current retained range";
                 var recoveryAction = retryingRecentTail
-                    ? $"retrying the bounded recent tail from USN {resumeUsn}"
-                    : "resuming at the current journal end because the recent-tail read was also rejected";
+                    ? $"retrying the bounded recent tail once from USN {resumeUsn}"
+                    : "resuming at the current journal end because the bounded recent-tail retry was also rejected";
 
                 System.Diagnostics.Trace.WriteLine(
                     $"USN monitor recovered from error 87: volume={volumeKey}, " +
