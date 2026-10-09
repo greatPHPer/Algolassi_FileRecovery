@@ -352,6 +352,14 @@ public sealed class PreDeleteSnapshotService : IDisposable
             _settings.Save();
         }
 
+        if (!_storageAvailable)
+        {
+            StatusChanged?.Invoke(
+                this,
+                $"Pre-delete protection could not access storage at {_storageRoot}; protection is inactive.");
+            return;
+        }
+
         if (roots.Length == 0)
         {
             StatusChanged?.Invoke(this, "Pre-delete protection is off; no protected directories are configured.");
@@ -459,9 +467,11 @@ public sealed class PreDeleteSnapshotService : IDisposable
                     }
 
                     if (RecoveryMonitoringExclusions.IsExcludedPath(file) ||
+                        IsInternalStoragePath(file) ||
                         !TryGetFileVersion(file, out var version) ||
                         version.Length <= 0 ||
-                        version.Length > MaximumFileBytes)
+                        version.Length > MaximumFileBytes ||
+                        version.Length > MaximumCacheBytes)
                     {
                         continue;
                     }
@@ -576,7 +586,8 @@ public sealed class PreDeleteSnapshotService : IDisposable
 
     private void QueueSnapshot(string path)
     {
-        if (RecoveryMonitoringExclusions.IsExcludedPath(path))
+        if (RecoveryMonitoringExclusions.IsExcludedPath(path) ||
+            IsInternalStoragePath(path))
         {
             return;
         }
@@ -585,13 +596,19 @@ public sealed class PreDeleteSnapshotService : IDisposable
         if (!TryNormalizeFilePath(path, out normalized) ||
             !TryGetFileVersion(normalized, out var version) ||
             version.Length <= 0 ||
-            version.Length > MaximumFileBytes)
+            version.Length > MaximumFileBytes ||
+            version.Length > MaximumCacheBytes)
         {
             if (TryNormalizeFilePath(path, out normalized))
             {
                 lock (_gate)
                 {
                     _observedVersions.Remove(normalized);
+                    if (_entries.ContainsKey(normalized))
+                    {
+                        RemoveEntryLocked(normalized);
+                        SaveIndexLocked();
+                    }
                 }
             }
 
@@ -672,16 +689,20 @@ public sealed class PreDeleteSnapshotService : IDisposable
     {
         if (cancellationToken.IsCancellationRequested ||
             RecoveryMonitoringExclusions.IsExcludedPath(path) ||
+            IsInternalStoragePath(path) ||
             !TryGetFileVersion(path, out var before) ||
             before.Length <= 0 ||
-            before.Length > MaximumFileBytes)
+            before.Length > MaximumFileBytes ||
+            before.Length > MaximumCacheBytes)
         {
             return;
         }
 
+        string cacheDirectory;
         lock (_gate)
         {
             if (_disposed ||
+                !_storageAvailable ||
                 !IsProtectedPathLocked(path) ||
                 !_observedVersions.TryGetValue(path, out var observed) ||
                 observed != before)
@@ -696,31 +717,82 @@ public sealed class PreDeleteSnapshotService : IDisposable
             {
                 return;
             }
+
+            cacheDirectory = _cacheDirectory;
         }
 
-        byte[] data;
+        if (!HasAvailableSpace(cacheDirectory, before.Length))
+        {
+            System.Diagnostics.Trace.WriteLine(
+                $"Pre-delete snapshot skipped for {path}: storage does not have enough reported free space " +
+                $"for {before.Length:N0} byte(s).");
+            return;
+        }
+
+        var cacheFileName = GetCacheFileName(path);
+        var destination = Path.Combine(cacheDirectory, cacheFileName);
+        var temporary = destination + $".{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
+        long copied = 0;
+        string sha256;
+
         try
         {
-            using var stream = new FileStream(
-                path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete,
-                bufferSize: 128 * 1024,
-                FileOptions.SequentialScan);
-
-            if (stream.Length != before.Length)
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            using (var input = new FileStream(
+                       path,
+                       FileMode.Open,
+                       FileAccess.Read,
+                       FileShare.ReadWrite | FileShare.Delete,
+                       CopyBufferSize,
+                       FileOptions.SequentialScan))
+            using (var output = new FileStream(
+                       temporary,
+                       FileMode.CreateNew,
+                       FileAccess.Write,
+                       FileShare.None,
+                       CopyBufferSize,
+                       FileOptions.SequentialScan))
             {
+                if (input.Length != before.Length)
+                {
+                    TryDeleteFile(temporary);
+                    return;
+                }
+
+                var buffer = new byte[CopyBufferSize];
+                int read;
+                while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    output.Write(buffer, 0, read);
+                    hash.AppendData(buffer, 0, read);
+                    copied = checked(copied + read);
+                }
+
+                output.Flush(flushToDisk: true);
+            }
+
+            if (copied != before.Length)
+            {
+                TryDeleteFile(temporary);
+                System.Diagnostics.Trace.WriteLine(
+                    $"Pre-delete snapshot skipped because a streamed copy was short: " +
+                    $"path={path}, expected={before.Length:N0}, copied={copied:N0}.");
                 return;
             }
 
-            data = new byte[checked((int)before.Length)];
-            stream.ReadExactly(data);
+            sha256 = Convert.ToHexString(hash.GetHashAndReset());
+        }
+        catch (OperationCanceledException)
+        {
+            TryDeleteFile(temporary);
+            throw;
         }
         catch (Exception ex)
         {
+            TryDeleteFile(temporary);
             System.Diagnostics.Trace.WriteLine(
-                $"Pre-delete snapshot could not read stable contents for {path}: " +
+                $"Pre-delete snapshot could not stream contents for {path}: " +
                 $"{ex.GetType().Name}: {ex.Message}");
             return;
         }
@@ -729,42 +801,74 @@ public sealed class PreDeleteSnapshotService : IDisposable
 
         if (!TryGetFileVersion(path, out var after) || after != before)
         {
+            TryDeleteFile(temporary);
             System.Diagnostics.Trace.WriteLine(
                 $"Pre-delete snapshot skipped because the file changed during capture: {path}.");
             return;
         }
 
-        var sha256 = Convert.ToHexString(SHA256.HashData(data));
-        var cacheFileName = GetCacheFileName(path);
-        var destination = Path.Combine(_cacheDirectory, cacheFileName);
-        var temporary = destination + $".{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
-
         lock (_gate)
         {
             if (_disposed ||
+                !_storageAvailable ||
+                !string.Equals(_cacheDirectory, cacheDirectory, StringComparison.OrdinalIgnoreCase) ||
                 !IsProtectedPathLocked(path) ||
                 !_observedVersions.TryGetValue(path, out var observed) ||
                 observed != before)
             {
+                TryDeleteFile(temporary);
                 return;
+            }
+
+            long totalBytes = _entries.Values.Sum(entry => entry.Length);
+            var entryCount = _entries.Count;
+
+            if (_entries.TryGetValue(path, out var oldEntry))
+            {
+                totalBytes -= oldEntry.Length;
+                entryCount--;
+            }
+
+            // Evict the oldest other copies only as needed to make room for this
+            // verified version. Never evict the candidate currently being captured.
+            while (entryCount >= MaximumCacheEntries ||
+                   totalBytes > MaximumCacheBytes - before.Length)
+            {
+                var oldest = _entries
+                    .Where(pair => !string.Equals(
+                        pair.Key,
+                        path,
+                        StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(pair => pair.Value.CapturedAtUtc)
+                    .FirstOrDefault();
+
+                if (oldest.Value is null)
+                {
+                    TryDeleteFile(temporary);
+                    System.Diagnostics.Trace.WriteLine(
+                        $"Pre-delete snapshot skipped for {path}: configured cache budget is full.");
+                    return;
+                }
+
+                totalBytes -= oldest.Value.Length;
+                entryCount--;
+                RemoveEntryLocked(oldest.Key);
             }
 
             try
             {
-                File.WriteAllBytes(temporary, data);
                 File.Move(temporary, destination, overwrite: true);
 
                 _entries[path] = new PreDeleteSnapshotCacheEntry
                 {
                     Path = path,
                     CacheFileName = cacheFileName,
-                    Length = data.LongLength,
+                    Length = copied,
                     LastWriteTimeUtcTicks = before.LastWriteTimeUtcTicks,
                     CapturedAtUtc = DateTime.UtcNow,
                     Sha256 = sha256
                 };
 
-                PruneLocked(DateTime.UtcNow);
                 SaveIndexLocked();
             }
             catch (Exception ex)
@@ -778,7 +882,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
         }
 
         System.Diagnostics.Trace.WriteLine(
-            $"Pre-delete snapshot captured: path={path}, size={data.LongLength:N0}, sha256={sha256}.");
+            $"Pre-delete snapshot captured: path={path}, size={copied:N0}, sha256={sha256}.");
     }
 
     private bool CacheMatchesVersion(string path, ObservedFileVersion version)
