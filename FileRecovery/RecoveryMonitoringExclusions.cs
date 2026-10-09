@@ -135,9 +135,35 @@ internal static class RecoveryMonitoringExclusions
 
         lock (Gate)
         {
+            // The configured protected-storage root is app-owned. Excluding it from
+            // general deletion monitoring prevents cache promotion/moves from showing
+            // up as user deletions in history. The path is read from the shared settings
+            // instance so changing the storage location takes effect immediately.
+            var protectedStorageDirectory = GetProtectedStorageDirectoryLocked();
+
             return IsSameOrDescendant(normalized, InternalStorageDirectory) ||
+                   (!string.IsNullOrWhiteSpace(protectedStorageDirectory) &&
+                    IsSameOrDescendant(normalized, protectedStorageDirectory)) ||
                    _ignoredDirectories.Any(directory =>
                        IsSameOrDescendant(normalized, directory));
+        }
+    }
+
+    private static string GetProtectedStorageDirectoryLocked()
+    {
+        if (_settings is null)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return NormalizeDirectory(_settings.EffectivePreDeleteStorageDirectory);
+        }
+        catch
+        {
+            // A malformed storage setting must not break general deletion monitoring.
+            return string.Empty;
         }
     }
 
