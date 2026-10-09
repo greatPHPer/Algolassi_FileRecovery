@@ -8,6 +8,7 @@ public sealed class NtfsDeletionDataSnapshot
     public long ValidDataLengthBytes { get; init; }
     public long CapturedByteCount { get; init; }
     public string? DataFileName { get; set; }
+    public string? DataFilePath { get; set; }
     public string Sha256 { get; set; } = string.Empty;
     public List<NtfsDataExtent> DataExtents { get; init; } = [];
     public DateTime CapturedAtUtc { get; init; }
@@ -26,6 +27,7 @@ public sealed class NtfsDeletionDataSnapshot
         ValidDataLengthBytes = ValidDataLengthBytes,
         CapturedByteCount = CapturedByteCount,
         DataFileName = DataFileName,
+        DataFilePath = DataFilePath,
         Sha256 = Sha256,
         DataExtents = DataExtents
             .Select(extent => new NtfsDataExtent
