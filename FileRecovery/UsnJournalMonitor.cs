@@ -2015,12 +2015,30 @@ public sealed class UsnJournalMonitor : IDisposable
              batch < maxBatches && nextUsn < journal.NextUsn;
              batch++)
         {
-            var records = ReadRecords(
-                volumeHandle,
-                journal.JournalId,
-                nextUsn,
-                out var returnedNextUsn,
-                UsnReasonFileDelete | UsnReasonRenameOldName);
+            List<UsnRecord> records;
+            long returnedNextUsn;
+
+            try
+            {
+                records = ReadRecords(
+                    volumeHandle,
+                    journal.JournalId,
+                    nextUsn,
+                    out returnedNextUsn,
+                    UsnReasonFileDelete | UsnReasonRenameOldName);
+            }
+            catch (Win32Exception ex) when (ex.NativeErrorCode == 87)
+            {
+                // If Windows rejects even the saved monitor cursor, do not retry a
+                // fabricated numeric tail. Leave the read loop and use the bounded
+                // FSCTL_ENUM_USN_DATA fallback below.
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS live deletion snapshot: READ_USN_JOURNAL rejected cursor; " +
+                    $"falling back to bounded FSCTL_ENUM_USN_DATA. " +
+                    $"path={normalizedTarget}, startUsn={nextUsn}, journalNext={journal.NextUsn}, " +
+                    $"journalId={journal.JournalId}.");
+                break;
+            }
 
             if (returnedNextUsn <= nextUsn)
             {
@@ -2157,9 +2175,34 @@ public sealed class UsnJournalMonitor : IDisposable
                 $"candidates={fallbackMatches.Count}, target={normalizedTarget}.");
         }
 
+        // Match the proven recovery-time fallback: FSCTL_ENUM_USN_DATA accepts
+        // a LowUsn/HighUsn filter range, unlike READ_USN_JOURNAL's StartUsn, so a
+        // recent numeric boundary is safe here. It also lets this live-snapshot
+        // resolver try a bounded lookup when the monitor cursor has already reached
+        // the journal tail, without inventing a READ_USN_JOURNAL start position.
+        const long enumRecentUsnWindow = 10_000_000;
+        var enumLowUsn = Math.Max(journal.FirstUsn, journal.NextUsn - enumRecentUsnWindow);
+
+        if (TryResolveRecentUsnEnumData(
+                volumeHandle,
+                volumeKey,
+                enumLowUsn,
+                journal.NextUsn,
+                normalizedTarget,
+                deletedAtUtc,
+                out fileReferenceNumber,
+                out parentFileReferenceNumber))
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: bounded FSCTL_ENUM_USN_DATA fallback matched " +
+                $"path={normalizedTarget}, fileRef={fileReferenceNumber}, " +
+                $"parentRef={parentFileReferenceNumber}, lowUsn={enumLowUsn}, highUsn={journal.NextUsn}.");
+            return true;
+        }
+
         System.Diagnostics.Debug.WriteLine(
-            $"NTFS live deletion snapshot: journal tail search found no uniquely matching delete " +
-            $"for path={normalizedTarget}, start={lowUsn}, high={journal.NextUsn}.");
+            $"NTFS live deletion snapshot: journal tail and bounded enum search found no uniquely matching delete " +
+            $"for path={normalizedTarget}, start={lowUsn}, enumLow={enumLowUsn}, high={journal.NextUsn}.");
 
         return false;
     }
