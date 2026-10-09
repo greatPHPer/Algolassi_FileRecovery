@@ -47,6 +47,11 @@ public sealed class UsnJournalMonitor : IDisposable
     private readonly SemaphoreSlim _historicalLogFileSnapshotGate = new(1, 1);
 
     private const int RecentDeletedRecordLimit = 512;
+    // On startup, inspect only a small tail of retained USN history. This can
+    // capture recent pre-start deletions whose exact MFT generation still exists,
+    // while avoiding replay of an unbounded offline backlog on the live worker.
+    private const long MaxStartupCatchUpUsnBytes = 4L * 1024L * 1024L;
+    private const int RecentPreStartSnapshotMinutes = 5;
 
     private Task? _worker;
     private bool _started;
@@ -95,10 +100,10 @@ public sealed class UsnJournalMonitor : IDisposable
             // first cursor, leaving the history row without an NTFS reference.
             ArmInitialCursors();
 
-            // Only deletions occurring after this point are eligible for a
-            // delete-time snapshot. A file deleted before the application started
-            // is historical/pre-start data and must not be captured from a later
-            // reused MFT record and mislabeled as a live snapshot.
+            // Deletions after this point may use the bounded sequence-transition
+            // fallback. A small startup USN catch-up can also snapshot recent
+            // pre-start deletions, but that path requires the exact original MFT
+            // generation and never accepts a reused/advanced sequence.
             _monitorStartedAtUtc = DateTime.UtcNow;
 
             _started = true;
@@ -160,18 +165,28 @@ public sealed class UsnJournalMonitor : IDisposable
                     hadPreviousCursor &&
                     previousCursor!.JournalId == journal.JournalId &&
                     previousNextUsn >= journal.FirstUsn &&
+                    previousNextUsn >= journal.LowestValidUsn &&
                     previousNextUsn < journal.NextUsn;
 
-                // The persisted cursor may be far behind after a restart. Replaying
-                // that entire offline backlog on the live-monitor worker can delay
-                // capture of newly deleted nonresident files until their MFT runlists
-                // are gone. The explicit "Scan NTFS Deleted Files" operation reads the
-                // retained historical journal separately. Keep this worker at the
-                // current journal tail so it prioritizes deletions while monitoring.
+                // Preserve live-deletion priority, but replay at most the most recent
+                // 4 MiB of USN address space when the previous cursor is still valid.
+                // Older history remains available through "Scan NTFS Deleted Files".
+                var startupNextUsn = journal.NextUsn;
+                if (hasPreStartBacklog)
+                {
+                    var recentWindowStart = Math.Max(
+                        journal.LowestValidUsn,
+                        journal.NextUsn - MaxStartupCatchUpUsnBytes);
+
+                    startupNextUsn = Math.Max(
+                        previousNextUsn,
+                        recentWindowStart);
+                }
+
                 var startupCursor = new VolumeJournalCursor
                 {
                     JournalId = journal.JournalId,
-                    NextUsn = journal.NextUsn
+                    NextUsn = startupNextUsn
                 };
 
                 _settings.UsnCursors[volumeKey] = startupCursor;
@@ -181,13 +196,15 @@ public sealed class UsnJournalMonitor : IDisposable
                     $"USN monitor startup cursor: volume={volumeKey}, " +
                     $"previousJournalId={(hadPreviousCursor ? previousCursor!.JournalId.ToString() : "(none)")}, " +
                     $"previousNextUsn={(hadPreviousCursor ? previousNextUsn.ToString() : "(none)")}, " +
-                    $"startupNextUsn={journal.NextUsn}, " +
-                    $"skippedPreStartBacklog={hasPreStartBacklog}.");
+                    $"startupNextUsn={startupNextUsn}, journalNextUsn={journal.NextUsn}, " +
+                    $"catchUpUsnBytes={Math.Max(0, journal.NextUsn - startupNextUsn):N0}, " +
+                    $"catchUpLimitBytes={MaxStartupCatchUpUsnBytes:N0}, " +
+                    $"skippedOlderBacklog={(hasPreStartBacklog && startupNextUsn > previousNextUsn)}.");
 
                 StatusChanged?.Invoke(
                     this,
-                    hasPreStartBacklog
-                        ? $"USN live monitoring armed for {volumeKey} at the current journal tail. Use Scan NTFS Deleted Files to search deletions from before startup."
+                    hasPreStartBacklog && startupNextUsn < journal.NextUsn
+                        ? $"USN monitoring armed for {volumeKey}; checking a bounded recent deletion backlog before continuing live monitoring. Use Scan NTFS Deleted Files for older history."
                         : $"USN journal armed for {volumeKey}. New deletions will be tracked.");
             }
             catch (UnauthorizedAccessException)
@@ -720,21 +737,35 @@ public sealed class UsnJournalMonitor : IDisposable
                     RecoveryStrength = "Weak"
                 };
 
-                // For live deletions, capture before resolving the parent path because
-                // extra metadata reads can let NTFS advance the deleted MFT record's sequence.
-                // Permit the reader's bounded delete-transition fallback here: it still requires
-                // a small forward sequence advance, a deleted/non-directory record, and matching
-                // filename, parent/path, and FILE_NAME timestamp. Historical/pre-start recovery
-                // continues to require the exact original MFT generation.
-                if (record.TimestampUtc >= _monitorStartedAtUtc &&
-                    record.TimestampUtc <= DateTime.UtcNow.AddMinutes(1))
+                // Capture a live deletion before resolving its parent path: extra
+                // metadata reads can let NTFS advance the deleted MFT sequence. The live
+                // path may use its guarded bounded sequence-transition fallback.
+                //
+                // During startup catch-up, also try very recent pre-start deletions, but
+                // only against the exact original MFT generation. Never accept a sequence
+                // transition for a file deleted while AlgoLassi was not monitoring.
+                var isLiveDeletion =
+                    record.TimestampUtc >= _monitorStartedAtUtc &&
+                    record.TimestampUtc <= DateTime.UtcNow.AddMinutes(1);
+
+                var isRecentPreStartDeletion =
+                    record.TimestampUtc < _monitorStartedAtUtc &&
+                    record.TimestampUtc >=
+                        _monitorStartedAtUtc.AddMinutes(-RecentPreStartSnapshotMinutes);
+
+                if (isLiveDeletion || isRecentPreStartDeletion)
                 {
+                    var captureLabel = isLiveDeletion
+                        ? "NTFS deletion-time capture-first"
+                        : "NTFS pre-start catch-up capture";
+
                     System.Diagnostics.Trace.WriteLine(
-                        $"NTFS deletion-time capture-first: " +
+                        $"{captureLabel}: " +
                         $"path={record.FileName}, " +
                         $"fileRef={record.FileReferenceNumber}, " +
                         $"parentRef={record.ParentFileReferenceNumber}, " +
-                        $"deleteTime={record.TimestampUtc:O}.");
+                        $"deleteTime={record.TimestampUtc:O}, " +
+                        $"exactGenerationOnly={!isLiveDeletion}.");
 
                     CaptureNtfsDeletionSnapshot(
                         deletion,
@@ -743,12 +774,12 @@ public sealed class UsnJournalMonitor : IDisposable
                         record.ParentFileReferenceNumber,
                         record.FileName,
                         cachedDirectory ?? "(Parent directory unavailable)",
-                        allowBoundedDeleteTransition: true);
+                        allowBoundedDeleteTransition: isLiveDeletion);
 
                     if (deletion.NtfsDataSnapshot?.IsComplete == true)
                     {
                         System.Diagnostics.Trace.WriteLine(
-                            $"NTFS deletion-time capture-first SUCCESS: " +
+                            $"{captureLabel} SUCCESS: " +
                             $"fileRef={record.FileReferenceNumber}, " +
                             $"size={deletion.NtfsDataSnapshot.FileSizeBytes:N0}, " +
                             $"sha256={deletion.NtfsDataSnapshot.Sha256 ?? "(none)"}.");
@@ -756,7 +787,7 @@ public sealed class UsnJournalMonitor : IDisposable
                     else
                     {
                         System.Diagnostics.Trace.WriteLine(
-                            $"NTFS deletion-time capture-first MISS: " +
+                            $"{captureLabel} MISS: " +
                             $"fileRef={record.FileReferenceNumber}, " +
                             $"reason=exact-generation $DATA capture did not complete.");
                     }
