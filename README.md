@@ -10,6 +10,10 @@ Windows file-recovery utility written in C# / .NET 9 WinForms.
 
 When the app is running, it stays in the Windows notification area (system tray) and monitors ready NTFS fixed volumes for file-system deletion notifications.
 
+**Keep AlgoLassi running continuously for best recovery results.** Start it before deleting files and leave it running in the system tray. Closing the Recovery Center window only hides the window; it does not stop monitoring. Choosing **Exit** from the tray menu, ending the process in Task Manager, or shutting down Windows stops live monitoring. Restarting after a deletion may still allow best-effort recovery from retained USN/NTFS history, but the immediate deletion-time snapshot opportunity may already have been missed and recovery is not guaranteed.
+
+This is continuous background monitoring, **not a full-volume recovery scan every second**. AlgoLassi reacts to deletion events and records the evidence it can capture. Keeping it running cannot prevent overwritten data or SSD TRIM from making a file unrecoverable.
+
 When a deletion is observed:
 
 - A deletion record is saved under the current user's local application data.
