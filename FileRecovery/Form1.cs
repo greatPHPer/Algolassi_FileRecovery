@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace FileRecovery;
 
 public partial class Form1 : Form
@@ -27,6 +29,27 @@ public partial class Form1 : Form
     private bool _ntfsResultsDisplayed;
     private bool _ntfsScanInProgress;
     private System.Windows.Forms.Timer? _entranceAnimationTimer;
+    private Button? _minimizeWindowButton;
+    private Button? _hideWindowButton;
+
+    private const int WmNcHitTest = 0x0084;
+    private const int HtClient = 1;
+    private const int HtCaption = 2;
+    private const int HtLeft = 10;
+    private const int HtRight = 11;
+    private const int HtTop = 12;
+    private const int HtTopLeft = 13;
+    private const int HtTopRight = 14;
+    private const int HtBottom = 15;
+    private const int HtBottomLeft = 16;
+    private const int HtBottomRight = 17;
+    private const int ResizeBorder = 8;
+
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
     private void ApplyHighTechTheme()
     {
@@ -146,7 +169,13 @@ public partial class Form1 : Form
         }
 
         StopEntranceAnimation();
-        var start = new Point(target.X + 28, target.Y + 18);
+
+        // Start near the bottom edge of the monitor's work area. The form then
+        // rises vertically into its bottom-right resting position.
+        var startY = Math.Max(
+            target.Y,
+            workArea.Bottom - Math.Min(64, Math.Max(32, Height / 8)));
+        var start = new Point(target.X, startY);
 
         Opacity = 0;
         WindowState = FormWindowState.Normal;
@@ -186,13 +215,13 @@ public partial class Form1 : Form
             }
 
             var progress = Math.Clamp(
-                (DateTime.UtcNow - startedAtUtc).TotalMilliseconds / 220d,
+                (DateTime.UtcNow - startedAtUtc).TotalMilliseconds / 700d,
                 0d,
                 1d);
             var eased = 1d - Math.Pow(1d - progress, 3d);
 
             Location = new Point(
-                start.X + (int)Math.Round((target.X - start.X) * eased),
+                target.X,
                 start.Y + (int)Math.Round((target.Y - start.Y) * eased));
             Opacity = eased;
 
@@ -228,6 +257,150 @@ public partial class Form1 : Form
         }
     }
 
+    private void ConfigureBorderlessChrome()
+    {
+        FormBorderStyle = FormBorderStyle.None;
+        MaximizeBox = false;
+        MinimizeBox = false;
+
+        // With no native title bar, retain explicit window actions and a draggable
+        // header so the Recovery Center remains easy to move and hide to the tray.
+        _minimizeWindowButton = CreateCaptionButton("—", "Minimize Recovery Center");
+        _minimizeWindowButton.Location = new Point(ClientSize.Width - 84, 10);
+        _minimizeWindowButton.Click += (_, _) => WindowState = FormWindowState.Minimized;
+
+        _hideWindowButton = CreateCaptionButton("×", "Hide Recovery Center to the system tray");
+        _hideWindowButton.Location = new Point(ClientSize.Width - 46, 10);
+        _hideWindowButton.FlatAppearance.BorderColor = Color.FromArgb(113, 68, 82);
+        _hideWindowButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(120, 43, 58);
+        _hideWindowButton.Click += (_, _) => Close();
+
+        Controls.Add(_minimizeWindowButton);
+        Controls.Add(_hideWindowButton);
+        _minimizeWindowButton.BringToFront();
+        _hideWindowButton.BringToFront();
+
+        lblTitle.MouseDown += DragWindowMouseDown;
+        lblSubtitle.MouseDown += DragWindowMouseDown;
+    }
+
+    private static Button CreateCaptionButton(string caption, string accessibleName)
+    {
+        var button = new Button
+        {
+            Size = new Size(34, 28),
+            Text = caption,
+            AccessibleName = accessibleName,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(22, 37, 57),
+            ForeColor = Color.FromArgb(224, 236, 248),
+            Font = new Font("Segoe UI", 12F, FontStyle.Regular),
+            Cursor = Cursors.Hand,
+            UseVisualStyleBackColor = false,
+            TabStop = false
+        };
+
+        button.FlatAppearance.BorderSize = 1;
+        button.FlatAppearance.BorderColor = Color.FromArgb(43, 62, 83);
+        button.FlatAppearance.MouseOverBackColor = Color.FromArgb(31, 51, 74);
+        button.FlatAppearance.MouseDownBackColor = Color.FromArgb(27, 99, 112);
+        return button;
+    }
+
+    private void DragWindowMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left || IsDisposed)
+        {
+            return;
+        }
+
+        ReleaseCapture();
+        SendMessage(Handle, 0x00A1, new IntPtr(HtCaption), IntPtr.Zero);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WmNcHitTest && FormBorderStyle == FormBorderStyle.None)
+        {
+            base.WndProc(ref m);
+
+            if (m.Result != new IntPtr(HtClient))
+            {
+                return;
+            }
+
+            var packed = m.LParam.ToInt64();
+            var screenX = unchecked((short)(packed & 0xFFFF));
+            var screenY = unchecked((short)((packed >> 16) & 0xFFFF));
+            var point = PointToClient(new Point(screenX, screenY));
+            var nearLeft = point.X >= 0 && point.X < ResizeBorder;
+            var nearRight = point.X < ClientSize.Width &&
+                            point.X >= ClientSize.Width - ResizeBorder;
+            var nearTop = point.Y >= 0 && point.Y < ResizeBorder;
+            var nearBottom = point.Y < ClientSize.Height &&
+                             point.Y >= ClientSize.Height - ResizeBorder;
+
+            if (nearTop && nearLeft)
+            {
+                m.Result = new IntPtr(HtTopLeft);
+                return;
+            }
+
+            if (nearTop && nearRight)
+            {
+                m.Result = new IntPtr(HtTopRight);
+                return;
+            }
+
+            if (nearBottom && nearLeft)
+            {
+                m.Result = new IntPtr(HtBottomLeft);
+                return;
+            }
+
+            if (nearBottom && nearRight)
+            {
+                m.Result = new IntPtr(HtBottomRight);
+                return;
+            }
+
+            if (nearLeft)
+            {
+                m.Result = new IntPtr(HtLeft);
+                return;
+            }
+
+            if (nearRight)
+            {
+                m.Result = new IntPtr(HtRight);
+                return;
+            }
+
+            if (nearTop)
+            {
+                m.Result = new IntPtr(HtTop);
+                return;
+            }
+
+            if (nearBottom)
+            {
+                m.Result = new IntPtr(HtBottom);
+                return;
+            }
+
+            // The upper title strip is the drag handle, except for real child controls.
+            if (point.Y >= ResizeBorder && point.Y < 76)
+            {
+                m.Result = new IntPtr(HtCaption);
+                return;
+            }
+
+            return;
+        }
+
+        base.WndProc(ref m);
+    }
+
     public void CloseFromApplication()
     {
         StopEntranceAnimation();
@@ -246,6 +419,7 @@ public partial class Form1 : Form
 
         InitializeComponent();
         ApplyHighTechTheme();
+        ConfigureBorderlessChrome();
         _history.Changed += History_Changed;
     }
 
