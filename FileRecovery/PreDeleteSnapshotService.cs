@@ -956,16 +956,17 @@ public sealed class PreDeleteSnapshotService : IDisposable
         }
     }
 
-    private static void DisposeWatchers(IEnumerable<FileSystemWatcher> watchers)
+    private void DisposeWatchers(IEnumerable<FileSystemWatcher> watchers)
     {
         foreach (var watcher in watchers)
         {
             try
             {
                 watcher.EnableRaisingEvents = false;
-                watcher.Created -= null;
-                watcher.Changed -= null;
-                watcher.Renamed -= null;
+                watcher.Created -= OnFileChanged;
+                watcher.Changed -= OnFileChanged;
+                watcher.Renamed -= OnFileRenamed;
+                watcher.Error -= OnWatcherError;
                 watcher.Dispose();
             }
             catch
@@ -1005,7 +1006,6 @@ public sealed class PreDeleteSnapshotService : IDisposable
 
         cancellation.Dispose();
         DisposeWatchers(watchers);
-        _captureSlots.Dispose();
     }
 
     private readonly record struct ObservedFileVersion(
