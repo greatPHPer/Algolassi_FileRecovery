@@ -670,12 +670,15 @@ public partial class Form1 : Form
                     ? Color.FromArgb(245, 253, 255)
                     : Color.FromArgb(190, 209, 228);
 
+                var slantOffset = Math.Min(slant, visibleWidth / 3);
                 var chipPoints = new[]
                 {
-                    new Point(x, buttonY),
+                    // Both side edges are parallel. The right edge slopes "":
+                    // top-right to bottom-right moves down and left.
+                    new Point(x + slantOffset, buttonY),
                     new Point(x + visibleWidth, buttonY),
-                    new Point(x + visibleWidth - Math.Min(slant, visibleWidth / 3), buttonY + buttonHeight),
-                    new Point(x + Math.Min(slant, visibleWidth / 3), buttonY + buttonHeight)
+                    new Point(x + visibleWidth - slantOffset, buttonY + buttonHeight),
+                    new Point(x, buttonY + buttonHeight)
                 };
 
                 using (var chipBrush = new SolidBrush(chipFill))
