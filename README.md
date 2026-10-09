@@ -22,6 +22,12 @@ When a deletion is observed:
 - Notifications can be muted without stopping monitoring.
 - The app keeps the latest 500 deletion records.
 
+## Ignored directories
+
+The recent-directory list displays each full path as clickable breadcrumb segments. Select a segment such as `C:`, `ProgramData`, `McAfee`, or `WPs` and choose **Ignore directory** to exclude that directory and all descendants from automatic deletion monitoring and visible deletion history. Ignored-directory settings are saved under the user's AlgoLassi settings.
+
+Use **Ignored Directories...** in the Recovery Center or **Manage ignored directories...** in the tray menu to add full paths manually or remove exclusions. Removed exclusions allow matching saved history to appear again. Excluding a directory filters events and history; it does not disable the volume's underlying NTFS journal or guarantee that Windows FileSystemWatcher will not report buffer-overflow warnings during very busy periods.
+
 The live monitor uses `FileSystemWatcher` to capture the affected item's fully qualified path. Windows exposes that path through `FileSystemEventArgs.FullPath`, including the deleted filename and its parent directory.
 
 Windows Recycle Bin operations are handled separately because a normal Delete-to-Recycle-Bin operation can be represented as a move/rename rather than a permanent filesystem delete. A small Recycle Bin monitor polls the Shell contents and records newly appeared items using the original location, filename, deleted date, and size.
