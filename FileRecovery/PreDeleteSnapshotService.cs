@@ -32,8 +32,8 @@ public sealed class PreDeleteSnapshotService : IDisposable
     private long MaximumFileBytes =>
         Math.Clamp(_settings.PreDeleteMaxFileSizeBytes, MinimumFileBytes, MaximumAllowedFileBytes);
 
-    private long MaximumCacheBytes =>
-        Math.Clamp(_settings.PreDeleteCacheLimitBytes, MinimumCacheBytes, MaximumAllowedCacheBytes);
+    private long MaximumStorageBytes =>
+        Math.Clamp(_settings.PreDeleteStorageLimitBytes, MinimumCacheBytes, MaximumAllowedCacheBytes);
     private readonly object _gate = new();
     private readonly SemaphoreSlim _captureSlots = new(2, 2);
     private readonly Dictionary<string, PreDeleteSnapshotCacheEntry> _entries =
@@ -94,7 +94,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
         IEnumerable<string> directories,
         string storageDirectory,
         long maximumFileBytes,
-        long cacheLimitBytes)
+        long storageLimitBytes)
     {
         ArgumentNullException.ThrowIfNull(directories);
 
@@ -104,8 +104,8 @@ public sealed class PreDeleteSnapshotService : IDisposable
             maximumFileBytes,
             MinimumFileBytes,
             MaximumAllowedFileBytes);
-        var clampedCacheLimitBytes = Math.Clamp(
-            cacheLimitBytes,
+        var clampedStorageLimitBytes = Math.Clamp(
+            storageLimitBytes,
             MinimumCacheBytes,
             MaximumAllowedCacheBytes);
 
@@ -120,7 +120,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
         _settings.ProtectedDirectories = normalized.ToList();
         _settings.PreDeleteStorageDirectory = normalizedStorage;
         _settings.PreDeleteMaxFileSizeBytes = clampedMaxFileBytes;
-        _settings.PreDeleteCacheLimitBytes = clampedCacheLimitBytes;
+        _settings.PreDeleteStorageLimitBytes = clampedStorageLimitBytes;
         _settings.Save();
 
         var storageChanged = !string.Equals(
@@ -210,7 +210,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
 
         if (entry.Length <= 0 ||
             entry.Length > MaximumFileBytes ||
-            entry.Length > MaximumCacheBytes ||
+            entry.Length > MaximumStorageBytes ||
             observed.Length != entry.Length ||
             observed.LastWriteTimeUtcTicks != entry.LastWriteTimeUtcTicks ||
             (deletion.FileSizeBytes.HasValue &&
@@ -420,7 +420,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
             $"Pre-delete protection active for {roots.Length:N0} selected director{(roots.Length == 1 ? "y" : "ies")}.");
         System.Diagnostics.Trace.WriteLine(
             $"Pre-delete protection started: roots={string.Join(";", roots)}, " +
-            $"maxFileBytes={MaximumFileBytes:N0}, maxCacheBytes={MaximumCacheBytes:N0}.");
+            $"maxFileBytes={MaximumFileBytes:N0}, maxTotalStorageBytes={MaximumStorageBytes:N0}.");
     }
 
     private async Task RunInitialScanAsync(string[] roots, CancellationToken cancellationToken)
@@ -471,7 +471,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
                         !TryGetFileVersion(file, out var version) ||
                         version.Length <= 0 ||
                         version.Length > MaximumFileBytes ||
-                        version.Length > MaximumCacheBytes)
+                        version.Length > MaximumStorageBytes)
                     {
                         continue;
                     }
@@ -548,7 +548,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
                 }
 
                 if (plannedEntries >= MaximumCacheEntries ||
-                    candidate.Version.Length > MaximumCacheBytes - plannedBytes)
+                    candidate.Version.Length > MaximumStorageBytes - plannedBytes)
                 {
                     continue;
                 }
@@ -597,7 +597,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
             !TryGetFileVersion(normalized, out var version) ||
             version.Length <= 0 ||
             version.Length > MaximumFileBytes ||
-            version.Length > MaximumCacheBytes)
+            version.Length > MaximumStorageBytes)
         {
             if (TryNormalizeFilePath(path, out normalized))
             {
@@ -693,7 +693,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
             !TryGetFileVersion(path, out var before) ||
             before.Length <= 0 ||
             before.Length > MaximumFileBytes ||
-            before.Length > MaximumCacheBytes)
+            before.Length > MaximumStorageBytes)
         {
             return;
         }
@@ -832,7 +832,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
             // Evict the oldest other copies only as needed to make room for this
             // verified version. Never evict the candidate currently being captured.
             while (entryCount >= MaximumCacheEntries ||
-                   totalBytes > MaximumCacheBytes - before.Length)
+                   totalBytes > MaximumStorageBytes - before.Length)
             {
                 var oldest = _entries
                     .Where(pair => !string.Equals(
@@ -932,7 +932,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
                                     StringComparison.Ordinal) ||
                                 entry.Length <= 0 ||
                                 entry.Length > MaximumFileBytes ||
-                                entry.Length > MaximumCacheBytes ||
+                                entry.Length > MaximumStorageBytes ||
                                 !File.Exists(Path.Combine(_cacheDirectory, entry.CacheFileName)))
                             {
                                 continue;
@@ -971,7 +971,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
 
         long totalBytes = _entries.Values.Sum(entry => entry.Length);
 
-        while (_entries.Count > MaximumCacheEntries || totalBytes > MaximumCacheBytes)
+        while (_entries.Count > MaximumCacheEntries || totalBytes > MaximumStorageBytes)
         {
             var oldest = _entries
                 .OrderBy(pair => pair.Value.CapturedAtUtc)
