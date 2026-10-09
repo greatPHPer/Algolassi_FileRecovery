@@ -3693,6 +3693,65 @@ public partial class Form1 : Form
                         continue;
                     }
 
+                    // Experimental fallback for larger plain-text files: before asking the
+                    // user to supply a marker, scan NTFS free clusters for an exact-length
+                    // text-like region when the original size is known. This is intentionally
+                    // heuristic (plain text has no intrinsic boundary), so the recovered
+                    // contents must be verified by the user. The existing marker scan remains
+                    // available if this size-only pass finds no candidate.
+                    const long minSizeOnlyTextCarveBytes = 64L * 1024L;
+                    const long maxSizeOnlyTextCarveBytes = 64L * 1024L * 1024L;
+
+                    if (candidate.FileSizeBytes >= minSizeOnlyTextCarveBytes &&
+                        candidate.FileSizeBytes <= maxSizeOnlyTextCarveBytes)
+                    {
+                        IProgress<long> sizeOnlyTextProgress = new Progress<long>(bytesScanned =>
+                        {
+                            if (!IsDisposed)
+                            {
+                                lblStatus.Text =
+                                    $"Experimental exact-size text scan for {candidate.Name}... " +
+                                    $"{bytesScanned / (1024d * 1024d * 1024d):0.00} GB of free space scanned";
+                            }
+                        });
+
+                        sizeOnlyTextProgress.Report(0);
+
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS size-only text carve started: path={candidate.FullPath}, " +
+                            $"expectedBytes={candidate.FileSizeBytes:N0}, " +
+                            $"scan=all-currently-free-clusters, identity=heuristic.");
+
+                        try
+                        {
+                            var sizeOnlyTextRecovery = await Task.Run(
+                                () => _ntfsDeepFileRecoveryService.Recover(
+                                    candidate,
+                                    destinationDirectory,
+                                    CancellationToken.None,
+                                    NtfsDeepFileRecoveryService.DefaultMaxBytesToScan,
+                                    sizeOnlyTextProgress,
+                                    candidate.FileSizeBytes),
+                                CancellationToken.None);
+
+                            successes.Add(sizeOnlyTextRecovery);
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS size-only text carve returned a candidate: " +
+                                $"path={candidate.FullPath}, bytes={sizeOnlyTextRecovery.BytesRecovered:N0}, " +
+                                $"destination={sizeOnlyTextRecovery.DestinationPath}; " +
+                                $"content identity remains heuristic.");
+                            continue;
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS size-only text carve found no candidate: path={candidate.FullPath}, " +
+                                $"expectedBytes={candidate.FileSizeBytes:N0}, " +
+                                $"error={ex.GetType().Name}: {ex.Message}; " +
+                                $"continuing to marker-driven forensic recovery.");
+                        }
+                    }
+
                     var markerKey = NormalizePath(candidate.FullPath);
                     string? forensicMarker = null;
 
