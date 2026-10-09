@@ -3734,7 +3734,7 @@ public partial class Form1 : Form
                         // Progress<T> posts updates back to the captured UI synchronization
                         // context. Run the actual volume scan in the background so the
                         // Recovery Center remains responsive during large-volume reads.
-                        var forensicProgress = new Progress<long>(bytesScanned =>
+                        IProgress<long> forensicProgress = new Progress<long>(bytesScanned =>
                         {
                             if (!IsDisposed)
                             {
