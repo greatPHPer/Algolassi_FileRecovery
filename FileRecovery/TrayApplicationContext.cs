@@ -16,6 +16,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly SynchronizationContext _uiContext;
     private Form1? _mainForm;
     private DeletionNotificationForm? _notificationForm;
+    private string _lastMonitoringStatus = "Starting...";
     private bool _exiting;
 
     public TrayApplicationContext()
@@ -206,6 +207,9 @@ public sealed class TrayApplicationContext : ApplicationContext
                 }
             };
         }
+
+        // Replay the last monitor state captured while the app was tray-only.
+        _mainForm.SetMonitorStatus(_lastMonitoringStatus);
 
         if (!_mainForm.Visible)
         {
@@ -407,10 +411,15 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         _uiContext.Post(_ =>
         {
+            // Monitoring begins while the app is resident in the tray, often before
+            // the Recovery Center form exists. Retain the newest status so a form
+            // opened later doesn't remain stuck on its designer default "starting...".
+            _lastMonitoringStatus = message;
             _trayIcon.Text = "AlgoLassi File Recovery";
+
             if (_mainForm is not null && !_mainForm.IsDisposed)
             {
-                _mainForm.SetMonitorStatus(message);
+                _mainForm.SetMonitorStatus(_lastMonitoringStatus);
             }
         }, null);
     }
