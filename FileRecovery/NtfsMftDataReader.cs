@@ -2433,7 +2433,8 @@ public sealed class NtfsMftDataReader
         out byte[] capturedData,
         DateTime expectedDeletedAtUtc = default,
         bool allowBoundedDeleteTransition = true,
-        long expectedFileSizeBytes = 0)
+        long expectedFileSizeBytes = 0,
+        int maxBoundedDeleteSequenceAdvance = 8)
     {
         stream = NotFound("The deleted file's NTFS $DATA stream could not be read.");
         capturedData = [];
@@ -2471,7 +2472,8 @@ public sealed class NtfsMftDataReader
                 expectedFullPath,
                 expectedDeletedAtUtc,
                 allowBoundedDeleteTransition,
-                expectedFileSizeBytes);
+                expectedFileSizeBytes,
+                maxBoundedDeleteSequenceAdvance);
 
             if (!stream.Found)
             {
@@ -2684,7 +2686,8 @@ public sealed class NtfsMftDataReader
         string? expectedFullPath = null,
         DateTime expectedDeletedAtUtc = default,
         bool allowBoundedDeleteTransition = true,
-        long expectedFileSizeBytes = 0)
+        long expectedFileSizeBytes = 0,
+        int maxBoundedDeleteSequenceAdvance = 8)
     {
         // A deletion-time size captured before the file disappeared can remain
         // authoritative even when the current/reused MFT $FILE_NAME size is gone.
@@ -2808,8 +2811,12 @@ public sealed class NtfsMftDataReader
             //
             // This is deliberately stronger than accepting an arbitrary sequence change
             // because an unrelated reused MFT generation could otherwise be mistaken for
-            // the deleted file.
-            const ushort maxDeleteSequenceAdvance = 8;
+            // the deleted file. Recent pre-start catch-up passes a maximum advance of one;
+            // live capture keeps the existing maximum of eight.
+            var maxDeleteSequenceAdvance = Math.Clamp(
+                maxBoundedDeleteSequenceAdvance,
+                1,
+                8);
 
             var relaxedRecord = ReadMftRecordByExtentMap(
                 rawMftVolumeHandle,
