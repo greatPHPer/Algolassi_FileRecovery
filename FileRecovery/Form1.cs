@@ -432,7 +432,9 @@ public partial class Form1 : Form
 
     private async void ShowHistoryRows()
     {
-        if (IsDisposed)
+        // Do not let a history refresh started by a monitor event reset or replace
+        // the NTFS results while an on-demand NTFS scan is in progress.
+        if (IsDisposed || _ntfsScanInProgress)
         {
             return;
         }
@@ -491,7 +493,10 @@ public partial class Form1 : Form
 
         // Ignore stale results if another selection/refresh started while this
         // background query was running.
-        if (IsDisposed || refreshVersion != _historyRowsRefreshVersion)
+        if (IsDisposed ||
+            refreshVersion != _historyRowsRefreshVersion ||
+            _ntfsScanInProgress ||
+            _ntfsResultsDisplayed)
         {
             return;
         }
@@ -1145,13 +1150,30 @@ public partial class Form1 : Form
 
         var includeSubdirectories = chkScanSubdirectories.Checked;
 
-        // This operation reads NTFS metadata only. Start immediately from the
-        // button click instead of requiring a separate Yes/No confirmation click.
+        var answer = MessageBox.Show(
+            this,
+            $"Scan deleted NTFS metadata under:\r\n\r\n{scanDirectory}\r\n\r\n" +
+            (includeSubdirectories
+                ? "Include all subdirectories."
+                : "Scan this directory only, not its subdirectories.") +
+            "\r\n\r\nThis reads filesystem metadata only and does not write to the source volume.",
+            "NTFS Deleted-File Scan",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+
+        if (answer != DialogResult.Yes)
+        {
+            return;
+        }
+
+        // Invalidate any ShowHistoryRows() query that started before this scan.
+        // Its async continuation must not replace the eventual NTFS candidate grid.
+        _historyRowsRefreshVersion++;
+        _ntfsScanInProgress = true;
+
         SetBusy(
             true,
             $"Scanning deleted NTFS metadata under {scanDirectory}...");
-
-        _ntfsScanInProgress = true;
 
         try
         {
