@@ -7,6 +7,35 @@ public sealed class RecoverySettings
     public bool NotificationsMuted { get; set; }
     public List<string> IgnoredDirectories { get; set; } = [];
     public List<string> ProtectedDirectories { get; set; } = [];
+
+    // The rolling pre-delete cache and promoted snapshots share this storage root.
+    // The default is used only after the user explicitly enables protected folders.
+    public string PreDeleteStorageDirectory { get; set; } = string.Empty;
+    public long PreDeleteMaxFileSizeBytes { get; set; } = 10L * 1024L * 1024L * 1024L;
+    public long PreDeleteCacheLimitBytes { get; set; } = 50L * 1024L * 1024L * 1024L;
+
+    public string EffectivePreDeleteStorageDirectory
+    {
+        get
+        {
+            var path = string.IsNullOrWhiteSpace(PreDeleteStorageDirectory)
+                ? Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "AlgoLassi",
+                    "FileRecovery",
+                    "ProtectedStorage")
+                : PreDeleteStorageDirectory;
+
+            return Path.GetFullPath(path.Trim());
+        }
+    }
+
+    public long EffectivePreDeleteMaxFileSizeBytes =>
+        Math.Clamp(PreDeleteMaxFileSizeBytes, 1L * 1024L * 1024L, 1024L * 1024L * 1024L * 1024L);
+
+    public long EffectivePreDeleteCacheLimitBytes =>
+        Math.Clamp(PreDeleteCacheLimitBytes, 1L * 1024L * 1024L, 4096L * 1024L * 1024L * 1024L);
+
     public Dictionary<string, VolumeJournalCursor> UsnCursors { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
 
