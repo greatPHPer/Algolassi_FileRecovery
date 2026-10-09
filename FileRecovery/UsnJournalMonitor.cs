@@ -684,7 +684,85 @@ public sealed class UsnJournalMonitor : IDisposable
         {
             batchesRead++;
 
-            var records = ReadRecords(volumeHandle, journal.JournalId, nextUsn, out var returnedNextUsn);
+            List<UsnRecord> records;
+            long returnedNextUsn;
+
+            try
+            {
+                records = ReadRecords(
+                    volumeHandle,
+                    journal.JournalId,
+                    nextUsn,
+                    out returnedNextUsn);
+            }
+            catch (Win32Exception ex) when (ex.NativeErrorCode == 87)
+            {
+                // FSCTL_READ_USN_JOURNAL can reject a cursor with ERROR_INVALID_PARAMETER
+                // if the journal rolled forward while this worker was processing records,
+                // or if Windows no longer accepts the saved start position. Previously the
+                // unchanged cursor was retried every monitoring cycle, leaving the status
+                // stuck on the same warning indefinitely.
+                if (!TryQueryJournal(volumeHandle, out var refreshedJournal, out var refreshError))
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"USN invalid-parameter recovery could not query current journal: " +
+                        $"volume={volumeKey}, requestedUsn={nextUsn}, " +
+                        $"journalId={journal.JournalId}, queryError={refreshError}.");
+
+                    StatusChanged?.Invoke(
+                        this,
+                        $"USN monitoring on {volumeKey} could not refresh the journal after error 87; retrying.");
+
+                    return;
+                }
+
+                var cursorStillRetained =
+                    cursor.JournalId == refreshedJournal.JournalId &&
+                    nextUsn >= refreshedJournal.FirstUsn &&
+                    nextUsn >= refreshedJournal.LowestValidUsn &&
+                    nextUsn <= refreshedJournal.NextUsn;
+
+                var recentTailStart = Math.Max(
+                    Math.Max(refreshedJournal.FirstUsn, refreshedJournal.LowestValidUsn),
+                    Math.Max(0L, refreshedJournal.NextUsn - MaxStartupCatchUpUsnBytes));
+
+                // First re-arm at the retained recent tail to preserve as much useful
+                // backlog as possible. If Windows rejects that position too, move to the
+                // current journal end on the next cycle rather than looping on error 87.
+                var retryingRecentTail = nextUsn != recentTailStart;
+                var resumeUsn = retryingRecentTail
+                    ? recentTailStart
+                    : refreshedJournal.NextUsn;
+
+                cursor.JournalId = refreshedJournal.JournalId;
+                cursor.NextUsn = resumeUsn;
+                _settings.UsnCursors[volumeKey] = cursor;
+                _settings.Save();
+
+                var recoveryReason = cursorStillRetained
+                    ? "Windows rejected a cursor still within the journal's reported retained range"
+                    : "the cursor or journal generation was outside the current retained range";
+                var recoveryAction = retryingRecentTail
+                    ? $"retrying the bounded recent tail from USN {resumeUsn}"
+                    : "resuming at the current journal end because the recent-tail read was also rejected";
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"USN monitor recovered from error 87: volume={volumeKey}, " +
+                    $"requestedUsn={nextUsn}, requestedJournalId={journal.JournalId}, " +
+                    $"currentJournalId={refreshedJournal.JournalId}, " +
+                    $"firstUsn={refreshedJournal.FirstUsn}, " +
+                    $"lowestValidUsn={refreshedJournal.LowestValidUsn}, " +
+                    $"currentNextUsn={refreshedJournal.NextUsn}, " +
+                    $"cursorStillRetained={cursorStillRetained}, " +
+                    $"resumeUsn={resumeUsn}, action={recoveryAction}.");
+
+                StatusChanged?.Invoke(
+                    this,
+                    $"USN monitoring recovered from error 87 on {volumeKey}: {recoveryReason}; {recoveryAction}. " +
+                    "A journal gap may mean some older deletion events were skipped.");
+
+                return;
+            }
 
             if (returnedNextUsn <= nextUsn)
             {
