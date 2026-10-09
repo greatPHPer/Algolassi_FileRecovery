@@ -998,6 +998,24 @@ public sealed class PreDeleteSnapshotService : IDisposable
                             _entries[path] = entry;
                         }
 
+                        // Files not referenced by the committed index are abandoned
+                        // stream temporaries/promotions or entries rejected by the
+                        // current limits. The cache directory is app-owned.
+                        var knownFiles = _entries.Values
+                            .Select(entry => entry.CacheFileName)
+                            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                        foreach (var file in Directory.EnumerateFiles(
+                                     _cacheDirectory,
+                                     "*.bin",
+                                     SearchOption.TopDirectoryOnly))
+                        {
+                            if (!knownFiles.Contains(Path.GetFileName(file)))
+                            {
+                                TryDeleteFile(file);
+                            }
+                        }
+
                         PruneLocked(DateTime.UtcNow);
                         SaveIndexLocked();
                     }
@@ -1016,6 +1034,7 @@ public sealed class PreDeleteSnapshotService : IDisposable
         var expired = _entries
             .Where(pair =>
                 nowUtc - pair.Value.CapturedAtUtc > CacheRetention ||
+                pair.Value.Length > MaximumFileBytes ||
                 !CacheFileMatchesLength(pair.Value))
             .Select(pair => pair.Key)
             .ToList();
