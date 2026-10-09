@@ -3674,10 +3674,10 @@ public partial class Form1 : Form
                     {
                         var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
                             $"Enter a distinctive text string that you know was inside '{candidate.Name}'.\r\n\r\n" +
-                            "This is the marker TEXT input, not a recovery confirmation. " +
-                            "Type the exact text (at least 4 bytes) and click OK to start the full-volume forensic scan.\r\n\r\n" +
-                            "Click Cancel, or click OK with an empty box, to skip the forensic scan.",
-                            "Enter forensic marker",
+                            "AlgoLassi will scan the entire source volume for this marker and attempt to recover the surrounding text. " +
+                            "This can read a large amount of data and may take a long time.\r\n\r\n" +
+                            "Enter the exact text (at least 4 bytes). Click Cancel, or leave the box empty, to skip this scan.",
+                            "Full-volume text recovery marker",
                             "");
 
                         if (string.IsNullOrWhiteSpace(enteredMarker))
@@ -3701,83 +3701,62 @@ public partial class Form1 : Form
                             continue;
                         }
 
-                        var logMarkerService = new NtfsLogFileHistoricalDataService();
-
+                        // The marker prompt already explains and obtains consent for a full-volume
+                        // scan. Do not ask a second Yes/No question after the user supplies it;
+                        // the previous extra prompt caused valid marker attempts to stop before
+                        // the raw-volume scanner actually ran. The $LogFile match is diagnostic
+                        // evidence only and must not suppress the independent raw-volume search.
                         try
                         {
-                            var markerFoundInLog = logMarkerService.TryFindMarkerInHistoricalLogFile(
-                                wholeVolumeRoot,
-                                forensicMarker,
-                                out var logMarkerEvidence);
-
-                            var proceedWithFullVolume = markerFoundInLog
-                                ? MessageBox.Show(
-                                    this,
-                                    "The marker was found in NTFS $LogFile, but that only confirms a possible historical text fragment; it does not recover the complete file.\r\n\r\n" +
-                                    "A separate raw-volume scan may still find the text in volume data. It reads the entire source volume and can take a long time.\r\n\r\n" +
-                                    "Continue with the full-volume scan?",
-                                    "Marker Found in NTFS $LogFile",
-                                    MessageBoxButtons.YesNo,
-                                    MessageBoxIcon.Warning,
-                                    MessageBoxDefaultButton.Button2)
-                                : MessageBox.Show(
-                                    this,
-                                    "The marker was not found in the retained NTFS $LogFile.\r\n\r\n" +
-                                    "Starting the raw-volume forensic scan will read the entire source volume and can take a long time.\r\n\r\n" +
-                                    "Start the full-volume scan now?",
-                                    "Start Full-Volume Forensic Scan",
-                                    MessageBoxButtons.YesNo,
-                                    MessageBoxIcon.Question,
-                                    MessageBoxDefaultButton.Button2);
-
-                            if (proceedWithFullVolume != DialogResult.Yes)
+                            var logProbe = await Task.Run(() =>
                             {
-                                failures.Add(
-                                    $"{candidate.Name}: raw-volume marker scan was skipped by the user. " +
-                                    $"markerFoundInLog={markerFoundInLog}; {logMarkerEvidence}");
-                                continue;
-                            }
+                                var found = new NtfsLogFileHistoricalDataService()
+                                    .TryFindMarkerInHistoricalLogFile(
+                                        wholeVolumeRoot,
+                                        forensicMarker,
+                                        out var evidence);
+                                return (Found: found, Evidence: evidence);
+                            });
+
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS marker preflight: path={candidate.FullPath}, " +
+                                $"markerFoundInLog={logProbe.Found}; continuing to raw-volume scan. " +
+                                logProbe.Evidence);
                         }
                         catch (Exception ex)
                         {
-                            var proceedWithFullVolume = MessageBox.Show(
-                                this,
-                                $"The NTFS $LogFile marker diagnostic failed:\r\n\r\n{ex.Message}\r\n\r\n" +
-                                "Start the raw-volume forensic scan anyway?",
-                                "NTFS $LogFile Marker Diagnostic Failed",
-                                MessageBoxButtons.YesNo,
-                                MessageBoxIcon.Warning,
-                                MessageBoxDefaultButton.Button2);
-
-                            if (proceedWithFullVolume != DialogResult.Yes)
-                            {
-                                failures.Add(
-                                    $"{candidate.Name}: the NTFS $LogFile marker diagnostic failed and the full-volume forensic scan was skipped: {ex.Message}");
-                                continue;
-                            }
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS marker preflight failed for {candidate.FullPath}; " +
+                                $"continuing to raw-volume scan: {ex.GetType().Name}: {ex.Message}");
                         }
 
                         var totalVolumeBytes = new DriveInfo(wholeVolumeRoot).TotalSize;
-                        var forensicProgress = new SynchronousProgress<long>(
-                            this,
-                            bytesScanned =>
+                        // Progress<T> posts updates back to the captured UI synchronization
+                        // context. Run the actual volume scan in the background so the
+                        // Recovery Center remains responsive during large-volume reads.
+                        var forensicProgress = new Progress<long>(bytesScanned =>
+                        {
+                            if (!IsDisposed)
                             {
                                 lblStatus.Text =
                                     $"Forensic full-volume scan for {candidate.Name}... " +
                                     $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
                                     $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
-                            });
+                            }
+                        });
 
                         try
                         {
                             forensicProgress.Report(0);
 
-                            var forensicRecovery = _ntfsWholeVolumeTextRecoveryService.Recover(
-                                candidate,
-                                destinationDirectory,
-                                forensicMarker,
-                                CancellationToken.None,
-                                forensicProgress);
+                            var forensicRecovery = await Task.Run(
+                                () => _ntfsWholeVolumeTextRecoveryService.Recover(
+                                    candidate,
+                                    destinationDirectory,
+                                    forensicMarker,
+                                    CancellationToken.None,
+                                    forensicProgress),
+                                CancellationToken.None);
 
                             successes.Add(forensicRecovery);
                             continue;
