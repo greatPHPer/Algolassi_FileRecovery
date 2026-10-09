@@ -248,18 +248,21 @@ public partial class Form1 : Form
                 e.Graphics.DrawRectangle(border, buttonBounds);
             }
 
-            var textBounds = Rectangle.Inflate(buttonBounds, -6, 0);
-            TextRenderer.DrawText(
-                e.Graphics,
-                segment.Label,
-                e.Font,
-                textBounds,
-                SystemColors.ControlText,
-                TextFormatFlags.HorizontalCenter |
-                TextFormatFlags.VerticalCenter |
-                TextFormatFlags.NoPrefix |
-                TextFormatFlags.EndEllipsis |
-                TextFormatFlags.NoPadding);
+            if (visibleWidth > 12)
+            {
+                var textBounds = Rectangle.Inflate(buttonBounds, -6, 0);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    segment.Label,
+                    e.Font,
+                    textBounds,
+                    SystemColors.ControlText,
+                    TextFormatFlags.HorizontalCenter |
+                    TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.NoPrefix |
+                    TextFormatFlags.EndEllipsis |
+                    TextFormatFlags.NoPadding);
+            }
 
             x += desiredWidth;
             if (segment != segments[^1])
