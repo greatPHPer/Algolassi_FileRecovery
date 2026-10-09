@@ -408,8 +408,19 @@ public sealed class PreDeleteSnapshotService : IDisposable
             int plannedEntries;
             lock (_gate)
             {
-                plannedBytes = _entries.Values.Sum(entry => entry.Length);
-                plannedEntries = _entries.Count;
+                // Stale cached versions for files that changed while AlgoLassi was
+                // closed will be replaced, so do not count those old versions against
+                // the new baseline's entry/byte budget.
+                var validEntries = _entries.Values
+                    .Where(entry =>
+                        _observedVersions.TryGetValue(entry.Path, out var observed) &&
+                        observed.Length == entry.Length &&
+                        observed.LastWriteTimeUtcTicks == entry.LastWriteTimeUtcTicks &&
+                        CacheFileMatchesLength(entry))
+                    .ToList();
+
+                plannedBytes = validEntries.Sum(entry => entry.Length);
+                plannedEntries = validEntries.Count;
             }
 
             var queued = 0;
@@ -417,12 +428,24 @@ public sealed class PreDeleteSnapshotService : IDisposable
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                if (queued >= MaximumInitialSnapshots)
+                {
+                    break;
+                }
+
                 lock (_gate)
                 {
                     if (_disposed || !IsProtectedPathLocked(candidate.Path))
                     {
                         continue;
                     }
+                }
+
+                // A filesystem watcher may already have captured this version
+                // since the baseline candidate list was assembled.
+                if (CacheMatchesVersion(candidate.Path, candidate.Version))
+                {
+                    continue;
                 }
 
                 if (plannedEntries >= MaximumCacheEntries ||
