@@ -391,6 +391,22 @@ public sealed class NtfsDeepFileRecoveryService
                 availableInExtent,
                 MaxRarArchiveBytes);
 
+            // When NTFS supplied an original size, never let a doubtful signature
+            // cause the parser to walk gigabytes looking for a header chain. Allow
+            // up to 1 MiB beyond the recorded size for optional appended data.
+            if (knownFileSizeBytes > 0)
+            {
+                if (knownFileSizeBytes > MaxRarArchiveBytes)
+                {
+                    continue;
+                }
+
+                var sizeBound = Math.Min(
+                    MaxRarArchiveBytes,
+                    knownFileSizeBytes + 1024L * 1024L);
+                maximumArchiveLength = Math.Min(maximumArchiveLength, sizeBound);
+            }
+
             if (maximumArchiveLength < signatureLength)
             {
                 continue;
@@ -409,6 +425,10 @@ public sealed class NtfsDeepFileRecoveryService
                         out parsedArchiveLength,
                         out parsedFormat))
                 {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"RAR signature candidate rejected: path={candidate.FullPath}, " +
+                        $"offset={absoluteStart:N0}, available={maximumArchiveLength:N0} bytes; " +
+                        "the archive header chain did not validate within this contiguous free extent.");
                     continue;
                 }
             }
