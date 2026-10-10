@@ -776,12 +776,44 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             cancellationToken);
 
         var markerEncoding = FindMarkerEncodingAtStart(prefix, markerVariants);
+        var previewLength = Math.Min(64, prefix.Length);
+        var preview = prefix.AsSpan(0, previewLength);
+        var previewAllZero = true;
+
+        foreach (var value in preview)
+        {
+            if (value != 0)
+            {
+                previewAllZero = false;
+                break;
+            }
+        }
+
+        var previewHex = Convert.ToHexString(preview);
+        var firstExtent = mappedExtents[0];
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS retained-runlist prefix diagnostic: path={candidate.FullPath}, " +
+            $"firstVcn={firstExtent.VirtualClusterNumber:N0}, " +
+            $"firstLcn={firstExtent.LogicalClusterNumber:N0}, " +
+            $"firstExtentClusters={firstExtent.ClusterCount:N0}, " +
+            $"bytesPerCluster={bytesPerCluster:N0}, prefixBytesRead={prefix.Length:N0}, " +
+            $"previewBytes={previewLength:N0}, previewAllZero={previewAllZero}, " +
+            $"previewHex={previewHex}, markerAtStart={markerEncoding is not null}.");
+
         if (markerEncoding is null)
         {
+            var diagnosis = previewAllZero
+                ? "The first 64 mapped bytes are all zero. This is consistent with deallocated/TRIMmed data " +
+                  "or a stale runlist; the original contents cannot be reconstructed from these bytes."
+                : "The mapped prefix contains non-zero bytes, but they do not match the supplied marker. " +
+                  "The retained runlist may refer to a different file generation or the original start bytes " +
+                  "may have been overwritten.";
+
             throw new InvalidOperationException(
                 "The retained NTFS runlist points to currently-free clusters, but the supplied marker does not " +
-                "appear at byte zero (or immediately after a supported text BOM). The mapping was not used, " +
-                "and the whole-volume scan was skipped to avoid another lengthy scan.");
+                "appear at byte zero (or immediately after a supported text BOM). " + diagnosis +
+                " The mapping was not used, and the whole-volume scan was skipped to avoid another lengthy scan.");
         }
 
         System.Diagnostics.Trace.WriteLine(
