@@ -41,6 +41,7 @@ public sealed class UsnJournalMonitor : IDisposable
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<RecentDeletedRecord> _recentDeletedRecords = new();
     private const long DeleteSnapshotMaxBytes = 16L * 1024L * 1024L;
+    private const long MaxStreamingDeleteSnapshotBytes = 2L * 1024 * 1024 * 1024;
     private readonly NtfsDeletionSnapshotStore _snapshotStore = new();
     // Only one live $LogFile fallback is allowed at a time. A burst of browser/editor
     // deletions must not start multiple 640 MB journal parses concurrently.
@@ -950,22 +951,60 @@ public sealed class UsnJournalMonitor : IDisposable
             var root = volumeKey + Path.DirectorySeparatorChar;
             var reader = new NtfsMftDataReader();
 
-            if (!reader.TryCaptureDeletedData(
+            NtfsDataStreamInfo stream;
+            byte[] capturedData = [];
+            var streamedCapture = false;
+            var streamedAllZero = false;
+            string? streamedDataFileName = null;
+            string? streamedSha256 = null;
+            var expectedFileSizeBytes = deletion.FileSizeBytes ?? 0;
+            var isBoundedPreStartCapture =
+                allowBoundedDeleteTransition &&
+                maxBoundedDeleteSequenceAdvance == 1;
+
+            if (expectedFileSizeBytes > DeleteSnapshotMaxBytes &&
+                expectedFileSizeBytes <= MaxStreamingDeleteSnapshotBytes &&
+                reader.TryCaptureDeletedDataToSnapshotStore(
                     root,
                     fileReferenceNumber,
                     parentFileReferenceNumber,
                     fileName,
                     expectedFullPath,
-                    DeleteSnapshotMaxBytes,
-                    out var stream,
-                    out var capturedData,
+                    _snapshotStore,
+                    deletion.Id,
+                    MaxStreamingDeleteSnapshotBytes,
+                    rejectAllZeroContent: isBoundedPreStartCapture,
+                    out stream,
+                    out streamedDataFileName,
+                    out streamedSha256,
+                    out streamedAllZero,
                     expectedDeletedAtUtc: deletion.DeletedAtUtc,
                     allowBoundedDeleteTransition: allowBoundedDeleteTransition,
-                    expectedFileSizeBytes: deletion.FileSizeBytes ?? 0,
+                    expectedFileSizeBytes: expectedFileSizeBytes,
                     maxBoundedDeleteSequenceAdvance: maxBoundedDeleteSequenceAdvance))
+            {
+                streamedCapture = true;
+            }
+            else if (!reader.TryCaptureDeletedData(
+                         root,
+                         fileReferenceNumber,
+                         parentFileReferenceNumber,
+                         fileName,
+                         expectedFullPath,
+                         DeleteSnapshotMaxBytes,
+                         out stream,
+                         out capturedData,
+                         expectedDeletedAtUtc: deletion.DeletedAtUtc,
+                         allowBoundedDeleteTransition: allowBoundedDeleteTransition,
+                         expectedFileSizeBytes: expectedFileSizeBytes,
+                         maxBoundedDeleteSequenceAdvance: maxBoundedDeleteSequenceAdvance))
             {
                 return;
             }
+
+            var capturedByteCount = streamedCapture
+                ? stream.FileSizeBytes
+                : capturedData.LongLength;
 
             deletion.FileSizeBytes =
                 stream.FileSizeBytes >= 0
@@ -978,15 +1017,13 @@ public sealed class UsnJournalMonitor : IDisposable
             // from this conservative catch-up path as a complete/strong snapshot.
             // A genuinely all-zero file can exist, so preserve its metadata as a
             // metadata-only result instead of treating the bytes as trustworthy.
-            var isBoundedPreStartCapture =
-                allowBoundedDeleteTransition &&
-                maxBoundedDeleteSequenceAdvance == 1;
-            var isAllZeroCapture =
-                capturedData.Length > 0 &&
-                capturedData.All(static value => value == 0);
+            var isAllZeroCapture = streamedCapture
+                ? capturedByteCount > 0 && streamedAllZero
+                : capturedData.Length > 0 &&
+                  capturedData.All(static value => value == 0);
             var rejectAllZeroPreStartCapture =
                 isBoundedPreStartCapture &&
-                capturedData.LongLength == stream.FileSizeBytes &&
+                capturedByteCount == stream.FileSizeBytes &&
                 isAllZeroCapture;
 
             var snapshot = new NtfsDeletionDataSnapshot
@@ -995,7 +1032,7 @@ public sealed class UsnJournalMonitor : IDisposable
                 IsResident = stream.IsResident,
                 FileSizeBytes = stream.FileSizeBytes,
                 ValidDataLengthBytes = stream.ValidDataLengthBytes,
-                CapturedByteCount = capturedData.LongLength,
+                CapturedByteCount = capturedByteCount,
                 DataExtents = stream.Extents
                     .Select(extent => new NtfsDataExtent
                     {
@@ -1009,8 +1046,10 @@ public sealed class UsnJournalMonitor : IDisposable
                     ? "Pre-start catch-up returned an all-zero buffer after a bounded MFT transition. " +
                       "Original contents may have been discarded by storage TRIM or the current runlist " +
                       "may no longer reference the original allocation; content was not marked captured."
-                    : capturedData.LongLength == stream.FileSizeBytes
-                        ? "NTFS $DATA was captured immediately when the USN deletion was observed."
+                    : capturedByteCount == stream.FileSizeBytes
+                        ? streamedCapture
+                            ? "NTFS $DATA was streamed to a durable snapshot when the USN deletion was observed."
+                            : "NTFS $DATA was captured immediately when the USN deletion was observed."
                         : $"NTFS $DATA metadata was captured at deletion time, but content capture was limited to {DeleteSnapshotMaxBytes:N0} bytes."
             };
 
@@ -1026,7 +1065,20 @@ public sealed class UsnJournalMonitor : IDisposable
                 return;
             }
 
-            if (capturedData.LongLength == stream.FileSizeBytes &&
+            if (streamedCapture)
+            {
+                snapshot.DataCaptured = true;
+                snapshot.DataFileName = streamedDataFileName;
+                snapshot.Sha256 = streamedSha256 ?? string.Empty;
+                deletion.RecoveryStrength = "Strong";
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS streamed deletion snapshot saved: path={deletion.FullPath}, " +
+                    $"fileRef={fileReferenceNumber}, size={capturedByteCount:N0}, " +
+                    $"resident={stream.IsResident}, dataFile={streamedDataFileName}, " +
+                    $"sha256={streamedSha256}.");
+            }
+            else if (capturedData.LongLength == stream.FileSizeBytes &&
                 _snapshotStore.TrySave(
                     deletion.Id,
                     capturedData,
@@ -1048,7 +1100,7 @@ public sealed class UsnJournalMonitor : IDisposable
                 System.Diagnostics.Debug.WriteLine(
                     $"NTFS deletion snapshot metadata only: path={deletion.FullPath}, " +
                     $"fileRef={fileReferenceNumber}, size={stream.FileSizeBytes:N0}, " +
-                    $"capturedBytes={capturedData.LongLength:N0}.");
+                    $"capturedBytes={capturedByteCount:N0}.");
             }
 
             deletion.NtfsDataSnapshot = snapshot;
