@@ -2711,40 +2711,118 @@ public sealed class NtfsDeepFileRecoveryService
         var currentOffset = offset;
         var bufferOffset = 0;
 
+        // Windows may open volume handles as noncached even when
+        // FILE_FLAG_NO_BUFFERING was not explicitly supplied. Random MP4-box
+        // reads commonly begin at arbitrary byte offsets, so retry a failed
+        // random read with an aligned sector-sized window. 4096 is a multiple
+        // of the common 512-byte, 1024-byte, 2048-byte and 4096-byte sector sizes.
+        const long fallbackAlignment = 4096;
+
         while (remaining > 0)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             var chunk = Math.Min(IoBufferSize, remaining);
+            var chunkBuffer = bufferOffset == 0 && chunk == buffer.Length
+                ? buffer
+                : new byte[chunk];
+
+            var directReadSucceeded = false;
+            var directError = 0;
+
             if (!SetFilePointerEx(
                     volumeHandle,
                     currentOffset,
                     out _,
                     0))
             {
-                throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    $"Could not seek to volume offset {currentOffset:N0}.");
+                directError = Marshal.GetLastWin32Error();
             }
-
-            var chunkBuffer = bufferOffset == 0 && chunk == buffer.Length
-                ? buffer
-                : new byte[chunk];
-
-            if (!ReadFile(
-                    volumeHandle,
-                    chunkBuffer,
-                    (uint)chunk,
-                    out var bytesRead,
-                    IntPtr.Zero) ||
-                bytesRead != (uint)chunk)
+            else if (!ReadFile(
+                         volumeHandle,
+                         chunkBuffer,
+                         (uint)chunk,
+                         out var directBytesRead,
+                         IntPtr.Zero) &&
+                     directBytesRead == 0)
             {
-                throw new Win32Exception(
-                    Marshal.GetLastWin32Error(),
-                    $"Could not read volume data at byte offset {currentOffset:N0}.");
+                directError = Marshal.GetLastWin32Error();
+            }
+            else
+            {
+                // A short read is also a failure, even if ReadFile returned true.
+                // Capture a usable error code before attempting the aligned retry.
+                if (directBytesRead == (uint)chunk)
+                {
+                    directReadSucceeded = true;
+                }
+                else
+                {
+                    directError = Marshal.GetLastWin32Error();
+                    if (directError == 0)
+                    {
+                        directError = 38; // ERROR_HANDLE_EOF
+                    }
+                }
             }
 
-            if (!ReferenceEquals(chunkBuffer, buffer))
+            if (!directReadSucceeded)
+            {
+                var alignedOffset = currentOffset - currentOffset % fallbackAlignment;
+                var prefixBytes = checked((int)(currentOffset - alignedOffset));
+                var requiredBytes = checked((long)prefixBytes + chunk);
+                var alignedLength = checked((int)(
+                    ((requiredBytes + fallbackAlignment - 1) / fallbackAlignment) *
+                    fallbackAlignment));
+                var alignedBuffer = new byte[alignedLength];
+
+                if (!SetFilePointerEx(
+                        volumeHandle,
+                        alignedOffset,
+                        out _,
+                        0))
+                {
+                    var alignedSeekError = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(
+                        alignedSeekError,
+                        $"Could not seek to volume offset {currentOffset:N0} " +
+                        $"(direct I/O error {directError}; aligned offset {alignedOffset:N0}).");
+                }
+
+                if (!ReadFile(
+                        volumeHandle,
+                        alignedBuffer,
+                        (uint)alignedLength,
+                        out var alignedBytesRead,
+                        IntPtr.Zero) ||
+                    alignedBytesRead != (uint)alignedLength)
+                {
+                    var alignedReadError = Marshal.GetLastWin32Error();
+                    if (alignedReadError == 0)
+                    {
+                        alignedReadError = 38; // ERROR_HANDLE_EOF
+                    }
+
+                    throw new Win32Exception(
+                        alignedReadError,
+                        $"Could not read aligned volume data for byte offset {currentOffset:N0} " +
+                        $"(direct I/O error {directError}; aligned offset {alignedOffset:N0}, " +
+                        $"requested {alignedLength:N0} byte(s), received {alignedBytesRead:N0}).");
+                }
+
+                Buffer.BlockCopy(
+                    alignedBuffer,
+                    prefixBytes,
+                    buffer,
+                    bufferOffset,
+                    chunk);
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"Deep NTFS aligned random-read fallback: offset={currentOffset:N0}, " +
+                    $"bytes={chunk:N0}, alignedOffset={alignedOffset:N0}, " +
+                    $"alignedBytes={alignedLength:N0}, directError={directError}.");
+            }
+            else if (!ReferenceEquals(chunkBuffer, buffer))
             {
                 Buffer.BlockCopy(
                     chunkBuffer,
