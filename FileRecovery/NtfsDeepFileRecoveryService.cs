@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Buffers.Binary;
 using System.ComponentModel;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace FileRecovery;
@@ -190,6 +191,27 @@ public sealed class NtfsDeepFileRecoveryService
                     return rarRecovery;
                 }
 
+                // MP4/MOV containers have explicit top-level box lengths. Parse those
+                // directly from the raw volume and stream the full file to disk, so
+                // multi-hundred-megabyte videos do not need to fit in the 64 MiB buffer.
+                if (TryRecoverMp4FromScanWindow(
+                        scanWindow,
+                        scanWindowOffset,
+                        physicalOffset,
+                        extentOffset,
+                        extentBytes,
+                        volumeInfo.BytesPerCluster,
+                        knownFileSizeBytes,
+                        volumeHandle,
+                        bitmapReader,
+                        candidate,
+                        destinationDirectory,
+                        cancellationToken,
+                        out var mp4Recovery))
+                {
+                    return mp4Recovery;
+                }
+
                 if (!TryCarve(
                         extension,
                         scanWindow,
@@ -344,6 +366,9 @@ public sealed class NtfsDeepFileRecoveryService
 
     private const long MaxRarArchiveBytes = 16L * 1024L * 1024L * 1024L;
     private const int MaxRarHeaderBytes = 2 * 1024 * 1024;
+    private const long MaxMp4ArchiveBytes = 16L * 1024L * 1024L * 1024L;
+    private const int MaxMp4FtypBoxBytes = 1024 * 1024;
+    private const int MaxMp4TopLevelBoxes = 1_000_000;
 
     private static bool TryRecoverRarFromScanWindow(
         byte[] scanWindow,
@@ -591,6 +616,682 @@ public sealed class NtfsDeepFileRecoveryService
         }
 
         return false;
+    }
+
+    private static bool TryRecoverMp4FromScanWindow(
+        byte[] scanWindow,
+        long scanWindowOffset,
+        long currentChunkPhysicalOffset,
+        long freeExtentStart,
+        long freeExtentLength,
+        long bytesPerCluster,
+        long knownFileSizeBytes,
+        SafeFileHandle volumeHandle,
+        NtfsVolumeBitmapReader bitmapReader,
+        RecoveryCandidate candidate,
+        string destinationDirectory,
+        CancellationToken cancellationToken,
+        out RecoveryResult recovery)
+    {
+        recovery = null!;
+        if (bytesPerCluster <= 0 || freeExtentLength <= 0)
+        {
+            return false;
+        }
+
+        var freeExtentEnd = checked(freeExtentStart + freeExtentLength);
+        var searchFrom = 0;
+
+        while (TryFindMp4Signature(scanWindow, searchFrom, out var signatureOffset))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            searchFrom = signatureOffset + 1;
+
+            var absoluteStart = checked(scanWindowOffset + signatureOffset);
+            if (absoluteStart < freeExtentStart ||
+                absoluteStart > freeExtentEnd - 16)
+            {
+                continue;
+            }
+
+            var availableInExtent = freeExtentEnd - absoluteStart;
+            var maximumArchiveLength = Math.Min(
+                availableInExtent,
+                MaxMp4ArchiveBytes);
+
+            if (knownFileSizeBytes > 0)
+            {
+                if (knownFileSizeBytes > MaxMp4ArchiveBytes ||
+                    knownFileSizeBytes > availableInExtent)
+                {
+                    continue;
+                }
+
+                maximumArchiveLength = Math.Min(
+                    maximumArchiveLength,
+                    knownFileSizeBytes);
+            }
+
+            if (maximumArchiveLength < 16)
+            {
+                continue;
+            }
+
+            long parsedArchiveLength;
+            try
+            {
+                if (!TryMeasureMp4Archive(
+                        volumeHandle,
+                        absoluteStart,
+                        maximumArchiveLength,
+                        knownFileSizeBytes,
+                        cancellationToken,
+                        out parsedArchiveLength))
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"MP4 signature candidate rejected: path={candidate.FullPath}, " +
+                        $"offset={absoluteStart:N0}, available={maximumArchiveLength:N0} bytes; " +
+                        "the MP4 box structure did not validate.");
+                    continue;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"MP4 structural scan rejected candidate at offset {absoluteStart:N0}: " +
+                    $"{ex.GetType().Name}: {ex.Message}");
+                continue;
+            }
+
+            if (parsedArchiveLength <= 0 ||
+                parsedArchiveLength > maximumArchiveLength ||
+                (knownFileSizeBytes > 0 && parsedArchiveLength != knownFileSizeBytes))
+            {
+                continue;
+            }
+
+            // An MP4 signature in the retained overlap may have been evaluated
+            // during an earlier chunk. Avoid recovering the same candidate twice.
+            if (absoluteStart + parsedArchiveLength <= currentChunkPhysicalOffset)
+            {
+                continue;
+            }
+
+            var firstCluster = absoluteStart / bytesPerCluster;
+            var lastByteExclusive = checked(absoluteStart + parsedArchiveLength);
+            var lastClusterExclusive = checked(
+                (lastByteExclusive + bytesPerCluster - 1) / bytesPerCluster);
+            var clusterCount = checked(lastClusterExclusive - firstCluster);
+
+            if (clusterCount <= 0)
+            {
+                continue;
+            }
+
+            var allocation = bitmapReader.CheckExtents(
+                volumeHandle,
+                [
+                    new NtfsDataExtent
+                    {
+                        VirtualClusterNumber = 0,
+                        LogicalClusterNumber = firstCluster,
+                        ClusterCount = clusterCount
+                    }
+                ],
+                cancellationToken);
+
+            if (allocation.Count != 1 ||
+                allocation[0].AllocatedClusterCount != 0 ||
+                allocation[0].FreeClusterCount != clusterCount)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"MP4 recovery rejected because its full span is no longer free: " +
+                    $"path={candidate.FullPath}, offset={absoluteStart:N0}, " +
+                    $"bytes={parsedArchiveLength:N0}.");
+                continue;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"Deep NTFS MP4 carve hit: candidate={candidate.FullPath}, " +
+                $"offset={absoluteStart:N0}, bytes={parsedArchiveLength:N0}, " +
+                $"clusters={clusterCount:N0}; MP4 box structure validated.");
+
+            var destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
+                destinationDirectory,
+                candidate.Name);
+
+            var destinationCreated = false;
+            try
+            {
+                using var output = new FileStream(
+                    destinationPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    IoBufferSize,
+                    FileOptions.SequentialScan);
+
+                destinationCreated = true;
+                var remaining = parsedArchiveLength;
+                var sourceOffset = absoluteStart;
+
+                while (remaining > 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var count = checked((int)Math.Min(IoBufferSize, remaining));
+                    var copyBuffer = new byte[count];
+
+                    ReadAt(
+                        volumeHandle,
+                        sourceOffset,
+                        copyBuffer,
+                        cancellationToken);
+
+                    output.Write(copyBuffer, 0, copyBuffer.Length);
+                    sourceOffset = checked(sourceOffset + count);
+                    remaining -= count;
+                }
+
+                output.Flush();
+            }
+            catch
+            {
+                if (destinationCreated)
+                {
+                    TryDelete(destinationPath);
+                }
+
+                throw;
+            }
+
+            recovery = new RecoveryResult
+            {
+                Success = true,
+                SourcePath = candidate.FullPath,
+                DestinationPath = destinationPath,
+                BytesRecovered = parsedArchiveLength,
+                Evidence =
+                    $"Deep NTFS carving recovered a {parsedArchiveLength:N0}-byte MP4/QuickTime " +
+                    "container from a single currently-free contiguous cluster extent. The " +
+                    "top-level ftyp/moov/mdat boxes and track structure were validated, but " +
+                    "the video was not decoded and its audio/video frames were not independently " +
+                    "verified. Open and play the recovered file, and compare SHA-256 when the " +
+                    "original hash is available."
+            };
+
+            System.Diagnostics.Trace.WriteLine(
+                $"Deep NTFS MP4 carve succeeded: source={candidate.FullPath}, " +
+                $"offset={absoluteStart:N0}, bytes={parsedArchiveLength:N0}, " +
+                $"destination={destinationPath}.");
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryFindMp4Signature(
+        byte[] buffer,
+        int searchFrom,
+        out int start)
+    {
+        start = -1;
+        searchFrom = Math.Max(0, searchFrom);
+
+        for (var i = searchFrom; i <= buffer.Length - 8; i++)
+        {
+            if (!buffer.AsSpan(i + 4, 4).SequenceEqual("ftyp"u8))
+            {
+                continue;
+            }
+
+            var boxSize = BinaryPrimitives.ReadUInt32BigEndian(
+                buffer.AsSpan(i, 4));
+
+            if (boxSize >= 16 || boxSize == 1)
+            {
+                start = i;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static bool TryMeasureMp4Archive(
+        SafeFileHandle volumeHandle,
+        long startOffset,
+        long maximumArchiveLength,
+        long knownFileSizeBytes,
+        CancellationToken cancellationToken,
+        out long archiveLength)
+    {
+        archiveLength = 0;
+        if (startOffset < 0 ||
+            maximumArchiveLength < 16 ||
+            (knownFileSizeBytes > 0 &&
+             (knownFileSizeBytes > maximumArchiveLength ||
+              knownFileSizeBytes > MaxMp4ArchiveBytes)))
+        {
+            return false;
+        }
+
+        var hasKnownLength = knownFileSizeBytes > 0;
+        var scanLimit = hasKnownLength
+            ? knownFileSizeBytes
+            : maximumArchiveLength;
+
+        if (scanLimit > MaxMp4ArchiveBytes)
+        {
+            return false;
+        }
+
+        long relativeOffset = 0;
+        var sawFileType = false;
+        var sawMovie = false;
+        var sawMediaData = false;
+
+        for (var boxIndex = 0; boxIndex < MaxMp4TopLevelBoxes; boxIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (relativeOffset == scanLimit)
+            {
+                if (sawFileType && sawMovie && sawMediaData)
+                {
+                    archiveLength = relativeOffset;
+                    return true;
+                }
+
+                return false;
+            }
+
+            var remaining = scanLimit - relativeOffset;
+            if (remaining < 8)
+            {
+                if (!hasKnownLength &&
+                    relativeOffset > 0 &&
+                    sawFileType && sawMovie && sawMediaData)
+                {
+                    archiveLength = relativeOffset;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (!TryReadMp4BoxHeader(
+                    volumeHandle,
+                    checked(startOffset + relativeOffset),
+                    remaining,
+                    cancellationToken,
+                    out var boxType,
+                    out var boxSize,
+                    out var headerLength,
+                    out var boxExtendsToEnd))
+            {
+                // With no trusted original length, the first invalid box after a
+                // complete ftyp/moov/mdat sequence is treated as the end boundary.
+                // With a trusted NTFS size, malformed boxes reject the candidate.
+                if (!hasKnownLength &&
+                    relativeOffset > 0 &&
+                    sawFileType && sawMovie && sawMediaData)
+                {
+                    archiveLength = relativeOffset;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (!hasKnownLength && !IsKnownMp4TopLevelBox(boxType))
+            {
+                if (relativeOffset > 0 && sawFileType && sawMovie && sawMediaData)
+                {
+                    archiveLength = relativeOffset;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (relativeOffset == 0 &&
+                !string.Equals(boxType, "ftyp", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (boxExtendsToEnd &&
+                (!hasKnownLength ||
+                 !string.Equals(boxType, "mdat", StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            if (string.Equals(boxType, "ftyp", StringComparison.Ordinal))
+            {
+                if (relativeOffset != 0 ||
+                    sawFileType ||
+                    !TryValidateMp4FileTypeBox(
+                        volumeHandle,
+                        checked(startOffset + relativeOffset),
+                        boxSize,
+                        headerLength,
+                        cancellationToken))
+                {
+                    return false;
+                }
+
+                sawFileType = true;
+            }
+            else if (string.Equals(boxType, "moov", StringComparison.Ordinal))
+            {
+                if (!sawFileType ||
+                    sawMovie ||
+                    !TryValidateMp4MovieBox(
+                        volumeHandle,
+                        checked(startOffset + relativeOffset),
+                        boxSize,
+                        headerLength,
+                        cancellationToken))
+                {
+                    return false;
+                }
+
+                sawMovie = true;
+            }
+            else if (string.Equals(boxType, "mdat", StringComparison.Ordinal))
+            {
+                if (!sawFileType || boxSize <= headerLength)
+                {
+                    return false;
+                }
+
+                sawMediaData = true;
+            }
+            else if (!sawFileType)
+            {
+                return false;
+            }
+
+            relativeOffset = checked(relativeOffset + boxSize);
+        }
+
+        return false;
+    }
+
+    private static bool TryReadMp4BoxHeader(
+        SafeFileHandle volumeHandle,
+        long boxOffset,
+        long availableBytes,
+        CancellationToken cancellationToken,
+        out string boxType,
+        out long boxSize,
+        out int headerLength,
+        out bool boxExtendsToEnd)
+    {
+        boxType = string.Empty;
+        boxSize = 0;
+        headerLength = 0;
+        boxExtendsToEnd = false;
+
+        if (availableBytes < 8)
+        {
+            return false;
+        }
+
+        var baseHeader = new byte[8];
+        ReadAt(volumeHandle, boxOffset, baseHeader, cancellationToken);
+
+        if (!IsValidMp4FourCc(baseHeader.AsSpan(4, 4)))
+        {
+            return false;
+        }
+
+        boxType = Encoding.ASCII.GetString(baseHeader, 4, 4);
+        var shortSize = BinaryPrimitives.ReadUInt32BigEndian(
+            baseHeader.AsSpan(0, 4));
+
+        if (shortSize == 1)
+        {
+            if (availableBytes < 16)
+            {
+                return false;
+            }
+
+            var extendedSize = new byte[8];
+            ReadAt(
+                volumeHandle,
+                checked(boxOffset + 8),
+                extendedSize,
+                cancellationToken);
+
+            var wideSize = BinaryPrimitives.ReadUInt64BigEndian(extendedSize);
+            if (wideSize > long.MaxValue)
+            {
+                return false;
+            }
+
+            boxSize = (long)wideSize;
+            headerLength = 16;
+        }
+        else if (shortSize == 0)
+        {
+            boxSize = availableBytes;
+            headerLength = 8;
+            boxExtendsToEnd = true;
+        }
+        else
+        {
+            boxSize = shortSize;
+            headerLength = 8;
+        }
+
+        return boxSize >= headerLength && boxSize <= availableBytes;
+    }
+
+    private static bool TryValidateMp4FileTypeBox(
+        SafeFileHandle volumeHandle,
+        long boxOffset,
+        long boxSize,
+        int headerLength,
+        CancellationToken cancellationToken)
+    {
+        if (boxSize > MaxMp4FtypBoxBytes)
+        {
+            return false;
+        }
+
+        var payloadLength = checked((int)(boxSize - headerLength));
+        // ftyp requires major_brand + minor_version, followed by zero or more
+        // four-character compatible brands.
+        if (payloadLength < 8 || (payloadLength - 8) % 4 != 0)
+        {
+            return false;
+        }
+
+        var payload = new byte[payloadLength];
+        ReadAt(
+            volumeHandle,
+            checked(boxOffset + headerLength),
+            payload,
+            cancellationToken);
+
+        if (!IsValidMp4FourCc(payload.AsSpan(0, 4)))
+        {
+            return false;
+        }
+
+        for (var brandOffset = 8; brandOffset < payload.Length; brandOffset += 4)
+        {
+            if (!IsValidMp4FourCc(payload.AsSpan(brandOffset, 4)))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryValidateMp4MovieBox(
+        SafeFileHandle volumeHandle,
+        long boxOffset,
+        long boxSize,
+        int headerLength,
+        CancellationToken cancellationToken)
+    {
+        if (boxSize < headerLength + 8)
+        {
+            return false;
+        }
+
+        long relativeChildOffset = headerLength;
+        var sawMovieHeader = false;
+        var sawTrack = false;
+
+        for (var childIndex = 0;
+             childIndex < MaxMp4TopLevelBoxes && relativeChildOffset < boxSize;
+             childIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var remaining = boxSize - relativeChildOffset;
+            if (!TryReadMp4BoxHeader(
+                    volumeHandle,
+                    checked(boxOffset + relativeChildOffset),
+                    remaining,
+                    cancellationToken,
+                    out var childType,
+                    out var childSize,
+                    out var childHeaderLength,
+                    out var childExtendsToEnd) ||
+                childExtendsToEnd)
+            {
+                return false;
+            }
+
+            if (string.Equals(childType, "mvhd", StringComparison.Ordinal))
+            {
+                if (childSize < childHeaderLength + 4)
+                {
+                    return false;
+                }
+
+                sawMovieHeader = true;
+            }
+            else if (string.Equals(childType, "trak", StringComparison.Ordinal))
+            {
+                if (!TryValidateMp4TrackBox(
+                        volumeHandle,
+                        checked(boxOffset + relativeChildOffset),
+                        childSize,
+                        childHeaderLength,
+                        cancellationToken))
+                {
+                    return false;
+                }
+
+                sawTrack = true;
+            }
+
+            relativeChildOffset = checked(relativeChildOffset + childSize);
+        }
+
+        return relativeChildOffset == boxSize && sawMovieHeader && sawTrack;
+    }
+
+    private static bool TryValidateMp4TrackBox(
+        SafeFileHandle volumeHandle,
+        long boxOffset,
+        long boxSize,
+        int headerLength,
+        CancellationToken cancellationToken)
+    {
+        if (boxSize < headerLength + 8)
+        {
+            return false;
+        }
+
+        long relativeChildOffset = headerLength;
+        var sawTrackHeader = false;
+        var sawMedia = false;
+
+        for (var childIndex = 0;
+             childIndex < MaxMp4TopLevelBoxes && relativeChildOffset < boxSize;
+             childIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var remaining = boxSize - relativeChildOffset;
+            if (!TryReadMp4BoxHeader(
+                    volumeHandle,
+                    checked(boxOffset + relativeChildOffset),
+                    remaining,
+                    cancellationToken,
+                    out var childType,
+                    out var childSize,
+                    out var childHeaderLength,
+                    out var childExtendsToEnd) ||
+                childExtendsToEnd)
+            {
+                return false;
+            }
+
+            if (string.Equals(childType, "tkhd", StringComparison.Ordinal))
+            {
+                if (childSize < childHeaderLength + 4)
+                {
+                    return false;
+                }
+
+                sawTrackHeader = true;
+            }
+            else if (string.Equals(childType, "mdia", StringComparison.Ordinal))
+            {
+                if (childSize <= childHeaderLength)
+                {
+                    return false;
+                }
+
+                sawMedia = true;
+            }
+
+            relativeChildOffset = checked(relativeChildOffset + childSize);
+        }
+
+        return relativeChildOffset == boxSize && sawTrackHeader && sawMedia;
+    }
+
+    private static bool IsKnownMp4TopLevelBox(string boxType) =>
+        boxType is
+            "ftyp" or "pdin" or "moov" or "mdat" or "free" or "skip" or
+            "wide" or "uuid" or "moof" or "mfra" or "sidx" or "ssix" or
+            "styp" or "emsg" or "prft" or "meta" or "udta" or "pnot" or
+            "meco" or "mere" or "jp2h" or "jP  ";
+
+    private static bool IsValidMp4FourCc(ReadOnlySpan<byte> value)
+    {
+        if (value.Length != 4)
+        {
+            return false;
+        }
+
+        var hasNonSpace = false;
+        foreach (var item in value)
+        {
+            if (item < 0x20 || item > 0x7E)
+            {
+                return false;
+            }
+
+            hasNonSpace |= item != 0x20;
+        }
+
+        return hasNonSpace;
     }
 
     private static bool TryFindRarSignature(
@@ -1134,6 +1835,9 @@ public sealed class NtfsDeepFileRecoveryService
         extension.Equals(".docx", StringComparison.OrdinalIgnoreCase) ||
         extension.Equals(".xlsx", StringComparison.OrdinalIgnoreCase) ||
         extension.Equals(".pptx", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".mp4", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".m4v", StringComparison.OrdinalIgnoreCase) ||
+        extension.Equals(".mov", StringComparison.OrdinalIgnoreCase) ||
         extension.Equals(".txt", StringComparison.OrdinalIgnoreCase);
 
     internal static bool TryCarve(
