@@ -790,7 +790,7 @@ public sealed class NtfsDeepFileRecoveryService
                 return false;
             }
 
-            if (extraAreaSize > headerSize ||
+            if (extraAreaSize > (ulong)headerSize ||
                 dataAreaSize > (ulong)MaxRarArchiveBytes)
             {
                 return false;
