@@ -378,7 +378,18 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         // files without guessing boundaries from arbitrary free-space regions. If a map
         // exists but fails validation, stop with a precise reason rather than repeating
         // a potentially expensive whole-volume free-space scan.
-        if (candidate.NtfsDataSnapshot is { DataExtents.Count: > 0 })
+        var retainedSnapshot = candidate.NtfsDataSnapshot;
+        var retainedExtentCount = retainedSnapshot?.DataExtents.Count ?? 0;
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS large text runlist decision: path={candidate.FullPath}, " +
+            $"snapshotPresent={retainedSnapshot is not null}, " +
+            $"snapshotCaptured={retainedSnapshot?.IsComplete == true}, " +
+            $"snapshotSize={retainedSnapshot?.FileSizeBytes ?? 0:N0}, " +
+            $"snapshotValidDataLength={retainedSnapshot?.ValidDataLengthBytes ?? 0:N0}, " +
+            $"retainedExtents={retainedExtentCount:N0}.");
+
+        if (retainedExtentCount > 0)
         {
             return RecoverLargeKnownLengthTextFromRetainedExtentMap(
                 candidate,
