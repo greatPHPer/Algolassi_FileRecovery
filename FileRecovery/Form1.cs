@@ -4191,12 +4191,26 @@ public partial class Form1 : Form
                     if (!forensicMarkers.TryGetValue(markerKey, out forensicMarker) &&
                         !forensicMarkerDeclined.Contains(markerKey))
                     {
+                        var requiresLargeTextStartMarker =
+                            candidate.FileSizeBytes > 64L * 1024L * 1024L;
+
+                        var markerPrompt = requiresLargeTextStartMarker
+                            ? $"'{candidate.Name}' is {candidate.FileSizeBytes:N0} bytes.\r\n\r\n" +
+                              "For text files larger than 64 MiB, enter an exact distinctive string from the VERY BEGINNING of the file (the first text bytes, after any BOM). " +
+                              "The large-file recovery path will search currently-free NTFS space and attempt to stream exactly the known file size from one contiguous free extent. " +
+                              "A marker that appears only later in the file is not sufficient because plain text has no built-in start or end marker.\r\n\r\n" +
+                              "The large-file streaming path supports known sizes up to 2 GiB. The recovered content remains heuristic; compare SHA-256 whenever the original hash is available. " +
+                              "Click Cancel or leave empty to skip."
+                            : $"Enter a distinctive text string that you know was inside '{candidate.Name}'.\r\n\r\n" +
+                              "AlgoLassi will scan the entire source volume for this marker and attempt to recover the surrounding text. " +
+                              "This can read a large amount of data and may take a long time.\r\n\r\n" +
+                              "Enter the exact text (at least 4 bytes). Click Cancel, or leave the box empty, to skip this scan.";
+
                         var enteredMarker = Microsoft.VisualBasic.Interaction.InputBox(
-                            $"Enter a distinctive text string that you know was inside '{candidate.Name}'.\r\n\r\n" +
-                            "AlgoLassi will scan the entire source volume for this marker and attempt to recover the surrounding text. " +
-                            "This can read a large amount of data and may take a long time.\r\n\r\n" +
-                            "Enter the exact text (at least 4 bytes). Click Cancel, or leave the box empty, to skip this scan.",
-                            "Full-volume text recovery marker",
+                            markerPrompt,
+                            requiresLargeTextStartMarker
+                                ? "Large text recovery start marker"
+                                : "Full-volume text recovery marker",
                             "");
 
                         if (string.IsNullOrWhiteSpace(enteredMarker))
