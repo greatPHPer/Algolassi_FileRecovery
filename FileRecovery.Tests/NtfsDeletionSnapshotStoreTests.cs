@@ -54,6 +54,58 @@ public sealed class NtfsDeletionSnapshotStoreTests
     }
 
     [Fact]
+    public void TrySaveStreaming_DoesNotOverwriteAnExistingSnapshotForTheSameRecord()
+    {
+        var root = CreateTempDirectory();
+
+        try
+        {
+            var store = new NtfsDeletionSnapshotStore(root);
+            var recordId = Guid.NewGuid();
+            var original = System.Text.Encoding.UTF8.GetBytes("original snapshot bytes");
+            var replacement = System.Text.Encoding.UTF8.GetBytes("different later capture");
+
+            var firstSaved = store.TrySaveStreaming(
+                recordId,
+                original.Length,
+                (output, hash) =>
+                {
+                    output.Write(original, 0, original.Length);
+                    hash.AppendData(original);
+                },
+                out var firstFileName,
+                out var firstHash);
+
+            Assert.True(firstSaved);
+            Assert.NotEmpty(firstFileName);
+            Assert.Equal(Convert.ToHexString(SHA256.HashData(original)), firstHash);
+
+            var secondSaved = store.TrySaveStreaming(
+                recordId,
+                replacement.Length,
+                (output, hash) =>
+                {
+                    output.Write(replacement, 0, replacement.Length);
+                    hash.AppendData(replacement);
+                },
+                out var secondFileName,
+                out var secondHash);
+
+            Assert.False(secondSaved);
+            Assert.Empty(secondFileName);
+            Assert.Empty(secondHash);
+
+            var existingPath = Path.Combine(root, "NtfsSnapshots", firstFileName);
+            Assert.Equal(original, File.ReadAllBytes(existingPath));
+            Assert.Equal(firstHash, ComputeFileHash(existingPath));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public void TryCopyVerifiedToFile_WhenHashDoesNotMatch_DoesNotPublishDestination()
     {
         var root = CreateTempDirectory();
