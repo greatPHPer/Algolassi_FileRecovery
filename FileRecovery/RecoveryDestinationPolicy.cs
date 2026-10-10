@@ -32,6 +32,9 @@ public static class RecoveryDestinationPolicy
         Directory.CreateDirectory(destinationDirectory);
     }
 
+    private static bool PathExists(string path) =>
+        File.Exists(path) || Directory.Exists(path);
+
     public static string CreateSafeFilePath(
         string destinationDirectory,
         string originalFileName)
@@ -45,7 +48,7 @@ public static class RecoveryDestinationPolicy
         }
 
         var candidate = Path.Combine(destinationDirectory, fileName);
-        if (!File.Exists(candidate))
+        if (!PathExists(candidate))
         {
             return candidate;
         }
@@ -56,7 +59,7 @@ public static class RecoveryDestinationPolicy
         for (var i = 1; i < int.MaxValue; i++)
         {
             candidate = Path.Combine(destinationDirectory, $"{stem} ({i}){extension}");
-            if (!File.Exists(candidate))
+            if (!PathExists(candidate))
             {
                 return candidate;
             }

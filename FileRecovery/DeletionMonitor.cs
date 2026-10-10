@@ -16,6 +16,28 @@ public sealed class DeletionMonitor : IDisposable
 
     public void Start()
     {
+        // Controlled test switch: set ALGOLASSI_DISABLE_FILEWATCHER=1 (or true)
+        // before launching the application to isolate historical NTFS recovery
+        // from FileSystemWatcher activity. USN and Recycle Bin monitoring remain
+        // available because they are independent recovery sources.
+        var disableWatcher =
+            string.Equals(
+                Environment.GetEnvironmentVariable("ALGOLASSI_DISABLE_FILEWATCHER"),
+                "1",
+                StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(
+                Environment.GetEnvironmentVariable("ALGOLASSI_DISABLE_FILEWATCHER"),
+                "true",
+                StringComparison.OrdinalIgnoreCase);
+
+        if (disableWatcher)
+        {
+            StatusChanged?.Invoke(
+                this,
+                "FileSystemWatcher disabled by test environment; NTFS/USN recovery sources remain active.");
+            return;
+        }
+
         lock (_gate)
         {
             if (_started)
@@ -109,21 +131,96 @@ public sealed class DeletionMonitor : IDisposable
 
     private void OnRenamed(object sender, RenamedEventArgs e)
     {
-        if (!string.IsNullOrWhiteSpace(e.OldFullPath))
+        long? originalSize = null;
+
+        var oldPath = NormalizePath(e.OldFullPath);
+        var newPath = NormalizePath(e.FullPath);
+
+        if (!string.IsNullOrWhiteSpace(oldPath) &&
+            _knownSizes.TryRemove(oldPath, out var cachedSize))
         {
-            _knownSizes.TryRemove(e.OldFullPath, out _);
+            originalSize = cachedSize;
+        }
+
+        // A normal Delete performed through Windows Explorer commonly moves the
+        // file into the volume's Recycle Bin rather than generating a direct
+        // FileSystemWatcher Deleted event for the original path. Treat that
+        // old->Recycle.Bin rename as a live deletion observation so the USN
+        // snapshot path can capture the file before its metadata/data become
+        // harder to recover.
+        if (IsRecycleBinPath(newPath) &&
+            !IsRecycleBinPath(oldPath) &&
+            !RecoveryMonitoringExclusions.IsExcludedPath(oldPath))
+        {
+            var directory = Path.GetDirectoryName(oldPath) ?? string.Empty;
+            var fileName = Path.GetFileName(oldPath);
+
+            if (!string.IsNullOrWhiteSpace(fileName))
+            {
+                var record = new DeletionRecord
+                {
+                    FullPath = oldPath,
+                    FileName = fileName,
+                    DirectoryPath = directory,
+                    DeletedAtUtc = DateTime.UtcNow,
+                    FileSizeBytes = originalSize,
+                    RecoveryStrength = "Strong"
+                };
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS immediate Recycle Bin rename detected: " +
+                    $"oldPath={oldPath}, newPath={newPath}, size={originalSize?.ToString() ?? "(unknown)"}.");
+
+                DeletionDetected?.Invoke(
+                    this,
+                    new DeletionDetectedEventArgs(record));
+
+                _ = Task.Run(() => UpdateRecoveryStrength(record));
+            }
         }
 
         RememberSize(e.FullPath);
     }
 
+    private static bool IsRecycleBinPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        var normalized = NormalizePath(path);
+        var root = Path.GetPathRoot(normalized);
+
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return false;
+        }
+
+        var recycleRoot = Path.Combine(
+            root.TrimEnd(Path.DirectorySeparatorChar),
+            "$Recycle.Bin");
+
+        return normalized.Equals(
+                   recycleRoot,
+                   StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith(
+                   recycleRoot + Path.DirectorySeparatorChar,
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
     private void OnDeleted(object sender, FileSystemEventArgs e)
     {
-        long? size = _knownSizes.TryRemove(e.FullPath, out var cachedSize)
+        var fullPath = NormalizePath(e.FullPath);
+
+        long? size = _knownSizes.TryRemove(fullPath, out var cachedSize)
             ? cachedSize
             : null;
+        if (RecoveryMonitoringExclusions.IsExcludedPath(fullPath))
+        {
+            return;
+        }
 
-        var fullPath = NormalizePath(e.FullPath);
         var directory = Path.GetDirectoryName(fullPath) ?? string.Empty;
         var fileName = Path.GetFileName(fullPath);
 
@@ -211,6 +308,11 @@ public sealed class DeletionMonitor : IDisposable
 
     private void RememberSize(string path)
     {
+        if (RecoveryMonitoringExclusions.IsExcludedPath(path))
+        {
+            return;
+        }
+
         try
         {
             if (!File.Exists(path))
@@ -218,8 +320,9 @@ public sealed class DeletionMonitor : IDisposable
                 return;
             }
 
-            var info = new FileInfo(path);
-            _knownSizes[path] = info.Length;
+            var normalizedPath = NormalizePath(path);
+            var info = new FileInfo(normalizedPath);
+            _knownSizes[normalizedPath] = info.Length;
         }
         catch
         {

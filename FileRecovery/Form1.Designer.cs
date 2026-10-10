@@ -8,19 +8,24 @@ partial class Form1
     private Label lblTitle = null!;
     private Label lblSubtitle = null!;
     private Label lblDirectories = null!;
-    private ListBox lstDirectories = null!;
+    private BufferedDirectoryListBox lstDirectories = null!;
     private Button btnScanDirectory = null!;
     private Button btnScanNtfs = null!;
+    private Button btnManageIgnoredDirectories = null!;
+    private TextBox txtScanPath = null!;
+    private Button btnBrowseScanPath = null!;
+    private CheckBox chkScanSubdirectories = null!;
     private Button btnShowHistory = null!;
     private Button btnClearHistory = null!;
     private Label lblFiles = null!;
-    private DataGridView dgvResults = null!;
+    private BufferedDataGridView dgvResults = null!;
     private DataGridViewTextBoxColumn colName = null!;
     private DataGridViewTextBoxColumn colDeleted = null!;
     private DataGridViewTextBoxColumn colSize = null!;
     private DataGridViewTextBoxColumn colStrength = null!;
     private DataGridViewTextBoxColumn colEvidence = null!;
     private Button btnRecover = null!;
+    private Button btnSkipRecycleBin = null!;
     private Label lblStatus = null!;
 
     protected override void Dispose(bool disposing)
@@ -39,19 +44,24 @@ partial class Form1
         lblTitle = new Label();
         lblSubtitle = new Label();
         lblDirectories = new Label();
-        lstDirectories = new ListBox();
+        lstDirectories = new BufferedDirectoryListBox();
         btnScanDirectory = new Button();
         btnScanNtfs = new Button();
+        btnManageIgnoredDirectories = new Button();
+        txtScanPath = new TextBox();
+        btnBrowseScanPath = new Button();
+        chkScanSubdirectories = new CheckBox();
         btnShowHistory = new Button();
         btnClearHistory = new Button();
         lblFiles = new Label();
-        dgvResults = new DataGridView();
+        dgvResults = new BufferedDataGridView();
         colName = new DataGridViewTextBoxColumn();
         colDeleted = new DataGridViewTextBoxColumn();
         colSize = new DataGridViewTextBoxColumn();
         colStrength = new DataGridViewTextBoxColumn();
         colEvidence = new DataGridViewTextBoxColumn();
         btnRecover = new Button();
+        btnSkipRecycleBin = new Button();
         lblStatus = new Label();
 
         ((System.ComponentModel.ISupportInitialize)dgvResults).BeginInit();
@@ -68,7 +78,7 @@ partial class Form1
         lblSubtitle.ForeColor = Color.DimGray;
         lblSubtitle.Location = new Point(27, 56);
         lblSubtitle.Size = new Size(730, 15);
-        lblSubtitle.Text = "Resident monitoring is active in the system tray. Select a recent deletion location to inspect recoverable items.";
+        lblSubtitle.Text = "Keep AlgoLassi running in the system tray BEFORE deleting files. Closing this window is safe; Exit stops monitoring.";
 
         lblDirectories.AutoSize = true;
         lblDirectories.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
@@ -77,26 +87,24 @@ partial class Form1
         lblDirectories.Text = "Recent directories";
 
         lstDirectories.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left;
+        lstDirectories.DrawMode = DrawMode.OwnerDrawFixed;
         lstDirectories.FormattingEnabled = true;
         lstDirectories.HorizontalScrollbar = true;
+        lstDirectories.HorizontalExtent = 1400;
         lstDirectories.IntegralHeight = false;
-        lstDirectories.ItemHeight = 20;
+        lstDirectories.ItemHeight = 30;
         lstDirectories.Location = new Point(24, 122);
         lstDirectories.Name = "lstDirectories";
         lstDirectories.Size = new Size(300, 447);
         lstDirectories.SelectedIndexChanged += lstDirectories_SelectedIndexChanged;
+        lstDirectories.DrawItem += lstDirectories_DrawItem;
+        lstDirectories.MouseDown += lstDirectories_MouseDown;
 
         btnScanDirectory.Location = new Point(344, 82);
         btnScanDirectory.Size = new Size(190, 36);
         btnScanDirectory.Text = "Scan Recycle Bin";
         btnScanDirectory.UseVisualStyleBackColor = true;
         btnScanDirectory.Click += btnScanDirectory_Click;
-
-        btnScanNtfs.Location = new Point(344, 122);
-        btnScanNtfs.Size = new Size(190, 36);
-        btnScanNtfs.Text = "Scan NTFS Deleted Files";
-        btnScanNtfs.UseVisualStyleBackColor = true;
-        btnScanNtfs.Click += btnScanNtfs_Click;
 
         btnShowHistory.Location = new Point(546, 82);
         btnShowHistory.Size = new Size(170, 36);
@@ -110,9 +118,44 @@ partial class Form1
         btnClearHistory.UseVisualStyleBackColor = true;
         btnClearHistory.Click += btnClearHistory_Click;
 
+        txtScanPath.Location = new Point(344, 122);
+        txtScanPath.Name = "txtScanPath";
+        txtScanPath.PlaceholderText = "Directory to scan for deleted NTFS files...";
+        txtScanPath.Size = new Size(400, 23);
+        txtScanPath.TabIndex = 0;
+
+        btnBrowseScanPath.Location = new Point(750, 120);
+        btnBrowseScanPath.Size = new Size(110, 30);
+        btnBrowseScanPath.Text = "Browse...";
+        btnBrowseScanPath.UseVisualStyleBackColor = true;
+        btnBrowseScanPath.Click += btnBrowseScanPath_Click;
+
+        btnScanNtfs.Location = new Point(344, 158);
+        btnScanNtfs.Size = new Size(190, 36);
+        btnScanNtfs.Text = "Scan NTFS Deleted Files";
+        btnScanNtfs.UseVisualStyleBackColor = true;
+        btnScanNtfs.Click += btnScanNtfs_Click;
+
+        btnManageIgnoredDirectories.Location = new Point(704, 158);
+        btnManageIgnoredDirectories.Name = "btnManageIgnoredDirectories";
+        btnManageIgnoredDirectories.Size = new Size(156, 36);
+        btnManageIgnoredDirectories.Text = "Ignored Directories...";
+        btnManageIgnoredDirectories.UseVisualStyleBackColor = true;
+        btnManageIgnoredDirectories.Click += btnManageIgnoredDirectories_Click;
+
+        chkScanSubdirectories.AutoSize = true;
+        chkScanSubdirectories.Checked = true;
+        chkScanSubdirectories.CheckState = CheckState.Checked;
+        chkScanSubdirectories.Location = new Point(546, 166);
+        chkScanSubdirectories.Name = "chkScanSubdirectories";
+        chkScanSubdirectories.Size = new Size(143, 19);
+        chkScanSubdirectories.Text = "Include subdirectories";
+        chkScanSubdirectories.UseVisualStyleBackColor = true;
+        chkScanSubdirectories.TabIndex = 1;
+
         lblFiles.AutoSize = true;
         lblFiles.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
-        lblFiles.Location = new Point(344, 171);
+        lblFiles.Location = new Point(344, 207);
         lblFiles.Size = new Size(113, 19);
         lblFiles.Text = "Deleted files";
 
@@ -124,13 +167,13 @@ partial class Form1
         dgvResults.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         dgvResults.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
         dgvResults.Columns.AddRange(new DataGridViewColumn[] { colName, colDeleted, colSize, colStrength, colEvidence });
-        dgvResults.Location = new Point(344, 199);
+        dgvResults.Location = new Point(344, 235);
         dgvResults.MultiSelect = true;
         dgvResults.Name = "dgvResults";
         dgvResults.ReadOnly = true;
         dgvResults.RowHeadersVisible = false;
         dgvResults.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        dgvResults.Size = new Size(662, 408);
+        dgvResults.Size = new Size(662, 338);
         dgvResults.SelectionChanged += dgvResults_SelectionChanged;
 
         colName.DataPropertyName = "Name";
@@ -158,6 +201,14 @@ partial class Form1
         colEvidence.MinimumWidth = 220;
         colEvidence.FillWeight = 30F;
 
+        btnSkipRecycleBin.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+        btnSkipRecycleBin.Enabled = false;
+        btnSkipRecycleBin.Location = new Point(664, 582);
+        btnSkipRecycleBin.Size = new Size(174, 36);
+        btnSkipRecycleBin.Text = "Skip Recycle Bin";
+        btnSkipRecycleBin.UseVisualStyleBackColor = true;
+        btnSkipRecycleBin.Click += btnSkipRecycleBin_Click;
+
         btnRecover.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         btnRecover.Enabled = false;
         btnRecover.Location = new Point(846, 582);
@@ -170,7 +221,7 @@ partial class Form1
         lblStatus.AutoEllipsis = true;
         lblStatus.ForeColor = Color.DimGray;
         lblStatus.Location = new Point(24, 589);
-        lblStatus.Size = new Size(805, 24);
+        lblStatus.Size = new Size(632, 24);
         lblStatus.Text = "Monitoring status: starting...";
 
         AutoScaleDimensions = new SizeF(7F, 15F);
@@ -178,11 +229,16 @@ partial class Form1
         ClientSize = new Size(1030, 635);
         Controls.Add(lblStatus);
         Controls.Add(btnRecover);
+        Controls.Add(btnSkipRecycleBin);
         Controls.Add(dgvResults);
         Controls.Add(lblFiles);
+        Controls.Add(chkScanSubdirectories);
+        Controls.Add(btnScanNtfs);
+        Controls.Add(btnManageIgnoredDirectories);
+        Controls.Add(btnBrowseScanPath);
+        Controls.Add(txtScanPath);
         Controls.Add(btnClearHistory);
         Controls.Add(btnShowHistory);
-        Controls.Add(btnScanNtfs);
         Controls.Add(btnScanDirectory);
         Controls.Add(lstDirectories);
         Controls.Add(lblDirectories);

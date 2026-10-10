@@ -21,7 +21,10 @@ public sealed class RecycleBinService
             throw new InvalidOperationException("The Windows Recycle Bin could not be opened.");
         }
 
-        var columns = ReadColumnIndexes(folder);
+        // Keep the tuple statically typed. Passing the dynamic folder directly would
+        // make this method call dynamic and turn the ValueTuple result into dynamic,
+        // causing columns.OriginalLocation to fail at runtime.
+        var columns = ReadColumnIndexes((object)folder);
         var results = new List<RecoveryItem>();
         dynamic items = folder.Items();
 
@@ -34,7 +37,23 @@ public sealed class RecycleBinService
             }
 
             string name = SafeString(() => item.Name, "Unknown item");
-            string originalLocation = SafeDetails(folder, item, columns.OriginalLocation);
+
+            // Prefer the normal Details-view value first. Shell ExtendedProperty
+            // access can be substantially slower when many Recycle Bin entries
+            // exist, and the Details-view column already provides the original
+            // location on supported Windows configurations.
+            string originalLocation = SafeDetails(
+                folder,
+                item,
+                columns.OriginalLocation);
+
+            if (string.IsNullOrWhiteSpace(originalLocation))
+            {
+                originalLocation = SafeString(
+                    () => item.ExtendedProperty("{9B174B33-40FF-11D2-A27E-00C04FC30871} 2"),
+                    string.Empty);
+            }
+
             string deletedDate = SafeDetails(folder, item, columns.DeletedDate);
             string size = SafeDetails(folder, item, columns.Size);
 
@@ -88,8 +107,9 @@ public sealed class RecycleBinService
         throw new InvalidOperationException("Windows did not expose a Restore command for this Recycle Bin item.");
     }
 
-    private static (int OriginalLocation, int DeletedDate, int Size) ReadColumnIndexes(dynamic folder)
+    private static (int OriginalLocation, int DeletedDate, int Size) ReadColumnIndexes(object folderObject)
     {
+        dynamic folder = folderObject;
         int originalLocation = -1;
         int deletedDate = -1;
         int size = -1;
@@ -117,6 +137,25 @@ public sealed class RecycleBinService
             {
                 size = column;
             }
+        }
+
+        // Windows uses these standard Recycle Bin Details columns on the
+        // English Shell: Name=0, Original Location=1, Date Deleted=2, Size=3.
+        // Header discovery can fail on localized/custom Shell configurations,
+        // so retain the known column positions as safe fallbacks.
+        if (originalLocation < 0)
+        {
+            originalLocation = 1;
+        }
+
+        if (deletedDate < 0)
+        {
+            deletedDate = 2;
+        }
+
+        if (size < 0)
+        {
+            size = 3;
         }
 
         return (originalLocation, deletedDate, size);

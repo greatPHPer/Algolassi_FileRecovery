@@ -76,10 +76,11 @@ public sealed class DeletionNotificationForm : Form
             BeginSlideOut();
         };
 
+        PositionHidden();
         Shown += (_, _) => BeginSlideIn();
     }
 
-    public void BeginSlideIn()
+    private void PositionHidden()
     {
         var area = Screen.PrimaryScreen?.WorkingArea
             ?? Screen.FromControl(this).WorkingArea;
@@ -88,6 +89,11 @@ public sealed class DeletionNotificationForm : Form
         _hiddenX = area.Right + 8;
         Left = _hiddenX;
         Top = area.Bottom - Height - 18;
+    }
+
+    public void BeginSlideIn()
+    {
+        PositionHidden();
         _phase = 1;
         _animationTimer.Start();
     }

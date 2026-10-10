@@ -12,6 +12,8 @@ public sealed class NtfsByteRecoveryService
     private const uint FileShareDelete = 0x00000004;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOverlapped = 0x40000000;
+    private const int ErrorIoPending = 997;
 
     private const int IoBufferSize = 1024 * 1024;
 
@@ -86,7 +88,7 @@ public sealed class NtfsByteRecoveryService
 
         ValidateExtents(candidate);
 
-        var sourceRoot = Path.GetPathRoot(sourcePath);
+        var sourceRoot = GetNtfsVolumeRoot(sourcePath);
         if (string.IsNullOrWhiteSpace(sourceRoot))
         {
             throw new InvalidOperationException("The deleted file's source volume could not be determined.");
@@ -94,6 +96,9 @@ public sealed class NtfsByteRecoveryService
 
         var volumeInfo = new NtfsVolumeInspector().Inspect(sourceRoot);
         using var volumeHandle = CreateVolumeHandle(sourceRoot);
+        using var rawVolumeHandle = CreateVolumeHandle(
+            sourceRoot,
+            overlapped: true);
 
         var currentAllocations = new NtfsVolumeBitmapReader().CheckExtents(
             volumeHandle,
@@ -153,7 +158,7 @@ public sealed class NtfsByteRecoveryService
                 else
                 {
                     ReadClusters(
-                        volumeHandle,
+                        rawVolumeHandle,
                         output,
                         extent.LogicalClusterNumber,
                         bytesToWrite,
@@ -195,18 +200,9 @@ public sealed class NtfsByteRecoveryService
 
     private static void ValidateExtents(RecoveryCandidate candidate)
     {
-        if (candidate.ExtentAllocations.Count == 0)
-        {
-            throw new InvalidOperationException(
-                "Current NTFS cluster allocation could not be verified. Recovery is blocked for safety.");
-        }
-
-        if (candidate.AllocatedDataClusterCount != 0)
-        {
-            throw new InvalidOperationException(
-                "Recovery is blocked because one or more former data clusters are currently allocated.");
-        }
-
+        // Allocation state is intentionally validated immediately before recovery
+        // against the live NTFS volume bitmap below. Do not require a stale
+        // pre-scan bitmap snapshot on the candidate.
         var expectedVcn = 0L;
         foreach (var extent in candidate.DataExtents)
         {
@@ -258,18 +254,82 @@ public sealed class NtfsByteRecoveryService
         byte[] buffer,
         int count)
     {
-        if (!SetFilePointerEx(handle, offset, out _, 0))
-        {
-            return false;
-        }
+        using var completionEvent = new ManualResetEvent(initialState: false);
 
-        return ReadFile(
-            handle,
-            buffer,
-            (uint)count,
-            out var bytesRead,
-            IntPtr.Zero)
-            && bytesRead == (uint)count;
+        var overlapped = new NativeOverlapped
+        {
+            OffsetLow = unchecked((int)(offset & 0xFFFFFFFF)),
+            OffsetHigh = unchecked((int)(offset >> 32)),
+            HEvent = completionEvent.SafeWaitHandle.DangerousGetHandle()
+        };
+
+        var overlappedPtr = Marshal.AllocHGlobal(
+            Marshal.SizeOf<NativeOverlapped>());
+
+        try
+        {
+            Marshal.StructureToPtr(
+                overlapped,
+                overlappedPtr,
+                fDeleteOld: false);
+
+            var bufferHandle = GCHandle.Alloc(
+                buffer,
+                GCHandleType.Pinned);
+
+            try
+            {
+                var started = ReadFile(
+                    handle,
+                    bufferHandle.AddrOfPinnedObject(),
+                    checked((uint)count),
+                    IntPtr.Zero,
+                    overlappedPtr);
+
+                if (!started)
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    if (error != ErrorIoPending)
+                    {
+                        return false;
+                    }
+                }
+
+                if (!completionEvent.WaitOne())
+                {
+                    return false;
+                }
+
+                if (!GetOverlappedResult(
+                        handle,
+                        overlappedPtr,
+                        out var bytesRead,
+                        bWait: false))
+                {
+                    return false;
+                }
+
+                return bytesRead == (uint)count;
+            }
+            finally
+            {
+                bufferHandle.Free();
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(overlappedPtr);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeOverlapped
+    {
+        public IntPtr Internal;
+        public IntPtr InternalHigh;
+        public int OffsetLow;
+        public int OffsetHigh;
+        public IntPtr HEvent;
     }
 
     private static void WriteZeros(
@@ -289,9 +349,18 @@ public sealed class NtfsByteRecoveryService
         }
     }
 
-    private static SafeFileHandle CreateVolumeHandle(string root)
+    private static SafeFileHandle CreateVolumeHandle(
+        string root,
+        bool overlapped = false)
     {
-        var volumeName = root.TrimEnd(Path.DirectorySeparatorChar);
+        var normalizedRoot = GetNtfsVolumeRoot(root)
+            ?? throw new ArgumentException(
+                "A valid Windows volume root is required.",
+                nameof(root));
+
+        var volumeName = normalizedRoot.TrimEnd(Path.DirectorySeparatorChar);
+        var flags = FileFlagBackupSemantics |
+                    (overlapped ? FileFlagOverlapped : 0);
 
         var handle = CreateFile(
             $@"\\.\{volumeName[..2]}",
@@ -299,7 +368,7 @@ public sealed class NtfsByteRecoveryService
             FileShareRead | FileShareWrite | FileShareDelete,
             IntPtr.Zero,
             OpenExisting,
-            FileFlagBackupSemantics,
+            flags,
             IntPtr.Zero);
 
         if (handle.IsInvalid)
@@ -311,6 +380,19 @@ public sealed class NtfsByteRecoveryService
         }
 
         return handle;
+    }
+
+    private static string? GetNtfsVolumeRoot(string path)
+    {
+        var normalized = path.Trim();
+
+        while (normalized.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+               normalized.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalized = normalized[4..];
+        }
+
+        return Path.GetPathRoot(normalized);
     }
 
     private static void TryDelete(string path)
@@ -339,17 +421,17 @@ public sealed class NtfsByteRecoveryService
         IntPtr hTemplateFile);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetFilePointerEx(
+    private static extern bool GetOverlappedResult(
         SafeFileHandle hFile,
-        long liDistanceToMove,
-        out long lpNewFilePointer,
-        uint dwMoveMethod);
+        IntPtr lpOverlapped,
+        out uint lpNumberOfBytesTransferred,
+        [MarshalAs(UnmanagedType.Bool)] bool bWait);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool ReadFile(
         SafeFileHandle hFile,
-        byte[] lpBuffer,
+        IntPtr lpBuffer,
         uint nNumberOfBytesToRead,
-        out uint lpNumberOfBytesRead,
+        IntPtr lpNumberOfBytesRead,
         IntPtr lpOverlapped);
 }

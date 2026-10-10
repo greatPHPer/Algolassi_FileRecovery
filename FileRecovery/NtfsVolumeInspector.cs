@@ -16,7 +16,7 @@ public sealed class NtfsVolumeInspector
 
     public NtfsVolumeInfo Inspect(string rootPath)
     {
-        var root = Path.GetPathRoot(rootPath);
+        var root = GetNtfsVolumeRoot(rootPath);
         if (string.IsNullOrWhiteSpace(root))
         {
             throw new ArgumentException("A valid Windows volume path is required.", nameof(rootPath));
@@ -76,11 +76,24 @@ public sealed class NtfsVolumeInspector
         };
     }
 
+    private static string? GetNtfsVolumeRoot(string path)
+    {
+        var normalized = path.Trim();
+
+        while (normalized.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+               normalized.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            normalized = normalized[4..];
+        }
+
+        return Path.GetPathRoot(normalized);
+    }
+
     private static SafeFileHandle CreateVolumeHandle(string root)
     {
         var volumeName = root.TrimEnd(Path.DirectorySeparatorChar);
         var handle = CreateFile(
-            $@"\.{volumeName[..2]}",
+            $@"\\.\{volumeName[..2]}",
             GenericRead,
             FileShareRead | FileShareWrite | FileShareDelete,
             IntPtr.Zero,
@@ -90,10 +103,12 @@ public sealed class NtfsVolumeInspector
 
         if (handle.IsInvalid)
         {
+            var error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
             handle.Dispose();
+
             throw new Win32Exception(
-                System.Runtime.InteropServices.Marshal.GetLastWin32Error(),
-                $"Could not open NTFS volume {root}.");
+                error,
+                $"Could not open NTFS volume {root}. Device={volumeName}.");
         }
 
         return handle;
