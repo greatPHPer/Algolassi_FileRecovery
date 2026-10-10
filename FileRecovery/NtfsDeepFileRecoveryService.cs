@@ -42,12 +42,11 @@ public sealed class NtfsDeepFileRecoveryService
         RecoveryDestinationPolicy.Validate(candidate.FullPath, destinationDirectory);
 
         var extension = Path.GetExtension(candidate.Name);
-        if (!SupportsExtension(extension))
-        {
-            throw new InvalidOperationException(
-                $"Deep file carving does not have a safe structural carver for '{extension}'. " +
-                "This recovery path requires a file type with a recognizable, self-delimiting format.");
-        }
+
+        // Do not reject an unfamiliar suffix here. TryCarve validates known
+        // formats from their byte signatures, then permits a conservative,
+        // exact-length text fallback for small files with a known original size.
+        // Unsupported binary formats (including RAR) still need a dedicated parser.
 
         WindowsPrivilege.EnableSeBackupPrivilege();
 
@@ -313,7 +312,11 @@ public sealed class NtfsDeepFileRecoveryService
             return knownFileSizeBytes > 0;
         }
 
-        return SupportsExtension(extension);
+        // Unknown extensions are eligible for signature-based carving. The
+        // actual bytes, not the filename suffix, determine whether a known format
+        // can be reconstructed. Small, known-length text files may use the
+        // conservative fallback below; unknown binary formats still need parsers.
+        return true;
     }
 
     private static bool SupportsExtension(string extension) =>
@@ -343,6 +346,77 @@ public sealed class NtfsDeepFileRecoveryService
         startOffset = 0;
         length = 0;
         format = string.Empty;
+
+        // For an unfamiliar extension, use content signatures instead of trusting
+        // the suffix. The output keeps the original filename, while evidence records
+        // the format detected from its bytes.
+        if (!SupportsExtension(extension))
+        {
+            if (TryFindJpeg(buffer, out startOffset, out length))
+            {
+                format = "JPEG (extension-independent)";
+                return true;
+            }
+            if (TryFindPng(buffer, out startOffset, out length))
+            {
+                format = "PNG (extension-independent)";
+                return true;
+            }
+            if (TryFindGif(buffer, out startOffset, out length))
+            {
+                format = "GIF (extension-independent)";
+                return true;
+            }
+            if (TryFindBmp(buffer, out startOffset, out length))
+            {
+                format = "BMP (extension-independent)";
+                return true;
+            }
+            if (TryFindWav(buffer, out startOffset, out length))
+            {
+                format = "WAV (extension-independent)";
+                return true;
+            }
+            if (TryFindWebp(buffer, out startOffset, out length))
+            {
+                format = "WebP (extension-independent)";
+                return true;
+            }
+            if (TryFindPdf(buffer, out startOffset, out length))
+            {
+                format = "PDF (extension-independent)";
+                return true;
+            }
+            if (TryFindZip(buffer, out startOffset, out length))
+            {
+                format = "ZIP (extension-independent; may include Office formats)";
+                return true;
+            }
+
+            // Plain text has no reliable end marker. Only attempt an exact-length
+            // match when the original size is known and <= 1 MiB. This is heuristic,
+            // not proof that the matching bytes belong to this deleted file.
+            if (knownFileSizeBytes > 0 &&
+                knownFileSizeBytes <= 1024L * 1024L &&
+                bytesPerCluster > 0 &&
+                bytesPerCluster <= int.MaxValue &&
+                knownFileSizeBytes <= int.MaxValue &&
+                TryFindText(
+                    buffer,
+                    checked((int)knownFileSizeBytes),
+                    checked((int)bytesPerCluster),
+                    out startOffset))
+            {
+                length = checked((int)knownFileSizeBytes);
+                format = "Plain text (unknown-extension heuristic)";
+                return true;
+            }
+
+            startOffset = 0;
+            length = 0;
+            format = string.Empty;
+            return false;
+        }
 
         if (extension.Equals(".txt", StringComparison.OrdinalIgnoreCase))
         {
