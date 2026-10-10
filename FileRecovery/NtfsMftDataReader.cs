@@ -2,6 +2,7 @@ using System.Text;
 using System.Buffers.Binary;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using Microsoft.Win32.SafeHandles;
 
 namespace FileRecovery;
@@ -2606,6 +2607,220 @@ public sealed class NtfsMftDataReader
             return false;
         }    }
 
+
+    /// <summary>
+    /// Captures a deleted NTFS stream to durable storage with bounded memory.
+    /// It retains the same MFT reference, parent, name, path, timestamp and size
+    /// checks as the ordinary deletion snapshot path.
+    /// </summary>
+    public bool TryCaptureDeletedDataToSnapshotStore(
+        string rootPath,
+        ulong fileReferenceNumber,
+        ulong expectedParentFileReferenceNumber,
+        string expectedFileName,
+        string? expectedFullPath,
+        NtfsDeletionSnapshotStore snapshotStore,
+        Guid recordId,
+        long maxCaptureBytes,
+        bool rejectAllZeroContent,
+        out NtfsDataStreamInfo stream,
+        out string dataFileName,
+        out string sha256,
+        out bool allZero,
+        DateTime expectedDeletedAtUtc = default,
+        bool allowBoundedDeleteTransition = true,
+        long expectedFileSizeBytes = 0,
+        int maxBoundedDeleteSequenceAdvance = 8)
+    {
+        stream = NotFound("The deleted file's NTFS $DATA stream could not be read.");
+        dataFileName = string.Empty;
+        sha256 = string.Empty;
+        allZero = true;
+
+        if (string.IsNullOrWhiteSpace(rootPath) ||
+            fileReferenceNumber == 0 ||
+            expectedParentFileReferenceNumber == 0 ||
+            string.IsNullOrWhiteSpace(expectedFileName) ||
+            snapshotStore is null ||
+            maxCaptureBytes <= 0)
+        {
+            return false;
+        }
+
+        var root = GetNtfsVolumeRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return false;
+        }
+
+        try
+        {
+            WindowsPrivilege.EnableSeBackupPrivilege();
+
+            var volumeInfo = new NtfsVolumeInspector().Inspect(root);
+            using var volumeHandle = CreateVolumeHandle(
+                volumeInfo.RootPath,
+                overlapped: false);
+
+            stream = ReadDefaultDataStream(
+                volumeInfo,
+                volumeHandle,
+                fileReferenceNumber,
+                expectedFileName,
+                expectedParentFileReferenceNumber,
+                expectedFullPath,
+                expectedDeletedAtUtc,
+                allowBoundedDeleteTransition,
+                expectedFileSizeBytes,
+                maxBoundedDeleteSequenceAdvance);
+
+            if (!stream.Found ||
+                stream.FileSizeBytes < 0 ||
+                stream.FileSizeBytes > maxCaptureBytes)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS streamed deletion snapshot unavailable or over limit: " +
+                    $"fileRef={fileReferenceNumber}, found={stream.Found}, " +
+                    $"size={stream.FileSizeBytes:N0}, max={maxCaptureBytes:N0}, " +
+                    $"evidence={stream.Evidence}");
+                return false;
+            }
+
+            TraceDataStreamLayout(
+                "stream-capture-layout",
+                fileReferenceNumber,
+                stream,
+                volumeInfo.BytesPerCluster);
+
+            var allZeroLocal = true;
+            var saved = snapshotStore.TrySaveStreaming(
+                recordId,
+                stream.FileSizeBytes,
+                (output, hash) =>
+                {
+                    if (stream.IsResident)
+                    {
+                        var resident = stream.ResidentData ?? [];
+                        if (resident.LongLength != stream.FileSizeBytes)
+                        {
+                            throw new InvalidDataException(
+                                $"Resident NTFS stream length mismatch: expected={stream.FileSizeBytes:N0}, " +
+                                $"actual={resident.LongLength:N0}.");
+                        }
+
+                        output.Write(resident, 0, resident.Length);
+                        hash.AppendData(resident);
+                        allZeroLocal = resident.All(static value => value == 0);
+                    }
+                    else
+                    {
+                        var remaining = stream.FileSizeBytes;
+                        var remainingInitialized = Math.Min(
+                            stream.ValidDataLengthBytes > 0
+                                ? stream.ValidDataLengthBytes
+                                : stream.FileSizeBytes,
+                            stream.FileSizeBytes);
+                        var expectedVcn = 0L;
+
+                        foreach (var extent in stream.Extents)
+                        {
+                            if (extent.ClusterCount <= 0 ||
+                                extent.VirtualClusterNumber != expectedVcn)
+                            {
+                                throw new InvalidDataException(
+                                    $"Non-contiguous NTFS runlist: fileRef={fileReferenceNumber}, " +
+                                    $"expectedVcn={expectedVcn}, extentVcn={extent.VirtualClusterNumber}, " +
+                                    $"clusters={extent.ClusterCount}.");
+                            }
+
+                            var extentBytes = checked(
+                                extent.ClusterCount * (long)volumeInfo.BytesPerCluster);
+                            var bytesForExtent = Math.Min(extentBytes, remaining);
+                            var initializedForExtent = Math.Min(
+                                bytesForExtent,
+                                remainingInitialized);
+
+                            if (initializedForExtent > 0)
+                            {
+                                if (extent.IsSparse)
+                                {
+                                    WriteZeroBytesToStream(output, hash, initializedForExtent);
+                                }
+                                else
+                                {
+                                    ReadRawClustersToStream(
+                                        volumeHandle,
+                                        extent.LogicalClusterNumber,
+                                        initializedForExtent,
+                                        volumeInfo.BytesPerCluster,
+                                        output,
+                                        hash,
+                                        out var chunkAllZero);
+                                    allZeroLocal &= chunkAllZero;
+                                }
+
+                                remainingInitialized -= initializedForExtent;
+                            }
+
+                            var zeroFillBytes = bytesForExtent - initializedForExtent;
+                            if (zeroFillBytes > 0)
+                            {
+                                WriteZeroBytesToStream(output, hash, zeroFillBytes);
+                            }
+
+                            remaining -= bytesForExtent;
+                            expectedVcn = checked(expectedVcn + extent.ClusterCount);
+
+                            if (remaining == 0)
+                            {
+                                break;
+                            }
+                        }
+
+                        if (remaining != 0)
+                        {
+                            throw new InvalidDataException(
+                                $"NTFS runlist did not cover the full stream: remaining={remaining:N0} bytes.");
+                        }
+                    }
+
+                    if (rejectAllZeroContent &&
+                        stream.FileSizeBytes > 0 &&
+                        allZeroLocal)
+                    {
+                        throw new InvalidDataException(
+                            "Bounded pre-start capture contained only zero bytes; snapshot was not saved.");
+                    }
+                },
+                out dataFileName,
+                out sha256);
+
+            allZero = allZeroLocal;
+            if (!saved)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS streamed snapshot not saved: fileRef={fileReferenceNumber}, " +
+                    $"size={stream.FileSizeBytes:N0}.");
+                return false;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS streamed snapshot saved: fileRef={fileReferenceNumber}, " +
+                $"size={stream.FileSizeBytes:N0}, extents={stream.Extents.Count:N0}, " +
+                $"sha256={sha256}, allZero={allZero}.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            dataFileName = string.Empty;
+            sha256 = string.Empty;
+            stream = NotFound($"NTFS streamed deletion snapshot failed: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS streamed deletion snapshot failed: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
     public bool TryReadDataStreamForDeletedReference(
         string rootPath,
         ulong fileReferenceNumber,
@@ -4166,6 +4381,103 @@ public sealed class NtfsMftDataReader
         System.Diagnostics.Trace.WriteLine(
             $"NTFS {tag}: fileRef={fileReferenceNumber}, bytes={data.LongLength:N0}, " +
             $"nonZeroBytes={nonZero:N0}, allZero={nonZero == 0}, head32={head}, sha256={sha}.");
+    }
+
+
+    private static void ReadRawClustersToStream(
+        SafeFileHandle volumeHandle,
+        long logicalClusterNumber,
+        long byteCount,
+        uint bytesPerCluster,
+        Stream destination,
+        IncrementalHash hash,
+        out bool allBytesZero)
+    {
+        allBytesZero = true;
+        var clusterSize = checked((long)bytesPerCluster);
+        if (clusterSize <= 0)
+        {
+            throw new InvalidDataException(
+                "The NTFS volume reported an invalid cluster size for a streamed raw read.");
+        }
+
+        var maxAlignedReadBytesLong = RawReadBufferSize -
+            (RawReadBufferSize % clusterSize);
+        if (maxAlignedReadBytesLong <= 0)
+        {
+            throw new InvalidDataException(
+                $"The NTFS cluster size {clusterSize:N0} exceeds the raw read buffer size.");
+        }
+
+        var maxAlignedReadBytes = checked((int)maxAlignedReadBytesLong);
+        var buffer = new byte[maxAlignedReadBytes];
+        var offset = checked(logicalClusterNumber * clusterSize);
+        var remaining = byteCount;
+
+        while (remaining > 0)
+        {
+            var bytesToCopy = checked((int)Math.Min(maxAlignedReadBytes, remaining));
+            var alignedReadBytes = checked((int)(
+                ((bytesToCopy + clusterSize - 1) / clusterSize) * clusterSize));
+
+            if (!SetFilePointerEx(volumeHandle, offset, out _, 0))
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    error,
+                    $"Could not seek to streamed NTFS extent at byte offset {offset:N0}.");
+            }
+
+            if (!ReadFile(
+                    volumeHandle,
+                    buffer,
+                    (uint)alignedReadBytes,
+                    out var bytesRead,
+                    IntPtr.Zero))
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    error,
+                    $"Could not read streamed NTFS extent at byte offset {offset:N0}; " +
+                    $"requestedBytes={alignedReadBytes:N0}.");
+            }
+
+            if (bytesRead != (uint)alignedReadBytes)
+            {
+                throw new IOException(
+                    $"Partial streamed NTFS read at byte offset {offset:N0}: " +
+                    $"requestedBytes={alignedReadBytes:N0}, bytesRead={bytesRead:N0}.");
+            }
+
+            destination.Write(buffer, 0, bytesToCopy);
+            hash.AppendData(buffer, 0, bytesToCopy);
+            for (var i = 0; i < bytesToCopy; i++)
+            {
+                if (buffer[i] != 0)
+                {
+                    allBytesZero = false;
+                    break;
+                }
+            }
+
+            offset = checked(offset + bytesToCopy);
+            remaining -= bytesToCopy;
+        }
+    }
+
+    private static void WriteZeroBytesToStream(
+        Stream destination,
+        IncrementalHash hash,
+        long byteCount)
+    {
+        var zeroBuffer = new byte[64 * 1024];
+        while (byteCount > 0)
+        {
+            var count = checked((int)Math.Min(zeroBuffer.Length, byteCount));
+            destination.Write(zeroBuffer, 0, count);
+            hash.AppendData(zeroBuffer, 0, count);
+            byteCount -= count;
+        }
     }
 
     private static void ReadRawClusters(
