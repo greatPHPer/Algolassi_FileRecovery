@@ -3162,21 +3162,25 @@ public partial class Form1 : Form
                                 // for a freshly deleted file. Attach it to the candidate
                                 // so recovery uses the bytes captured before later NTFS
                                 // cluster reuse can change the raw data.
-                                if (record.NtfsDataSnapshot?.IsComplete == true)
+                                if (record.NtfsDataSnapshot is { } retainedSnapshot &&
+                                    (retainedSnapshot.IsComplete || retainedSnapshot.DataExtents.Count > 0))
                                 {
-                                    match.NtfsDataSnapshot =
-                                        record.NtfsDataSnapshot.Clone();
+                                    // Metadata-only deletion snapshots still preserve the original runlist.
+                                    // Large files exceed the content-capture limit, but their mapped extents
+                                    // can still be useful for guarded streaming reconstruction.
+                                    match.NtfsDataSnapshot = retainedSnapshot.Clone();
 
                                     if (match.FileSizeBytes <= 0)
                                     {
-                                        match.FileSizeBytes =
-                                            match.NtfsDataSnapshot.FileSizeBytes;
+                                        match.FileSizeBytes = retainedSnapshot.FileSizeBytes;
                                     }
 
                                     System.Diagnostics.Debug.WriteLine(
-                                        $"NTFS recovery candidate: attached complete delete-time snapshot " +
+                                        $"NTFS recovery candidate: attached delete-time snapshot metadata " +
                                         $"path={record.FullPath}, fileRef={record.FileReferenceNumber}, " +
-                                        $"bytes={match.NtfsDataSnapshot.CapturedByteCount:N0}.");
+                                        $"captured={retainedSnapshot.IsComplete}, " +
+                                        $"bytes={retainedSnapshot.CapturedByteCount:N0}, " +
+                                        $"extents={retainedSnapshot.DataExtents.Count:N0}.");
                                 }
 
                                 ntfsCandidates.Add(match);
@@ -3217,16 +3221,22 @@ public partial class Form1 : Form
                                         "historical file reference."
                                 };
 
-                                if (record.NtfsDataSnapshot?.IsComplete == true)
+                                if (record.NtfsDataSnapshot is { } retainedSnapshot &&
+                                    (retainedSnapshot.IsComplete || retainedSnapshot.DataExtents.Count > 0))
                                 {
-                                    metadataCandidate.NtfsDataSnapshot =
-                                        record.NtfsDataSnapshot.Clone();
+                                    metadataCandidate.NtfsDataSnapshot = retainedSnapshot.Clone();
 
                                     if (metadataCandidate.FileSizeBytes <= 0)
                                     {
-                                        metadataCandidate.FileSizeBytes =
-                                            metadataCandidate.NtfsDataSnapshot.FileSizeBytes;
+                                        metadataCandidate.FileSizeBytes = retainedSnapshot.FileSizeBytes;
                                     }
+
+                                    System.Diagnostics.Debug.WriteLine(
+                                        $"NTFS metadata-only candidate: attached delete-time runlist " +
+                                        $"path={record.FullPath}, fileRef={record.FileReferenceNumber}, " +
+                                        $"size={retainedSnapshot.FileSizeBytes:N0}, " +
+                                        $"extents={retainedSnapshot.DataExtents.Count:N0}, " +
+                                        $"captured={retainedSnapshot.IsComplete}.");
                                 }
 
                                 ntfsCandidates.Add(metadataCandidate);
@@ -3286,20 +3296,21 @@ public partial class Form1 : Form
                                 // Legacy candidates can also benefit from a
                                 // persisted delete-time snapshot when the selected
                                 // history record already has one.
-                                if (record.NtfsDataSnapshot?.IsComplete == true)
+                                if (record.NtfsDataSnapshot is { } retainedSnapshot &&
+                                    (retainedSnapshot.IsComplete || retainedSnapshot.DataExtents.Count > 0))
                                 {
-                                    match.NtfsDataSnapshot =
-                                        record.NtfsDataSnapshot.Clone();
+                                    match.NtfsDataSnapshot = retainedSnapshot.Clone();
 
                                     if (match.FileSizeBytes <= 0)
                                     {
-                                        match.FileSizeBytes =
-                                            match.NtfsDataSnapshot.FileSizeBytes;
+                                        match.FileSizeBytes = retainedSnapshot.FileSizeBytes;
                                     }
 
                                     System.Diagnostics.Debug.WriteLine(
-                                        $"NTFS legacy candidate: attached complete delete-time snapshot " +
-                                        $"path={record.FullPath}, bytes={match.NtfsDataSnapshot.CapturedByteCount:N0}.");
+                                        $"NTFS legacy candidate: attached delete-time snapshot metadata " +
+                                        $"path={record.FullPath}, size={retainedSnapshot.FileSizeBytes:N0}, " +
+                                        $"captured={retainedSnapshot.IsComplete}, " +
+                                        $"extents={retainedSnapshot.DataExtents.Count:N0}.");
                                 }
 
                                 ntfsCandidates.Add(match);
