@@ -2738,21 +2738,16 @@ public sealed class NtfsDeepFileRecoveryService
             {
                 directError = Marshal.GetLastWin32Error();
             }
-            else if (!ReadFile(
-                         volumeHandle,
-                         chunkBuffer,
-                         (uint)chunk,
-                         out var directBytesRead,
-                         IntPtr.Zero) &&
-                     directBytesRead == 0)
-            {
-                directError = Marshal.GetLastWin32Error();
-            }
             else
             {
-                // A short read is also a failure, even if ReadFile returned true.
-                // Capture a usable error code before attempting the aligned retry.
-                if (directBytesRead == (uint)chunk)
+                var readReturned = ReadFile(
+                    volumeHandle,
+                    chunkBuffer,
+                    (uint)chunk,
+                    out var directBytesRead,
+                    IntPtr.Zero);
+
+                if (readReturned && directBytesRead == (uint)chunk)
                 {
                     directReadSucceeded = true;
                 }
