@@ -407,7 +407,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 directStream.ValidDataLengthBytes >= expectedLength &&
                 directStream.Extents.Count > 0)
             {
-                candidate.NtfsDataSnapshot = new NtfsDeletionDataSnapshot
+                var refreshedSnapshot = new NtfsDeletionDataSnapshot
                 {
                     DataCaptured = false,
                     IsResident = false,
@@ -429,8 +429,9 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                         "metadata only and has not yet been validated against marker bytes."
                 };
 
-                retainedSnapshot = candidate.NtfsDataSnapshot;
-                retainedExtentCount = retainedSnapshot.DataExtents.Count;
+                candidate.NtfsDataSnapshot = refreshedSnapshot;
+                retainedSnapshot = refreshedSnapshot;
+                retainedExtentCount = refreshedSnapshot.DataExtents.Count;
 
                 System.Diagnostics.Trace.WriteLine(
                     $"NTFS large text recovery-time runlist reattached: path={candidate.FullPath}, " +
