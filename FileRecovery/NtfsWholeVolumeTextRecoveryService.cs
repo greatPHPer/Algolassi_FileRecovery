@@ -599,7 +599,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         out string destinationPath)
     {
         destinationPath = string.Empty;
-        var strictEncoding = markerEncoding switch
+        System.Text.Encoding strictEncoding = markerEncoding switch
         {
             "UTF-16LE" => new System.Text.UnicodeEncoding(false, false, true),
             "UTF-16BE" => new System.Text.UnicodeEncoding(true, false, true),
