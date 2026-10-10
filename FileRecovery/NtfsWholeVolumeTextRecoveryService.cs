@@ -402,14 +402,16 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 progress);
         }
 
-        if (retainedSnapshot is not null &&
-            !retainedSnapshot.IsComplete &&
-            retainedExtentCount == 0)
+        if (retainedExtentCount == 0)
         {
             throw new InvalidOperationException(
-                "A metadata-only NTFS deletion snapshot exists, but it contains no retained data extents. " +
-                "The mapped reconstruction path cannot proceed, and the repeated whole-volume scan was " +
-                "skipped to avoid another lengthy scan. Check the runlist handoff diagnostics before retrying.");
+                "No retained NTFS data runlist reached the large-text recovery candidate " +
+                $"(snapshotPresent={retainedSnapshot is not null}, " +
+                $"snapshotCaptured={retainedSnapshot?.IsComplete == true}, " +
+                $"snapshotSize={retainedSnapshot?.FileSizeBytes ?? 0:N0}, " +
+                $"snapshotExtents={retainedExtentCount:N0}). " +
+                "The repeated whole-volume scan was skipped to avoid another lengthy scan. " +
+                "Inspect the NTFS deletion-history/runlist handoff before retrying.");
         }
 
         var volumeBitmap = new NtfsVolumeBitmapReader();
