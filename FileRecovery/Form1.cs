@@ -3843,10 +3843,85 @@ public partial class Form1 : Form
 
                 if (candidate.DataStreamFound)
                 {
-                    successes.Add(_ntfsRecoveryService.Recover(
-                        candidate,
-                        destinationDirectory));
-                    continue;
+                    try
+                    {
+                        successes.Add(_ntfsRecoveryService.Recover(
+                            candidate,
+                            destinationDirectory));
+                        continue;
+                    }
+                    catch (Exception extentRecoveryError)
+                        when (IsMp4CarvingCandidate(candidate.Name))
+                    {
+                        // A stale NTFS runlist can still be present even though its
+                        // physical bytes are no longer readable through that mapping.
+                        // For MP4-family containers, try structural free-space carving
+                        // instead of stopping at the failed direct extent recovery.
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS MP4 extent recovery failed; trying structural free-space carving: " +
+                            $"path={candidate.FullPath}, error={extentRecoveryError.GetType().Name}: " +
+                            $"{extentRecoveryError.Message}");
+
+                        var carvingCandidate = new RecoveryCandidate
+                        {
+                            FileReferenceNumber = candidate.FileReferenceNumber,
+                            ParentFileReferenceNumber = candidate.ParentFileReferenceNumber,
+                            Name = candidate.Name,
+                            DirectoryPath = candidate.DirectoryPath,
+                            LastUsnTimestampUtc = candidate.LastUsnTimestampUtc,
+                            Strength = candidate.Strength,
+                            Evidence = candidate.Evidence,
+                            DataStreamFound = false,
+                            DataStreamResident = false,
+                            FileSizeBytes = candidate.FileSizeBytes,
+                            ValidDataLengthBytes = 0,
+                            NtfsDataSnapshot = null,
+                            ResidentData = null,
+                            DataExtents = [],
+                            ExtentAllocations = [],
+                            FreeDataClusterCount = 0,
+                            AllocatedDataClusterCount = 0,
+                            DataEvidence =
+                                "Direct NTFS extent recovery failed; attempting an independent " +
+                                "MP4 structural carve from currently-free clusters."
+                        };
+
+                        var maxMp4CarveBytes =
+                            NtfsDeepFileRecoveryService.DefaultMaxBytesToScan;
+                        var mp4CarveProgress = new SynchronousProgress<long>(
+                            this,
+                            bytesScanned =>
+                            {
+                                lblStatus.Text =
+                                    $"NTFS extent read failed; searching free space for " +
+                                    $"{candidate.Name}... " +
+                                    $"{bytesScanned / (1024d * 1024d):0} MB scanned";
+                            });
+
+                        try
+                        {
+                            var carved = await Task.Run(
+                                () => _ntfsDeepFileRecoveryService.Recover(
+                                    carvingCandidate,
+                                    destinationDirectory,
+                                    CancellationToken.None,
+                                    maxMp4CarveBytes,
+                                    mp4CarveProgress,
+                                    candidate.FileSizeBytes),
+                                CancellationToken.None).ConfigureAwait(true);
+
+                            successes.Add(carved);
+                            continue;
+                        }
+                        catch (Exception carveError)
+                        {
+                            failures.Add(
+                                $"{candidate.Name}: NTFS extent recovery failed " +
+                                $"({extentRecoveryError.Message}); MP4 free-space carving " +
+                                $"also failed ({carveError.Message}).");
+                            continue;
+                        }
+                    }
                 }
 
                 // Re-check the complete default NTFS $DATA stream at recovery time.
@@ -4903,6 +4978,14 @@ public partial class Form1 : Form
         }
 
         return Path.GetPathRoot(normalized);
+    }
+
+    private static bool IsMp4CarvingCandidate(string fileName)
+    {
+        var extension = Path.GetExtension(fileName);
+        return extension.Equals(".mp4", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".m4v", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".mov", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string NormalizePath(string value) =>
