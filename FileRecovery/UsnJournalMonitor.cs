@@ -1516,6 +1516,14 @@ public sealed class UsnJournalMonitor : IDisposable
             return false;
         }
 
+        if (deletion.NtfsDataSnapshot?.IsComplete == true)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: skipping duplicate capture because a complete snapshot already exists: " +
+                $"path={deletion.FullPath}, fileRef={deletion.FileReferenceNumber}.");
+            return true;
+        }
+
         if (deletion.DeletedAtUtc != default &&
             _monitorStartedAtUtc != default &&
             deletion.DeletedAtUtc < _monitorStartedAtUtc)
@@ -1569,9 +1577,7 @@ public sealed class UsnJournalMonitor : IDisposable
             deletion.FileName,
             directoryPath);
 
-        if (deletion.NtfsDataSnapshot is not null &&
-            (deletion.NtfsDataSnapshot.IsComplete ||
-             deletion.NtfsDataSnapshot.FileSizeBytes > DeleteSnapshotMaxBytes))
+        if (deletion.NtfsDataSnapshot?.IsComplete == true)
         {
             return true;
         }
