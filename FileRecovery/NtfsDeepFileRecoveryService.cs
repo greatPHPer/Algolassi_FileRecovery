@@ -167,6 +167,29 @@ public sealed class NtfsDeepFileRecoveryService
                     $"bytes={bytesToRead:N0}, overlap={overlapLength:N0}, " +
                     $"scanned={scannedBytes:N0}.");
 
+                // RAR archives can be far larger than the bounded in-memory
+                // signature-carving window. Validate the RAR header chain directly
+                // from the volume and stream a complete contiguous archive to disk.
+                // This also lets a RAR archive be recognized when its filename suffix
+                // is unfamiliar, without buffering the entire archive in memory.
+                if (TryRecoverRarFromScanWindow(
+                        scanWindow,
+                        scanWindowOffset,
+                        physicalOffset,
+                        extentOffset,
+                        extentBytes,
+                        volumeInfo.BytesPerCluster,
+                        knownFileSizeBytes,
+                        volumeHandle,
+                        bitmapReader,
+                        candidate,
+                        destinationDirectory,
+                        cancellationToken,
+                        out var rarRecovery))
+                {
+                    return rarRecovery;
+                }
+
                 if (!TryCarve(
                         extension,
                         scanWindow,
@@ -317,6 +340,657 @@ public sealed class NtfsDeepFileRecoveryService
         // can be reconstructed. Small, known-length text files may use the
         // conservative fallback below; unknown binary formats still need parsers.
         return true;
+    }
+
+    private const long MaxRarArchiveBytes = 16L * 1024L * 1024L * 1024L;
+    private const int MaxRarHeaderBytes = 2 * 1024 * 1024;
+
+    private static bool TryRecoverRarFromScanWindow(
+        byte[] scanWindow,
+        long scanWindowOffset,
+        long currentChunkPhysicalOffset,
+        long freeExtentStart,
+        long freeExtentLength,
+        long bytesPerCluster,
+        long knownFileSizeBytes,
+        SafeFileHandle volumeHandle,
+        NtfsVolumeBitmapReader bitmapReader,
+        RecoveryCandidate candidate,
+        string destinationDirectory,
+        CancellationToken cancellationToken,
+        out RecoveryResult recovery)
+    {
+        recovery = null!;
+        var freeExtentEnd = checked(freeExtentStart + freeExtentLength);
+        var searchFrom = 0;
+
+        while (TryFindRarSignature(
+                   scanWindow,
+                   searchFrom,
+                   out var signatureOffset,
+                   out var signatureLength,
+                   out var detectedFormat))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            searchFrom = signatureOffset + 1;
+
+            var absoluteStart = checked(scanWindowOffset + signatureOffset);
+            if (absoluteStart < freeExtentStart ||
+                absoluteStart > freeExtentEnd - signatureLength)
+            {
+                continue;
+            }
+
+            var availableInExtent = freeExtentEnd - absoluteStart;
+            var maximumArchiveLength = Math.Min(
+                availableInExtent,
+                MaxRarArchiveBytes);
+
+            if (maximumArchiveLength < signatureLength)
+            {
+                continue;
+            }
+
+            long parsedArchiveLength;
+            string parsedFormat;
+
+            try
+            {
+                if (!TryMeasureRarArchive(
+                        volumeHandle,
+                        absoluteStart,
+                        maximumArchiveLength,
+                        cancellationToken,
+                        out parsedArchiveLength,
+                        out parsedFormat))
+                {
+                    continue;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"RAR structural scan rejected candidate at offset {absoluteStart:N0}: " +
+                    $"{ex.GetType().Name}: {ex.Message}");
+                continue;
+            }
+
+            if (parsedArchiveLength <= 0 ||
+                parsedArchiveLength > maximumArchiveLength)
+            {
+                continue;
+            }
+
+            // Prefer the structurally measured RAR length. If NTFS supplied the
+            // original length, accept it only when the end marker is at that
+            // boundary or has at most 1 MiB of appended auxiliary data (for
+            // example a third-party signature).
+            var outputLength = parsedArchiveLength;
+            if (knownFileSizeBytes > 0)
+            {
+                if (knownFileSizeBytes < parsedArchiveLength ||
+                    knownFileSizeBytes > MaxRarArchiveBytes ||
+                    knownFileSizeBytes - parsedArchiveLength > 1024L * 1024L)
+                {
+                    continue;
+                }
+
+                outputLength = knownFileSizeBytes;
+            }
+
+            if (outputLength > availableInExtent ||
+                absoluteStart > long.MaxValue - outputLength)
+            {
+                continue;
+            }
+
+            // A signature found in the retained overlap may already have been
+            // wholly passed by an earlier chunk. Do not recover it twice.
+            if (absoluteStart + outputLength <= currentChunkPhysicalOffset)
+            {
+                continue;
+            }
+
+            var firstCluster = absoluteStart / bytesPerCluster;
+            var lastByteExclusive = checked(absoluteStart + outputLength);
+            var lastClusterExclusive = checked(
+                (lastByteExclusive + bytesPerCluster - 1) / bytesPerCluster);
+            var clusterCount = checked(lastClusterExclusive - firstCluster);
+
+            if (clusterCount <= 0)
+            {
+                continue;
+            }
+
+            var allocation = bitmapReader.CheckExtents(
+                volumeHandle,
+                [
+                    new NtfsDataExtent
+                    {
+                        VirtualClusterNumber = 0,
+                        LogicalClusterNumber = firstCluster,
+                        ClusterCount = clusterCount
+                    }
+                ],
+                cancellationToken);
+
+            if (allocation.Count != 1 ||
+                allocation[0].AllocatedClusterCount != 0 ||
+                allocation[0].FreeClusterCount != clusterCount)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"RAR recovery rejected because its full span is no longer free: " +
+                    $"path={candidate.FullPath}, offset={absoluteStart:N0}, " +
+                    $"bytes={outputLength:N0}.");
+                continue;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"Deep NTFS RAR carve hit: candidate={candidate.FullPath}, " +
+                $"format={parsedFormat}, offset={absoluteStart:N0}, " +
+                $"bytes={outputLength:N0}, clusters={clusterCount:N0}; " +
+                "RAR headers validated, compressed payload checksums not independently verified.");
+
+            var destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
+                destinationDirectory,
+                candidate.Name);
+
+            var destinationCreated = false;
+            try
+            {
+                using var output = new FileStream(
+                    destinationPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    IoBufferSize,
+                    FileOptions.SequentialScan);
+
+                destinationCreated = true;
+                var remaining = outputLength;
+                var sourceOffset = absoluteStart;
+
+                while (remaining > 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var count = checked((int)Math.Min(IoBufferSize, remaining));
+                    var copyBuffer = new byte[count];
+
+                    ReadAt(
+                        volumeHandle,
+                        sourceOffset,
+                        copyBuffer,
+                        cancellationToken);
+
+                    output.Write(copyBuffer, 0, copyBuffer.Length);
+                    sourceOffset = checked(sourceOffset + count);
+                    remaining -= count;
+                }
+
+                output.Flush();
+            }
+            catch
+            {
+                if (destinationCreated)
+                {
+                    TryDelete(destinationPath);
+                }
+
+                throw;
+            }
+
+            recovery = new RecoveryResult
+            {
+                Success = true,
+                SourcePath = candidate.FullPath,
+                DestinationPath = destinationPath,
+                BytesRecovered = outputLength,
+                Evidence =
+                    $"Deep NTFS carving recovered a {outputLength:N0}-byte {parsedFormat} archive " +
+                    "from a single currently-free contiguous cluster extent. The archive's header " +
+                    "chain and header checksums were validated; the carver does not decompress archive " +
+                    "members or independently verify their payload checksums. Open/test the recovered " +
+                    "archive with a trusted archive utility to confirm payload integrity."
+            };
+
+            System.Diagnostics.Trace.WriteLine(
+                $"Deep NTFS RAR carve succeeded: source={candidate.FullPath}, " +
+                $"format={parsedFormat}, offset={absoluteStart:N0}, bytes={outputLength:N0}, " +
+                $"destination={destinationPath}.");
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryFindRarSignature(
+        byte[] buffer,
+        int searchFrom,
+        out int start,
+        out int signatureLength,
+        out string format)
+    {
+        start = -1;
+        signatureLength = 0;
+        format = string.Empty;
+
+        ReadOnlySpan<byte> rar5 = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+        ReadOnlySpan<byte> rar4 = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
+
+        if (searchFrom < 0)
+        {
+            searchFrom = 0;
+        }
+
+        for (var i = searchFrom; i < buffer.Length; i++)
+        {
+            if (i + rar5.Length <= buffer.Length &&
+                buffer.AsSpan(i, rar5.Length).SequenceEqual(rar5))
+            {
+                start = i;
+                signatureLength = rar5.Length;
+                format = "RAR 5.x";
+                return true;
+            }
+
+            if (i + rar4.Length <= buffer.Length &&
+                buffer.AsSpan(i, rar4.Length).SequenceEqual(rar4))
+            {
+                start = i;
+                signatureLength = rar4.Length;
+                format = "RAR 4.x";
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryMeasureRarArchive(
+        SafeFileHandle volumeHandle,
+        long startOffset,
+        long maximumArchiveLength,
+        CancellationToken cancellationToken,
+        out long archiveLength,
+        out string format)
+    {
+        archiveLength = 0;
+        format = string.Empty;
+
+        if (maximumArchiveLength < 7)
+        {
+            return false;
+        }
+
+        var signatureBufferLength = checked((int)Math.Min(8L, maximumArchiveLength));
+        var signatureBuffer = new byte[signatureBufferLength];
+        ReadAt(volumeHandle, startOffset, signatureBuffer, cancellationToken);
+
+        ReadOnlySpan<byte> rar5Signature = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+        ReadOnlySpan<byte> rar4Signature = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
+
+        if (signatureBuffer.Length >= rar5Signature.Length &&
+            signatureBuffer.AsSpan(0, rar5Signature.Length).SequenceEqual(rar5Signature))
+        {
+            format = "RAR 5.x";
+            return TryMeasureRar5Archive(
+                volumeHandle,
+                startOffset,
+                maximumArchiveLength,
+                cancellationToken,
+                out archiveLength);
+        }
+
+        if (signatureBuffer.Length >= rar4Signature.Length &&
+            signatureBuffer.AsSpan(0, rar4Signature.Length).SequenceEqual(rar4Signature))
+        {
+            format = "RAR 4.x";
+            return TryMeasureRar4Archive(
+                volumeHandle,
+                startOffset,
+                maximumArchiveLength,
+                cancellationToken,
+                out archiveLength);
+        }
+
+        return false;
+    }
+
+    private static bool TryMeasureRar5Archive(
+        SafeFileHandle volumeHandle,
+        long startOffset,
+        long maximumArchiveLength,
+        CancellationToken cancellationToken,
+        out long archiveLength)
+    {
+        archiveLength = 0;
+        long relativeOffset = 8;
+        var sawMainHeader = false;
+
+        // A header-only walk is enough to find the exact archive boundary:
+        // each RAR5 block reports the size of its optional packed-data area.
+        // Payload data is skipped, not buffered in memory.
+        for (var blockIndex = 0; blockIndex < 1_000_000; blockIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (relativeOffset < 8 ||
+                relativeOffset > maximumArchiveLength - 5)
+            {
+                return false;
+            }
+
+            var prefixLength = checked((int)Math.Min(
+                14L,
+                maximumArchiveLength - relativeOffset));
+            if (prefixLength < 5)
+            {
+                return false;
+            }
+
+            var prefix = new byte[prefixLength];
+            ReadAt(
+                volumeHandle,
+                checked(startOffset + relativeOffset),
+                prefix,
+                cancellationToken);
+
+            var storedHeaderCrc = BinaryPrimitives.ReadUInt32LittleEndian(
+                prefix.AsSpan(0, 4));
+
+            var sizePosition = 4;
+            if (!TryReadRarVint(prefix, ref sizePosition, out var headerSizeValue) ||
+                headerSizeValue < 2 ||
+                headerSizeValue > MaxRarHeaderBytes)
+            {
+                return false;
+            }
+
+            var sizeVintLength = sizePosition - 4;
+            var headerSize = checked((int)headerSizeValue);
+            var headerEnd = checked(
+                relativeOffset + 4L + sizeVintLength + headerSize);
+
+            if (headerEnd > maximumArchiveLength)
+            {
+                return false;
+            }
+
+            var headerBody = new byte[headerSize];
+            ReadAt(
+                volumeHandle,
+                checked(startOffset + relativeOffset + 4L + sizeVintLength),
+                headerBody,
+                cancellationToken);
+
+            var crcInput = new byte[checked(sizeVintLength + headerBody.Length)];
+            Buffer.BlockCopy(prefix, 4, crcInput, 0, sizeVintLength);
+            Buffer.BlockCopy(
+                headerBody,
+                0,
+                crcInput,
+                sizeVintLength,
+                headerBody.Length);
+
+            if (ComputeCrc32(crcInput) != storedHeaderCrc)
+            {
+                return false;
+            }
+
+            var headerPosition = 0;
+            if (!TryReadRarVint(headerBody, ref headerPosition, out var headerType) ||
+                !TryReadRarVint(headerBody, ref headerPosition, out var headerFlags))
+            {
+                return false;
+            }
+
+            ulong extraAreaSize = 0;
+            ulong dataAreaSize = 0;
+            var hasDataArea = (headerFlags & 0x0002) != 0;
+
+            if ((headerFlags & 0x0001) != 0 &&
+                !TryReadRarVint(headerBody, ref headerPosition, out extraAreaSize))
+            {
+                return false;
+            }
+
+            if (hasDataArea &&
+                !TryReadRarVint(headerBody, ref headerPosition, out dataAreaSize))
+            {
+                return false;
+            }
+
+            if (extraAreaSize > headerSize ||
+                dataAreaSize > (ulong)MaxRarArchiveBytes)
+            {
+                return false;
+            }
+
+            // Encrypted-header RAR5 archives require decrypting subsequent headers;
+            // do not claim a structurally validated recovery for those archives.
+            if (headerType == 4)
+            {
+                return false;
+            }
+
+            if (!sawMainHeader)
+            {
+                if (headerType != 1)
+                {
+                    return false;
+                }
+
+                sawMainHeader = true;
+            }
+            else if (headerType == 1)
+            {
+                return false;
+            }
+
+            if (headerType == 5)
+            {
+                if (!sawMainHeader || hasDataArea || dataAreaSize != 0)
+                {
+                    return false;
+                }
+
+                archiveLength = headerEnd;
+                return archiveLength <= maximumArchiveLength;
+            }
+
+            var remaining = maximumArchiveLength - headerEnd;
+            if (dataAreaSize > (ulong)remaining)
+            {
+                return false;
+            }
+
+            var nextOffset = checked(headerEnd + (long)dataAreaSize);
+            if (nextOffset <= relativeOffset ||
+                nextOffset > MaxRarArchiveBytes)
+            {
+                return false;
+            }
+
+            relativeOffset = nextOffset;
+        }
+
+        return false;
+    }
+
+    private static bool TryMeasureRar4Archive(
+        SafeFileHandle volumeHandle,
+        long startOffset,
+        long maximumArchiveLength,
+        CancellationToken cancellationToken,
+        out long archiveLength)
+    {
+        archiveLength = 0;
+        long relativeOffset = 7;
+        var sawMainHeader = false;
+
+        for (var blockIndex = 0; blockIndex < 1_000_000; blockIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (relativeOffset < 7 ||
+                relativeOffset > maximumArchiveLength - 7)
+            {
+                return false;
+            }
+
+            var fixedHeader = new byte[7];
+            ReadAt(
+                volumeHandle,
+                checked(startOffset + relativeOffset),
+                fixedHeader,
+                cancellationToken);
+
+            var storedHeaderCrc = BinaryPrimitives.ReadUInt16LittleEndian(
+                fixedHeader.AsSpan(0, 2));
+            var headerType = fixedHeader[2];
+            var headerFlags = BinaryPrimitives.ReadUInt16LittleEndian(
+                fixedHeader.AsSpan(3, 2));
+            var headerSize = BinaryPrimitives.ReadUInt16LittleEndian(
+                fixedHeader.AsSpan(5, 2));
+
+            if (headerSize < 7 ||
+                headerSize > maximumArchiveLength - relativeOffset)
+            {
+                return false;
+            }
+
+            var header = new byte[headerSize];
+            ReadAt(
+                volumeHandle,
+                checked(startOffset + relativeOffset),
+                header,
+                cancellationToken);
+
+            var computedHeaderCrc = (ushort)(
+                ComputeCrc32(header.AsSpan(2)) & 0xFFFF);
+
+            if (computedHeaderCrc != storedHeaderCrc)
+            {
+                return false;
+            }
+
+            ulong dataAreaSize = 0;
+            if ((headerFlags & 0x8000) != 0)
+            {
+                if (headerSize < 11)
+                {
+                    return false;
+                }
+
+                dataAreaSize = BinaryPrimitives.ReadUInt32LittleEndian(
+                    header.AsSpan(7, 4));
+            }
+
+            if (!sawMainHeader)
+            {
+                if (headerType != 0x73)
+                {
+                    return false;
+                }
+
+                // RAR4's MHD_PASSWORD bit means subsequent block headers are
+                // encrypted. Header-chain validation cannot safely continue.
+                if ((headerFlags & 0x0080) != 0)
+                {
+                    return false;
+                }
+
+                sawMainHeader = true;
+            }
+            else if (headerType == 0x73)
+            {
+                return false;
+            }
+
+            if (headerType == 0x7B)
+            {
+                archiveLength = checked(relativeOffset + headerSize);
+                return sawMainHeader &&
+                       archiveLength <= maximumArchiveLength;
+            }
+
+            if (headerType < 0x73 || headerType > 0x7A)
+            {
+                return false;
+            }
+
+            var headerEnd = checked(relativeOffset + headerSize);
+            var remaining = maximumArchiveLength - headerEnd;
+            if (dataAreaSize > (ulong)remaining)
+            {
+                return false;
+            }
+
+            var nextOffset = checked(headerEnd + (long)dataAreaSize);
+            if (nextOffset <= relativeOffset ||
+                nextOffset > MaxRarArchiveBytes)
+            {
+                return false;
+            }
+
+            relativeOffset = nextOffset;
+        }
+
+        return false;
+    }
+
+    private static bool TryReadRarVint(
+        ReadOnlySpan<byte> input,
+        ref int position,
+        out ulong value)
+    {
+        value = 0;
+
+        for (var index = 0; index < 10; index++)
+        {
+            if (position >= input.Length)
+            {
+                return false;
+            }
+
+            var next = input[position++];
+            if (index == 9 && (next & 0xFE) != 0)
+            {
+                return false;
+            }
+
+            value |= (ulong)(next & 0x7F) << (index * 7);
+            if ((next & 0x80) == 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static uint ComputeCrc32(ReadOnlySpan<byte> data)
+    {
+        var crc = 0xFFFFFFFFu;
+
+        foreach (var value in data)
+        {
+            crc ^= value;
+
+            for (var bit = 0; bit < 8; bit++)
+            {
+                crc = (crc & 1) != 0
+                    ? (crc >> 1) ^ 0xEDB88320u
+                    : crc >> 1;
+            }
+        }
+
+        return ~crc;
     }
 
     private static bool SupportsExtension(string extension) =>
