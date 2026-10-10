@@ -4102,6 +4102,45 @@ public partial class Form1 : Form
                         continue;
                     }
 
+                    // Catch-up discovery may identify the deleted filename but lack the
+                    // historical $FILE_NAME size. For an explicitly selected TXT candidate,
+                    // let the user provide its exact original byte length before marker recovery.
+                    // This is necessary for large streaming recovery, which must know the exact
+                    // copy length; an unknown length cannot be safely inferred from plain text.
+                    if (candidate.FileSizeBytes <= 0)
+                    {
+                        var enteredSize = Microsoft.VisualBasic.Interaction.InputBox(
+                            $"NTFS metadata did not provide a trusted original size for '{candidate.Name}'.\r\n\r\n" +
+                            "Enter the exact original file size in bytes to enable exact-size text recovery. " +
+                            "For the synthetic 1 GiB test file, enter 1073741824.\r\n\r\n" +
+                            "Leave blank to skip exact-size recovery and continue with the existing marker scan.",
+                            "Original text-file size",
+                            "");
+
+                        if (!string.IsNullOrWhiteSpace(enteredSize))
+                        {
+                            if (!long.TryParse(
+                                    enteredSize.Trim(),
+                                    System.Globalization.NumberStyles.None,
+                                    System.Globalization.CultureInfo.InvariantCulture,
+                                    out var suppliedSizeBytes) ||
+                                suppliedSizeBytes <= 0 ||
+                                suppliedSizeBytes > 2L * 1024L * 1024L * 1024L)
+                            {
+                                failures.Add(
+                                    $"{candidate.Name}: the supplied original size '{enteredSize}' is invalid. " +
+                                    "Enter the exact byte count between 1 and 2147483648.");
+                                continue;
+                            }
+
+                            candidate.FileSizeBytes = suppliedSizeBytes;
+                            System.Diagnostics.Trace.WriteLine(
+                                $"NTFS user-supplied original TXT size: path={candidate.FullPath}, " +
+                                $"bytes={suppliedSizeBytes:N0}; size was supplied for experimental recovery " +
+                                "and is not independently verified by NTFS metadata.");
+                        }
+                    }
+
                     // Experimental fallback for larger plain-text files: before asking the
                     // user to supply a marker, scan NTFS free clusters for an exact-length
                     // text-like region when the original size is known. This is intentionally
