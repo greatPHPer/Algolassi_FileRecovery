@@ -1357,14 +1357,68 @@ public sealed class UsnJournalMonitor : IDisposable
             var dataReader =
                 new NtfsLogFileHistoricalDataService();
 
-            // FileSystemWatcher normally records the original byte length before
-            // deletion. Pass that trusted size through so $LogFile reconstruction can
-            // validate the target without depending on a fragile historical-size
-            // inference from the reused MFT generation.
+            // Preserve the size captured by FileSystemWatcher. For large files,
+            // use the streaming historical path so the size is not reset to zero
+            // just because the older byte-array path has a 16 MiB limit.
             var knownSize = deletion.FileSizeBytes.GetValueOrDefault();
 
-            if (knownSize < 0 ||
-                knownSize > DeleteSnapshotMaxBytes)
+            if (knownSize > DeleteSnapshotMaxBytes)
+            {
+                if (knownSize > MaxStreamingDeleteSnapshotBytes)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS $LogFile live snapshot: known size exceeds streaming limit; " +
+                        $"path={deletion.FullPath}, size={knownSize:N0}, " +
+                        $"limit={MaxStreamingDeleteSnapshotBytes:N0}.");
+                    return false;
+                }
+
+                if (!dataReader.TryRecoverFileDataToSnapshotStore(
+                        root,
+                        fileReferenceNumber,
+                        deletion.FileName,
+                        fileSizeBytes: knownSize,
+                        maxCaptureBytes: MaxStreamingDeleteSnapshotBytes,
+                        snapshotStore: _snapshotStore,
+                        recordId: deletion.Id,
+                        out var streamedDataFileName,
+                        out var streamedSha256,
+                        out var streamedEvidence,
+                        progress: null,
+                        cancellationToken: cancellationToken))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS $LogFile live streaming snapshot lookup failed for " +
+                        $"{deletion.FullPath}: {streamedEvidence}");
+                    return false;
+                }
+
+                deletion.FileSizeBytes = knownSize;
+                deletion.RecoveryStrength = "Strong";
+                deletion.NtfsDataSnapshot = new NtfsDeletionDataSnapshot
+                {
+                    DataCaptured = true,
+                    IsResident = false,
+                    FileSizeBytes = knownSize,
+                    ValidDataLengthBytes = knownSize,
+                    CapturedByteCount = knownSize,
+                    DataFileName = streamedDataFileName,
+                    Sha256 = streamedSha256,
+                    CapturedAtUtc = DateTime.UtcNow,
+                    Evidence =
+                        "Captured immediately from a validated historical NTFS $LogFile runlist using " +
+                        "bounded-memory streaming. " + streamedEvidence
+                };
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile live STREAMING snapshot saved: " +
+                    $"path={deletion.FullPath}, fileRef={fileReferenceNumber}, " +
+                    $"size={knownSize:N0}, dataFile={streamedDataFileName}, " +
+                    $"sha256={streamedSha256}.");
+                return true;
+            }
+
+            if (knownSize < 0)
             {
                 knownSize = 0;
             }

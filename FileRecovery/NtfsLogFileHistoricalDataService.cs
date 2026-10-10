@@ -657,6 +657,305 @@ public sealed class NtfsLogFileHistoricalDataService
         }
     }
 
+
+    /// <summary>
+    /// Recovers a known-length nonresident file directly into the durable snapshot store.
+    /// Unlike TryRecoverFileData, this path never allocates a file-sized byte array.
+    /// Only a complete runlist tied to the exact historical MFT generation or an
+    /// exact open-attribute reference is accepted.
+    /// </summary>
+    public bool TryRecoverFileDataToSnapshotStore(
+        string rootPath,
+        ulong fileReferenceNumber,
+        string expectedFileName,
+        long fileSizeBytes,
+        long maxCaptureBytes,
+        NtfsDeletionSnapshotStore snapshotStore,
+        Guid recordId,
+        out string dataFileName,
+        out string sha256,
+        out string evidence,
+        IProgress<string>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        dataFileName = string.Empty;
+        sha256 = string.Empty;
+        evidence = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(rootPath) ||
+            fileReferenceNumber == 0 ||
+            string.IsNullOrWhiteSpace(expectedFileName) ||
+            fileSizeBytes <= 0 ||
+            fileSizeBytes > maxCaptureBytes ||
+            snapshotStore is null)
+        {
+            evidence = "Historical streaming recovery arguments are outside the supported range.";
+            return false;
+        }
+
+        var normalizedRoot = GetNtfsVolumeRoot(rootPath);
+        if (string.IsNullOrWhiteSpace(normalizedRoot))
+        {
+            evidence = "The source path is not on a valid NTFS volume.";
+            return false;
+        }
+
+        string? temporaryLogFile = null;
+        try
+        {
+            WindowsPrivilege.EnableSeBackupPrivilege();
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var volumeInfo = new NtfsVolumeInspector().Inspect(normalizedRoot);
+            using var metadataHandle = CreateVolumeHandle(normalizedRoot, overlapped: false);
+            using var rawHandle = CreateVolumeHandle(normalizedRoot, overlapped: true);
+
+            var reader = new NtfsMftDataReader();
+            var logStream = reader.ReadMetadataFileDataStream(volumeInfo, metadataHandle, 2);
+            if (!logStream.Found ||
+                logStream.IsResident ||
+                logStream.Extents.Count == 0 ||
+                logStream.FileSizeBytes <= 0)
+            {
+                evidence = "NTFS $LogFile did not expose a usable nonresident $DATA stream.";
+                return false;
+            }
+
+            var logicalLength = Math.Min(
+                logStream.FileSizeBytes,
+                MaxHistoricalRecoveryLogBytes);
+            progress?.Report(
+                $"Preparing disk-backed historical NTFS $LogFile workspace for {expectedFileName}... " +
+                $"{logicalLength / (1024d * 1024d):0} MB journal data");
+
+            temporaryLogFile = WriteMappedLogicalFileToTemporaryFile(
+                rawHandle,
+                volumeInfo.BytesPerCluster,
+                logStream.Extents,
+                logicalLength,
+                progress,
+                cancellationToken);
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!TryReadGeometryFromFile(
+                    temporaryLogFile,
+                    volumeInfo.BytesPerSector,
+                    out var geometry,
+                    out var geometryEvidence))
+            {
+                evidence = geometryEvidence;
+                return false;
+            }
+
+            ApplyFastPagesToFile(
+                temporaryLogFile,
+                geometry,
+                volumeInfo.BytesPerSector,
+                cancellationToken);
+
+            progress?.Report(
+                $"Parsing targeted historical NTFS $LogFile records for {expectedFileName}...");
+            var records = ParseTargetRecordsFromFile(
+                temporaryLogFile,
+                geometry,
+                volumeInfo.BytesPerSector,
+                fileReferenceNumber,
+                volumeInfo.BytesPerCluster,
+                volumeInfo.BytesPerFileRecordSegment,
+                progress,
+                cancellationToken);
+
+            cancellationToken.ThrowIfCancellationRequested();
+            TraceTargetHistoricalEvidence(
+                records,
+                fileReferenceNumber,
+                volumeInfo.BytesPerCluster,
+                volumeInfo.BytesPerFileRecordSegment);
+
+            var restartOpenAttributeHistories = ReadRestartOpenAttributeHistories(
+                temporaryLogFile,
+                geometry,
+                volumeInfo.BytesPerSector,
+                fileReferenceNumber);
+
+            progress?.Report(
+                $"Checking exact-generation historical mapping pairs for {expectedFileName}...");
+            var mappingCandidates = FindTargetMappingCandidates(
+                records,
+                fileReferenceNumber,
+                volumeInfo.BytesPerCluster,
+                volumeInfo.BytesPerFileRecordSegment,
+                restartOpenAttributeHistories);
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile streaming mapping search: fileRef={fileReferenceNumber}, " +
+                $"name={expectedFileName}, expectedSize={fileSizeBytes:N0}, " +
+                $"candidateCount={mappingCandidates.Count:N0}.");
+
+            if (mappingCandidates.Count == 0)
+            {
+                evidence =
+                    $"No complete-runlist candidate could be tied to exact file reference " +
+                    $"{fileReferenceNumber} ('{expectedFileName}'). Mapping pairs from a different " +
+                    "MFT generation were not accepted.";
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile streaming recovery MISS: fileRef={fileReferenceNumber}, " +
+                    $"name={expectedFileName}, size={fileSizeBytes:N0}, evidence={evidence}");
+                return false;
+            }
+
+            var requiredClusters = checked(
+                (fileSizeBytes + volumeInfo.BytesPerCluster - 1) /
+                volumeInfo.BytesPerCluster);
+
+            foreach (var candidate in mappingCandidates.OrderByDescending(item => item.Lsn))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!TryBuildCompleteChain(
+                        candidate.Extents,
+                        requiredClusters,
+                        out var extents,
+                        out var chainEvidence))
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS $LogFile streaming candidate rejected: fileRef={fileReferenceNumber}, " +
+                        $"lsn=0x{candidate.Lsn:X16}, identity={candidate.IdentitySource}, " +
+                        $"reason=runlist does not cover {requiredClusters:N0} required clusters.");
+                    continue;
+                }
+
+                var saved = snapshotStore.TrySaveStreaming(
+                    recordId,
+                    fileSizeBytes,
+                    (output, hash) =>
+                    {
+                        var remaining = fileSizeBytes;
+                        var expectedVcn = 0L;
+                        var clusterSize = checked((long)volumeInfo.BytesPerCluster);
+                        var buffer = new byte[1024 * 1024];
+                        var zeroBuffer = new byte[1024 * 1024];
+
+                        foreach (var extent in extents)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            if (extent.VirtualClusterNumber != expectedVcn ||
+                                extent.ClusterCount <= 0)
+                            {
+                                throw new InvalidDataException(
+                                    $"Historical $LogFile runlist VCN discontinuity: " +
+                                    $"expected={expectedVcn}, actual={extent.VirtualClusterNumber}, " +
+                                    $"clusters={extent.ClusterCount}.");
+                            }
+
+                            var extentBytes = checked(extent.ClusterCount * clusterSize);
+                            var bytesForExtent = Math.Min(extentBytes, remaining);
+                            long extentOffset = 0;
+                            while (extentOffset < bytesForExtent)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                var count = checked((int)Math.Min(
+                                    buffer.Length,
+                                    bytesForExtent - extentOffset));
+
+                                if (extent.IsSparse)
+                                {
+                                    output.Write(zeroBuffer, 0, count);
+                                    hash.AppendData(zeroBuffer, 0, count);
+                                }
+                                else
+                                {
+                                    var physicalOffset = checked(
+                                        extent.LogicalClusterNumber * clusterSize + extentOffset);
+                                    ReadRawExact(rawHandle, physicalOffset, buffer, 0, count);
+                                    output.Write(buffer, 0, count);
+                                    hash.AppendData(buffer, 0, count);
+                                }
+
+                                extentOffset += count;
+                                remaining -= count;
+                            }
+
+                            expectedVcn = checked(expectedVcn + extent.ClusterCount);
+                            if (remaining == 0)
+                            {
+                                break;
+                            }
+                        }
+
+                        if (remaining != 0)
+                        {
+                            throw new InvalidDataException(
+                                $"Historical $LogFile runlist did not cover the entire file; " +
+                                $"remaining={remaining:N0} bytes.");
+                        }
+                    },
+                    out dataFileName,
+                    out sha256);
+
+                if (!saved)
+                {
+                    evidence =
+                        $"A complete historical runlist was identified ({chainEvidence}), but " +
+                        "streaming its bytes to the snapshot store failed. No snapshot was published.";
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS $LogFile streaming snapshot SAVE FAILED: fileRef={fileReferenceNumber}, " +
+                        $"size={fileSizeBytes:N0}, lsn=0x{candidate.Lsn:X16}, evidence={evidence}");
+                    dataFileName = string.Empty;
+                    sha256 = string.Empty;
+                    return false;
+                }
+
+                evidence =
+                    $"Streamed {fileSizeBytes:N0} byte(s) using a complete historical $LogFile " +
+                    $"runlist tied to the exact file reference. {chainEvidence}";
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS $LogFile streaming recovery succeeded: fileRef={fileReferenceNumber}, " +
+                    $"name={expectedFileName}, size={fileSizeBytes:N0}, lsn=0x{candidate.Lsn:X16}, " +
+                    $"identity={candidate.IdentitySource}, sha256={sha256}.");
+                return true;
+            }
+
+            evidence =
+                $"Historical mapping-pair candidates existed for '{expectedFileName}', but none " +
+                $"formed a complete VCN-0 cluster chain for {fileSizeBytes:N0} bytes.";
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile streaming recovery MISS: fileRef={fileReferenceNumber}, " +
+                $"name={expectedFileName}, size={fileSizeBytes:N0}, evidence={evidence}");
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            dataFileName = string.Empty;
+            sha256 = string.Empty;
+            evidence = "Historical $LogFile streaming recovery was cancelled.";
+            return false;
+        }
+        catch (Exception ex)
+        {
+            dataFileName = string.Empty;
+            sha256 = string.Empty;
+            evidence = $"Historical $LogFile streaming recovery failed: {ex.GetType().Name}: {ex.Message}";
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS $LogFile streaming recovery failed: fileRef={fileReferenceNumber}, " +
+                $"name={expectedFileName}, error={evidence}");
+            return false;
+        }
+        finally
+        {
+            if (!string.IsNullOrWhiteSpace(temporaryLogFile))
+            {
+                try
+                {
+                    File.Delete(temporaryLogFile);
+                }
+                catch
+                {
+                    // Best-effort cleanup of the disk-backed journal workspace.
+                }
+            }
+        }
+    }
+
     private static bool TryInferHistoricalFileSize(
         IReadOnlyList<ParsedLogRecord> records,
         ulong targetFileReference,
