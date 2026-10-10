@@ -64,6 +64,98 @@ public sealed class NtfsDeletionSnapshotStore
         }
     }
 
+
+    /// <summary>
+    /// Saves a snapshot via a bounded-memory writer. The temporary file is
+    /// promoted only after the exact expected byte count and SHA-256 are known.
+    /// </summary>
+    public bool TrySaveStreaming(
+        Guid recordId,
+        long expectedLength,
+        Action<Stream, IncrementalHash> writeContent,
+        out string dataFileName,
+        out string sha256)
+    {
+        dataFileName = string.Empty;
+        sha256 = string.Empty;
+        if (expectedLength < 0 || writeContent is null)
+        {
+            return false;
+        }
+
+        var volumeRoot = Path.GetPathRoot(_folder);
+        if (string.IsNullOrWhiteSpace(volumeRoot))
+        {
+            return false;
+        }
+
+        try
+        {
+            var drive = new DriveInfo(volumeRoot);
+            const long safetyReserveBytes = 64L * 1024 * 1024;
+            var requiredBytes = checked(expectedLength + safetyReserveBytes);
+            if (drive.AvailableFreeSpace < requiredBytes)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS snapshot streaming skipped: insufficient free space; " +
+                    $"requiredAtLeast={requiredBytes:N0}, available={drive.AvailableFreeSpace:N0}, " +
+                    $"folder={_folder}.");
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS snapshot streaming could not validate destination free space: {ex.Message}");
+            return false;
+        }
+
+        var fileName = $"{recordId:N}.bin";
+        var destination = Path.Combine(_folder, fileName);
+        var temporary = Path.Combine(
+            _folder,
+            $".{fileName}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            byte[] hashBytes;
+            using (var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+            using (var output = new FileStream(
+                       temporary,
+                       FileMode.CreateNew,
+                       FileAccess.Write,
+                       FileShare.None,
+                       CopyBufferSize,
+                       FileOptions.SequentialScan))
+            {
+                writeContent(output, hash);
+                if (output.Length != expectedLength)
+                {
+                    throw new InvalidDataException(
+                        $"Streamed snapshot length mismatch: expected={expectedLength:N0}, " +
+                        $"actual={output.Length:N0}.");
+                }
+
+                output.Flush(flushToDisk: true);
+                hashBytes = hash.GetHashAndReset();
+            }
+
+            sha256 = Convert.ToHexString(hashBytes);
+            File.Move(temporary, destination, overwrite: true);
+            dataFileName = fileName;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            TryDelete(temporary);
+            dataFileName = string.Empty;
+            sha256 = string.Empty;
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS snapshot streaming save failed: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
     /// <summary>
     /// Promotes a verified cache file to the durable snapshot folder without loading
     /// its contents into memory. Cache and snapshot folders should share a storage root,
