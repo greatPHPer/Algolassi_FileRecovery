@@ -609,34 +609,9 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         var byteBuffer = new byte[IoBufferSize];
         var charBuffer = new char[IoBufferSize];
 
-        var firstReadCount = checked((int)Math.Min(byteBuffer.Length, expectedLength));
-        if (markerEncoding.StartsWith("UTF-16", StringComparison.Ordinal))
-        {
-            firstReadCount -= firstReadCount % 2;
-        }
-
-        if (firstReadCount <= 0)
-        {
-            return false;
-        }
-
-        ReadAt(
-            volumeHandle,
-            sourceOffset,
-            byteBuffer.AsSpan(0, firstReadCount).ToArray(),
-            cancellationToken);
-
-        var firstBytes = new byte[firstReadCount];
-        ReadAt(volumeHandle, sourceOffset, firstBytes, cancellationToken);
-        if (firstReadCount < expectedLength &&
-            !LooksLikeStrictTextSample(firstBytes, strictEncoding))
-        {
-            return false;
-        }
-
         destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
-            candidate.FullPath,
-            destinationDirectory);
+            destinationDirectory,
+            candidate.Name);
 
         var completedSuccessfully = false;
         try
@@ -665,18 +640,21 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     return false;
                 }
 
+                var chunkBytes = count == byteBuffer.Length
+                    ? byteBuffer
+                    : new byte[count];
+
                 ReadAt(
                     volumeHandle,
                     checked(sourceOffset + consumed),
-                    byteBuffer,
-                    count,
+                    chunkBytes,
                     cancellationToken);
 
                 var flush = consumed + count == expectedLength;
                 try
                 {
                     decoder.Convert(
-                        byteBuffer,
+                        chunkBytes,
                         0,
                         count,
                         charBuffer,
@@ -707,7 +685,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     return false;
                 }
 
-                output.Write(byteBuffer, 0, count);
+                output.Write(chunkBytes, 0, count);
                 consumed = checked(consumed + count);
             }
 
