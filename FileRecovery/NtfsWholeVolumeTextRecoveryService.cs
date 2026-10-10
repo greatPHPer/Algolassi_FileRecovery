@@ -373,6 +373,24 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             throw new InvalidOperationException("The source volume reported an invalid cluster size.");
         }
 
+        // When a validated deletion-time NTFS runlist survived in the history record,
+        // prefer reconstructing through those original extents. This handles fragmented
+        // files without guessing boundaries from arbitrary free-space regions. If a map
+        // exists but fails validation, stop with a precise reason rather than repeating
+        // a potentially expensive whole-volume free-space scan.
+        if (candidate.NtfsDataSnapshot is { DataExtents.Count: > 0 })
+        {
+            return RecoverLargeKnownLengthTextFromRetainedExtentMap(
+                candidate,
+                destinationDirectory,
+                markerVariants,
+                volumeInfo,
+                volumeHandle,
+                expectedLength,
+                cancellationToken,
+                progress);
+        }
+
         var volumeBitmap = new NtfsVolumeBitmapReader();
         var totalVolumeBytes = checked(volumeInfo.TotalClusters * bytesPerCluster);
         var overlapLength = markerVariants.Max(item => item.Bytes.Length) + 3;
@@ -586,6 +604,446 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             $"The start marker was not found in a currently-free NTFS extent large enough to hold the known " +
             $"{expectedLength:N0}-byte file. The large-file text carver requires a distinctive marker from the " +
             "very beginning of the file and one contiguous, currently-free extent.");
+    }
+
+    private RecoveryResult RecoverLargeKnownLengthTextFromRetainedExtentMap(
+        RecoveryCandidate candidate,
+        string destinationDirectory,
+        (string Encoding, byte[] Bytes)[] markerVariants,
+        NtfsVolumeInfo volumeInfo,
+        SafeFileHandle volumeHandle,
+        long expectedLength,
+        CancellationToken cancellationToken,
+        IProgress<long>? progress)
+    {
+        var snapshot = candidate.NtfsDataSnapshot
+            ?? throw new InvalidOperationException("The retained NTFS deletion metadata is unavailable.");
+
+        if (snapshot.FileSizeBytes != expectedLength)
+        {
+            throw new InvalidOperationException(
+                $"The retained NTFS runlist size ({snapshot.FileSizeBytes:N0} bytes) does not match " +
+                $"the supplied original size ({expectedLength:N0} bytes). The mapping was not used.");
+        }
+
+        if (snapshot.ValidDataLengthBytes < expectedLength)
+        {
+            throw new InvalidOperationException(
+                $"The retained NTFS runlist reports only {snapshot.ValidDataLengthBytes:N0} valid data bytes " +
+                $"for a {expectedLength:N0}-byte file. The mapping was not used.");
+        }
+
+        var bytesPerCluster = checked((long)volumeInfo.BytesPerCluster);
+        if (bytesPerCluster <= 0 || volumeInfo.TotalClusters <= 0)
+        {
+            throw new InvalidOperationException("The source volume reported invalid cluster geometry.");
+        }
+
+        var requiredClusters = checked((expectedLength + bytesPerCluster - 1) / bytesPerCluster);
+        var sourceExtents = snapshot.DataExtents
+            .OrderBy(extent => extent.VirtualClusterNumber)
+            .ToList();
+
+        var mappedExtents = new List<NtfsDataExtent>();
+        long nextVirtualCluster = 0;
+
+        foreach (var sourceExtent in sourceExtents)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (nextVirtualCluster >= requiredClusters)
+            {
+                break;
+            }
+
+            if (sourceExtent.VirtualClusterNumber != nextVirtualCluster ||
+                sourceExtent.ClusterCount <= 0 ||
+                sourceExtent.IsSparse ||
+                sourceExtent.LogicalClusterNumber < 0)
+            {
+                throw new InvalidOperationException(
+                    "The retained NTFS runlist has a virtual-cluster gap, sparse run, invalid starting cluster, " +
+                    "or non-positive extent length. Fragment reconstruction was refused.");
+            }
+
+            var clustersNeeded = checked(requiredClusters - nextVirtualCluster);
+            var clustersToUse = Math.Min(sourceExtent.ClusterCount, clustersNeeded);
+
+            if (sourceExtent.LogicalClusterNumber > volumeInfo.TotalClusters - clustersToUse)
+            {
+                throw new InvalidOperationException(
+                    "The retained NTFS runlist points beyond the end of the source volume.");
+            }
+
+            mappedExtents.Add(new NtfsDataExtent
+            {
+                VirtualClusterNumber = sourceExtent.VirtualClusterNumber,
+                LogicalClusterNumber = sourceExtent.LogicalClusterNumber,
+                ClusterCount = clustersToUse
+            });
+
+            nextVirtualCluster = checked(nextVirtualCluster + clustersToUse);
+        }
+
+        if (nextVirtualCluster != requiredClusters || mappedExtents.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"The retained NTFS runlist maps {nextVirtualCluster:N0} of the " +
+                $"{requiredClusters:N0} required clusters. Fragment reconstruction was refused.");
+        }
+
+        var physicalExtents = mappedExtents
+            .OrderBy(extent => extent.LogicalClusterNumber)
+            .ToList();
+
+        for (var index = 1; index < physicalExtents.Count; index++)
+        {
+            var previous = physicalExtents[index - 1];
+            var current = physicalExtents[index];
+            var previousEnd = checked(previous.LogicalClusterNumber + previous.ClusterCount);
+
+            if (previousEnd > current.LogicalClusterNumber)
+            {
+                throw new InvalidOperationException(
+                    "The retained NTFS runlist maps overlapping physical clusters. Fragment reconstruction was refused.");
+            }
+        }
+
+        // Reading arbitrary clusters that have been reallocated can produce plausible but
+        // unrelated text. Only reconstruct when every mapped cluster remains free according
+        // to the current NTFS volume bitmap.
+        var allocations = new NtfsVolumeBitmapReader().CheckExtents(
+            volumeHandle,
+            mappedExtents,
+            cancellationToken);
+
+        if (allocations.Count != mappedExtents.Count ||
+            allocations.Where((allocation, index) =>
+                    allocation.LogicalClusterNumber != mappedExtents[index].LogicalClusterNumber ||
+                    allocation.ClusterCount != mappedExtents[index].ClusterCount ||
+                    allocation.FreeClusterCount != allocation.ClusterCount ||
+                    allocation.AllocatedClusterCount != 0 ||
+                    allocation.Allocation == NtfsClusterAllocation.Unknown)
+                .Any())
+        {
+            var freeClusters = allocations.Sum(allocation => allocation.FreeClusterCount);
+            var allocatedClusters = allocations.Sum(allocation => allocation.AllocatedClusterCount);
+            throw new InvalidOperationException(
+                "The retained NTFS extent map exists, but not all original clusters are currently free " +
+                $"(free={freeClusters:N0}, allocated={allocatedClusters:N0}, " +
+                $"required={requiredClusters:N0}). To avoid reconstructing from potentially overwritten data, " +
+                "the mapped recovery was stopped without repeating the whole-volume scan.");
+        }
+
+        var prefixLength = checked((int)Math.Min(
+            (long)(MaxMarkerBytes + 3),
+            expectedLength));
+        var prefix = new byte[prefixLength];
+        ReadMappedBytesAt(
+            volumeHandle,
+            mappedExtents,
+            bytesPerCluster,
+            0,
+            prefix,
+            cancellationToken);
+
+        var markerEncoding = FindMarkerEncodingAtStart(prefix, markerVariants);
+        if (markerEncoding is null)
+        {
+            throw new InvalidOperationException(
+                "The retained NTFS runlist points to currently-free clusters, but the supplied marker does not " +
+                "appear at byte zero (or immediately after a supported text BOM). The mapping was not used, " +
+                "and the whole-volume scan was skipped to avoid another lengthy scan.");
+        }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS retained-runlist large text recovery started: path={candidate.FullPath}, " +
+            $"expectedBytes={expectedLength:N0}, requiredClusters={requiredClusters:N0}, " +
+            $"mappedExtents={mappedExtents.Count:N0}, currentlyFree=true, markerEncoding={markerEncoding}, " +
+            "markerAtStart=true.");
+
+        progress?.Report(0);
+
+        if (!TryStreamValidatedMappedTextToDestination(
+                candidate,
+                destinationDirectory,
+                volumeHandle,
+                mappedExtents,
+                bytesPerCluster,
+                expectedLength,
+                markerEncoding,
+                cancellationToken,
+                out var destinationPath))
+        {
+            throw new InvalidOperationException(
+                "The retained NTFS runlist contained the start marker, but the complete reconstructed file " +
+                "did not pass strict text validation. The incomplete output was removed; the whole-volume " +
+                "scan was skipped.");
+        }
+
+        progress?.Report(expectedLength);
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS retained-runlist large text recovery succeeded: path={candidate.FullPath}, " +
+            $"bytes={expectedLength:N0}, mappedExtents={mappedExtents.Count:N0}, " +
+            $"destination={destinationPath}; original content hash not independently known.");
+
+        return new RecoveryResult
+        {
+            Success = true,
+            SourcePath = candidate.FullPath,
+            DestinationPath = destinationPath,
+            BytesRecovered = expectedLength,
+            Evidence =
+                $"Reconstructed exactly {expectedLength:N0} bytes from {mappedExtents.Count:N0} retained deletion-time " +
+                "NTFS data extents in original virtual-cluster order. All mapped clusters were currently free, " +
+                "the supplied marker matched at logical byte zero, and the complete output passed strict text " +
+                "validation. Verify the recovered SHA-256 against a known original hash where available; this " +
+                "does not independently prove that every free cluster retained its original contents."
+        };
+    }
+
+    private static string? FindMarkerEncodingAtStart(
+        byte[] prefix,
+        (string Encoding, byte[] Bytes)[] markerVariants)
+    {
+        foreach (var variant in markerVariants)
+        {
+            if (prefix.AsSpan().StartsWith(variant.Bytes))
+            {
+                return variant.Encoding;
+            }
+
+            byte[] bom = variant.Encoding switch
+            {
+                "UTF-8" => [0xEF, 0xBB, 0xBF],
+                "UTF-16LE" => [0xFF, 0xFE],
+                "UTF-16BE" => [0xFE, 0xFF],
+                _ => []
+            };
+
+            if (bom.Length > 0 &&
+                prefix.Length >= bom.Length + variant.Bytes.Length &&
+                prefix.AsSpan(0, bom.Length).SequenceEqual(bom) &&
+                prefix.AsSpan(bom.Length).StartsWith(variant.Bytes))
+            {
+                return variant.Encoding;
+            }
+        }
+
+        return null;
+    }
+
+    private static void ReadMappedBytesAt(
+        SafeFileHandle volumeHandle,
+        IReadOnlyList<NtfsDataExtent> extents,
+        long bytesPerCluster,
+        long logicalOffset,
+        byte[] destination,
+        CancellationToken cancellationToken)
+    {
+        if (logicalOffset < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(logicalOffset));
+        }
+
+        var copied = 0;
+        var currentLogicalOffset = logicalOffset;
+
+        foreach (var extent in extents)
+        {
+            var extentVirtualStart = checked(extent.VirtualClusterNumber * bytesPerCluster);
+            var extentLength = checked(extent.ClusterCount * bytesPerCluster);
+            var extentVirtualEnd = checked(extentVirtualStart + extentLength);
+
+            if (currentLogicalOffset >= extentVirtualEnd)
+            {
+                continue;
+            }
+
+            if (currentLogicalOffset < extentVirtualStart)
+            {
+                throw new InvalidOperationException(
+                    "The retained NTFS runlist contains a gap while reading its logical file data.");
+            }
+
+            var offsetWithinExtent = checked(currentLogicalOffset - extentVirtualStart);
+            var count = checked((int)Math.Min(
+                (long)(destination.Length - copied),
+                extentLength - offsetWithinExtent));
+
+            if (count <= 0)
+            {
+                continue;
+            }
+
+            var chunk = new byte[count];
+            var physicalOffset = checked(
+                extent.LogicalClusterNumber * bytesPerCluster + offsetWithinExtent);
+
+            ReadAt(volumeHandle, physicalOffset, chunk, cancellationToken);
+            Buffer.BlockCopy(chunk, 0, destination, copied, count);
+            copied += count;
+            currentLogicalOffset = checked(currentLogicalOffset + count);
+
+            if (copied == destination.Length)
+            {
+                return;
+            }
+        }
+
+        throw new IOException(
+            $"The retained NTFS runlist supplied only {copied:N0} byte(s) for a {destination.Length:N0}-byte prefix read.");
+    }
+
+    private static bool TryStreamValidatedMappedTextToDestination(
+        RecoveryCandidate candidate,
+        string destinationDirectory,
+        SafeFileHandle volumeHandle,
+        IReadOnlyList<NtfsDataExtent> extents,
+        long bytesPerCluster,
+        long expectedLength,
+        string markerEncoding,
+        CancellationToken cancellationToken,
+        out string destinationPath)
+    {
+        destinationPath = string.Empty;
+
+        System.Text.Encoding strictEncoding = markerEncoding switch
+        {
+            "UTF-16LE" => new System.Text.UnicodeEncoding(false, false, true),
+            "UTF-16BE" => new System.Text.UnicodeEncoding(true, false, true),
+            _ => new System.Text.UTF8Encoding(false, true)
+        };
+
+        var decoder = strictEncoding.GetDecoder();
+        var byteBuffer = new byte[IoBufferSize];
+        var charBuffer = new char[IoBufferSize];
+
+        destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
+            destinationDirectory,
+            candidate.Name);
+
+        var completedSuccessfully = false;
+        var destinationCreated = false;
+
+        try
+        {
+            using var output = new FileStream(
+                destinationPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                IoBufferSize,
+                FileOptions.SequentialScan);
+            destinationCreated = true;
+
+            long consumed = 0;
+
+            foreach (var extent in extents)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var extentBytes = checked(extent.ClusterCount * bytesPerCluster);
+                var bytesInThisExtent = Math.Min(extentBytes, expectedLength - consumed);
+                long consumedInExtent = 0;
+
+                while (consumedInExtent < bytesInThisExtent)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var count = checked((int)Math.Min(
+                        (long)byteBuffer.Length,
+                        bytesInThisExtent - consumedInExtent));
+
+                    if (markerEncoding.StartsWith("UTF-16", StringComparison.Ordinal))
+                    {
+                        count -= count % 2;
+                    }
+
+                    if (count <= 0)
+                    {
+                        return false;
+                    }
+
+                    var chunkBytes = count == byteBuffer.Length
+                        ? byteBuffer
+                        : new byte[count];
+
+                    var physicalOffset = checked(
+                        extent.LogicalClusterNumber * bytesPerCluster + consumedInExtent);
+
+                    ReadAt(volumeHandle, physicalOffset, chunkBytes, cancellationToken);
+
+                    var flush = consumed + count == expectedLength;
+
+                    try
+                    {
+                        decoder.Convert(
+                            chunkBytes,
+                            0,
+                            count,
+                            charBuffer,
+                            0,
+                            charBuffer.Length,
+                            flush,
+                            out var bytesUsed,
+                            out var charsUsed,
+                            out var completed);
+
+                        if (bytesUsed != count || !completed)
+                        {
+                            return false;
+                        }
+
+                        for (var index = 0; index < charsUsed; index++)
+                        {
+                            var character = charBuffer[index];
+                            if (character is not ('\t' or '\r' or '\n') &&
+                                (char.IsControl(character) || character == '\uFFFD'))
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                    catch (System.Text.DecoderFallbackException)
+                    {
+                        return false;
+                    }
+
+                    output.Write(chunkBytes, 0, count);
+                    consumed = checked(consumed + count);
+                    consumedInExtent = checked(consumedInExtent + count);
+                }
+
+                if (consumed >= expectedLength)
+                {
+                    break;
+                }
+
+                if (consumedInExtent != bytesInThisExtent)
+                {
+                    return false;
+                }
+            }
+
+            if (consumed != expectedLength)
+            {
+                return false;
+            }
+
+            output.Flush();
+            completedSuccessfully = true;
+        }
+        finally
+        {
+            if (!completedSuccessfully && destinationCreated)
+            {
+                TryDelete(destinationPath);
+            }
+        }
+
+        return completedSuccessfully;
     }
 
     private static bool TryStreamValidatedTextToDestination(
