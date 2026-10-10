@@ -76,6 +76,8 @@ public partial class Form1 : Form
         lstDirectories.ForeColor = foreground;
         lstDirectories.BorderStyle = BorderStyle.FixedSingle;
         lstDirectories.DrawMode = DrawMode.OwnerDrawFixed;
+        // Fill each owner-drawn row completely so breadcrumb chips meet vertically.
+        lstDirectories.ItemHeight = 34;
 
         txtScanPath.BackColor = panel;
         txtScanPath.ForeColor = foreground;
@@ -633,12 +635,11 @@ public partial class Form1 : Form
             }
 
             var segments = BuildDirectoryPathSegments(itemText);
-            const int breadcrumbGap = 8;
             const int slant = 7;
             const int horizontalPadding = 8;
             var x = e.Bounds.Left + horizontalPadding;
-            var buttonY = e.Bounds.Top + 4;
-            var buttonHeight = Math.Max(18, e.Bounds.Height - 8);
+            var buttonY = e.Bounds.Top;
+            var buttonHeight = e.Bounds.Height;
             var font = e.Font ?? lstDirectories.Font;
 
             for (var i = 0; i < segments.Count; i++)
@@ -671,16 +672,25 @@ public partial class Form1 : Form
                     ? Color.FromArgb(245, 253, 255)
                     : Color.FromArgb(190, 209, 228);
 
-                var slantOffset = Math.Min(slant, visibleWidth / 3);
-                var chipPoints = new[]
-                {
-                    // Both side edges are parallel. The right edge slopes
-                    // from the upper-right down toward the lower-left.
-                    new Point(x + slantOffset, buttonY),
-                    new Point(x + visibleWidth, buttonY),
-                    new Point(x + visibleWidth - slantOffset, buttonY + buttonHeight),
-                    new Point(x, buttonY + buttonHeight)
-                };
+                // Every full-width chip uses the same seven-pixel slant. The next
+                // chip starts seven pixels earlier so its left edge exactly overlays
+                // this chip's right edge. The root chip alone has a vertical left edge.
+                var slantOffset = slant;
+                var chipPoints = i == 0
+                    ? new[]
+                    {
+                        new Point(x, buttonY),
+                        new Point(x + visibleWidth, buttonY),
+                        new Point(x + visibleWidth - slantOffset, buttonY + buttonHeight),
+                        new Point(x, buttonY + buttonHeight)
+                    }
+                    : new[]
+                    {
+                        new Point(x + slantOffset, buttonY),
+                        new Point(x + visibleWidth, buttonY),
+                        new Point(x + visibleWidth - slantOffset, buttonY + buttonHeight),
+                        new Point(x, buttonY + buttonHeight)
+                    };
 
                 using (var chipBrush = new SolidBrush(chipFill))
                 using (var chipPen = new Pen(chipBorder, 1f))
@@ -711,11 +721,7 @@ public partial class Form1 : Form
                     break;
                 }
 
-                x += desiredWidth;
-                if (!isLast)
-                {
-                    x += breadcrumbGap;
-                }
+                x += desiredWidth - slant;
             }
 
             if ((e.State & DrawItemState.Focus) != 0)
@@ -749,7 +755,7 @@ public partial class Form1 : Form
             return;
         }
 
-        var segment = FindDirectorySegmentAtX(itemText, e.X);
+        var segment = FindDirectorySegmentAt(itemText, index, e.Location);
         if (segment is null)
         {
             return;
@@ -777,26 +783,64 @@ public partial class Form1 : Form
         menu.Show(lstDirectories, e.Location);
     }
 
-    private DirectoryPathSegment? FindDirectorySegmentAtX(string path, int mouseX)
+    private DirectoryPathSegment? FindDirectorySegmentAt(
+        string path,
+        int itemIndex,
+        Point location)
     {
-        const int breadcrumbGap = 8;
-        var x = lstDirectories.ClientRectangle.Left + 8;
+        const int slant = 7;
+        const int horizontalPadding = 8;
+
+        var itemBounds = lstDirectories.GetItemRectangle(itemIndex);
+        var buttonHeight = Math.Max(1, itemBounds.Height);
+        var verticalPosition = Math.Clamp(
+            (double)(location.Y - itemBounds.Top) / buttonHeight,
+            0d,
+            1d);
+
+        var x = itemBounds.Left + horizontalPadding;
         var segments = BuildDirectoryPathSegments(path);
 
         for (var i = 0; i < segments.Count; i++)
         {
             var segment = segments[i];
-            var width = GetDirectorySegmentButtonWidth(segment.Label, lstDirectories.Font);
-            if (mouseX >= x && mouseX < x + width)
+            var desiredWidth = GetDirectorySegmentButtonWidth(
+                segment.Label,
+                lstDirectories.Font);
+
+            if (x >= itemBounds.Right - 4)
+            {
+                break;
+            }
+
+            var visibleWidth = Math.Min(
+                desiredWidth,
+                itemBounds.Right - x - 4);
+
+            if (visibleWidth < 18)
+            {
+                break;
+            }
+
+            // Hit-test the same slanted polygon that is drawn for each segment,
+            // rather than a rectangle that includes the old gaps and overlap area.
+            var slantOffset = slant;
+            var leftEdge = i == 0
+                ? x
+                : x + slantOffset * (1d - verticalPosition);
+            var rightEdge = x + visibleWidth - slantOffset * verticalPosition;
+
+            if (location.X >= leftEdge && location.X <= rightEdge)
             {
                 return segment;
             }
 
-            x += width;
-            if (i < segments.Count - 1)
+            if (visibleWidth < desiredWidth)
             {
-                x += breadcrumbGap;
+                break;
             }
+
+            x += desiredWidth - slant;
         }
 
         return null;
