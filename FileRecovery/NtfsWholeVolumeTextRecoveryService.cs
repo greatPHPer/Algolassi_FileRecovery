@@ -758,10 +758,15 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 "the mapped recovery was stopped without repeating the whole-volume scan.");
         }
 
-        var prefixLength = checked((int)Math.Min(
+        // Raw NTFS volume reads may require sector/cluster-aligned byte counts.
+        // Read a whole number of clusters for the marker preflight, but inspect only
+        // the small prefix that belongs to the logical file.
+        var desiredPrefixLength = checked((long)Math.Min(
             (long)(MaxMarkerBytes + 3),
             expectedLength));
-        var prefix = new byte[prefixLength];
+        var alignedPrefixLength = checked(
+            ((desiredPrefixLength + bytesPerCluster - 1) / bytesPerCluster) * bytesPerCluster);
+        var prefix = new byte[checked((int)alignedPrefixLength)];
         ReadMappedBytesAt(
             volumeHandle,
             mappedExtents,
@@ -923,7 +928,21 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 continue;
             }
 
-            var chunk = new byte[count];
+            // destination can end mid-cluster (for example, the 4,099-byte marker
+            // prefix). Read the covering whole-cluster range and copy only the requested
+            // logical bytes into the destination buffer.
+            var clustersToRead = checked(
+                ((long)count + bytesPerCluster - 1) / bytesPerCluster);
+            var alignedReadLength = checked(clustersToRead * bytesPerCluster);
+            var bytesAvailableInExtent = extentLength - offsetWithinExtent;
+
+            if (alignedReadLength > bytesAvailableInExtent)
+            {
+                throw new InvalidOperationException(
+                    "The retained NTFS runlist cannot provide a cluster-aligned read within its current extent.");
+            }
+
+            var chunk = new byte[checked((int)alignedReadLength)];
             var physicalOffset = checked(
                 extent.LogicalClusterNumber * bytesPerCluster + offsetWithinExtent);
 
@@ -1014,9 +1033,23 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                         return false;
                     }
 
-                    var chunkBytes = count == byteBuffer.Length
+                    // Keep raw-volume I/O sector/cluster aligned even when the logical
+                    // file ends part-way through its final cluster. The decoder and output
+                    // consume only 'count' bytes, never the padded tail.
+                    var clustersToRead = checked(
+                        ((long)count + bytesPerCluster - 1) / bytesPerCluster);
+                    var alignedReadLength = checked(clustersToRead * bytesPerCluster);
+                    var bytesAvailableInExtent = extentBytes - consumedInExtent;
+
+                    if (alignedReadLength > bytesAvailableInExtent)
+                    {
+                        return false;
+                    }
+
+                    var alignedReadCount = checked((int)alignedReadLength);
+                    var chunkBytes = alignedReadCount == byteBuffer.Length
                         ? byteBuffer
-                        : new byte[count];
+                        : new byte[alignedReadCount];
 
                     var physicalOffset = checked(
                         extent.LogicalClusterNumber * bytesPerCluster + consumedInExtent);
