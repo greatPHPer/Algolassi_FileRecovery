@@ -639,6 +639,7 @@ public partial class Form1 : Form
             var x = e.Bounds.Left + horizontalPadding;
             var buttonY = e.Bounds.Top + 4;
             var buttonHeight = Math.Max(18, e.Bounds.Height - 8);
+            var font = e.Font ?? lstDirectories.Font;
 
             for (var i = 0; i < segments.Count; i++)
             {
@@ -648,7 +649,7 @@ public partial class Form1 : Form
                     break;
                 }
 
-                var desiredWidth = GetDirectorySegmentButtonWidth(segment.Label, e.Font);
+                var desiredWidth = GetDirectorySegmentButtonWidth(segment.Label, font);
                 var visibleWidth = Math.Min(desiredWidth, e.Bounds.Right - x - 4);
                 if (visibleWidth < 18)
                 {
@@ -696,7 +697,7 @@ public partial class Form1 : Form
                 TextRenderer.DrawText(
                     e.Graphics,
                     segment.Label,
-                    e.Font,
+                    font,
                     textBounds,
                     chipText,
                     TextFormatFlags.HorizontalCenter |

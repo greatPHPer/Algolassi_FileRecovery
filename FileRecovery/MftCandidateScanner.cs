@@ -569,7 +569,8 @@ public sealed class MftCandidateScanner
                                 $"targetDirectory={normalizedTargetDirectory}.");
                         }
 
-                        if (IsDirectoryMatch(
+                        if (currentDirectoryPath is not null &&
+                            IsDirectoryMatch(
                                 currentDirectoryPath,
                                 normalizedTargetDirectory,
                                 includeSubdirectories))
