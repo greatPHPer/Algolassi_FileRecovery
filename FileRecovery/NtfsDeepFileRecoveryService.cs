@@ -347,13 +347,25 @@ public sealed class NtfsDeepFileRecoveryService
             knownFileSizeBytes > 0 &&
             knownFileSizeBytes <= MaxMp4ArchiveBytes)
         {
-            var volumeLengthBytes = checked(
+            var ntfsReportedVolumeLengthBytes = checked(
                 volumeInfo.NumberSectors * (long)volumeInfo.BytesPerSector);
+            var driveTotalBytes = new DriveInfo(sourceRoot).TotalSize;
+
+            // FSCTL_GET_NTFS_VOLUME_DATA can report a sector range that is slightly
+            // larger than DriveInfo's usable volume size on some devices. Never try
+            // to read beyond the size Windows exposes for the mounted volume.
+            var volumeLengthBytes = Math.Min(
+                ntfsReportedVolumeLengthBytes,
+                driveTotalBytes);
+            volumeLengthBytes -= volumeLengthBytes % volumeInfo.BytesPerSector;
+
             byte[] previousVolumeChunk = [];
 
             System.Diagnostics.Trace.WriteLine(
                 $"Deep NTFS MP4 raw-volume fallback started: candidate={candidate.FullPath}, " +
-                $"knownSize={knownFileSizeBytes:N0}, volumeBytes={volumeLengthBytes:N0}. " +
+                $"knownSize={knownFileSizeBytes:N0}, usableVolumeBytes={volumeLengthBytes:N0}, " +
+                $"ntfsReportedBytes={ntfsReportedVolumeLengthBytes:N0}, " +
+                $"driveTotalBytes={driveTotalBytes:N0}. " +
                 "This read-only pass includes allocated clusters.");
 
             while (fullVolumeScannedBytes < volumeLengthBytes)
