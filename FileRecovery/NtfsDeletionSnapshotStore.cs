@@ -112,6 +112,18 @@ public sealed class NtfsDeletionSnapshotStore
 
         var fileName = $"{recordId:N}.bin";
         var destination = Path.Combine(_folder, fileName);
+        if (File.Exists(destination))
+        {
+            // A published snapshot is immutable forensic evidence. Do not stream a
+            // second candidate over it just because another notification/retry uses
+            // the same record ID. This also avoids spending another file-sized I/O
+            // pass when a duplicate caller arrives after the first save completed.
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS snapshot streaming refused to overwrite an existing snapshot: " +
+                $"recordId={recordId:N}, destination={destination}.");
+            return false;
+        }
+
         var temporary = Path.Combine(
             _folder,
             $".{fileName}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
@@ -141,7 +153,9 @@ public sealed class NtfsDeletionSnapshotStore
             }
 
             sha256 = Convert.ToHexString(hashBytes);
-            File.Move(temporary, destination, overwrite: true);
+            // The early existence check avoids unnecessary duplicate captures; the
+            // non-overwriting move closes the race when two callers start together.
+            File.Move(temporary, destination, overwrite: false);
             dataFileName = fileName;
             return true;
         }
