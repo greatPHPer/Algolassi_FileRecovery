@@ -758,6 +758,14 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 "the mapped recovery was stopped without repeating the whole-volume scan.");
         }
 
+        ProbeRetainedExtentSamples(
+            candidate,
+            volumeHandle,
+            mappedExtents,
+            bytesPerCluster,
+            markerVariants,
+            cancellationToken);
+
         // Raw NTFS volume reads may require sector/cluster-aligned byte counts.
         // Read a whole number of clusters for the marker preflight, but inspect only
         // the small prefix that belongs to the logical file.
@@ -884,6 +892,93 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 "validation. Verify the recovered SHA-256 against a known original hash where available; this " +
                 "does not independently prove that every free cluster retained its original contents."
         };
+    }
+
+    private static void ProbeRetainedExtentSamples(
+        RecoveryCandidate candidate,
+        SafeFileHandle volumeHandle,
+        IReadOnlyList<NtfsDataExtent> extents,
+        long bytesPerCluster,
+        (string Encoding, byte[] Bytes)[] markerVariants,
+        CancellationToken cancellationToken)
+    {
+        long sampledBytes = 0;
+        var sampledExtentCount = 0;
+        var allSamplesZero = true;
+        var extentsWithMarker = 0;
+        var totalMarkerHits = 0;
+
+        foreach (var extent in extents)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (extent.ClusterCount <= 0 || extent.IsSparse || extent.LogicalClusterNumber < 0)
+            {
+                continue;
+            }
+
+            // One cluster per extent keeps this probe small (typically a few hundred KB
+            // for a 47-run file) while checking whether recognizable data survived beyond
+            // an all-zero first run.
+            var sampleLength = checked((int)Math.Min(
+                bytesPerCluster,
+                checked(extent.ClusterCount * bytesPerCluster)));
+            if (sampleLength <= 0 || sampleLength % bytesPerCluster != 0)
+            {
+                continue;
+            }
+
+            var sample = new byte[sampleLength];
+            var physicalOffset = checked(extent.LogicalClusterNumber * bytesPerCluster);
+            ReadAt(volumeHandle, physicalOffset, sample, cancellationToken);
+
+            var nonZero = sample.Any(value => value != 0);
+            if (nonZero)
+            {
+                allSamplesZero = false;
+            }
+
+            var markerHitsForExtent = 0;
+            foreach (var variant in markerVariants)
+            {
+                var remaining = sample.AsSpan();
+                while (!remaining.IsEmpty)
+                {
+                    var relative = remaining.IndexOf(variant.Bytes);
+                    if (relative < 0)
+                    {
+                        break;
+                    }
+
+                    markerHitsForExtent++;
+                    remaining = remaining[(relative + 1)..];
+                }
+            }
+
+            if (markerHitsForExtent > 0)
+            {
+                extentsWithMarker++;
+                totalMarkerHits += markerHitsForExtent;
+            }
+
+            var previewLength = Math.Min(16, sample.Length);
+            var previewHex = Convert.ToHexString(sample.AsSpan(0, previewLength));
+
+            System.Diagnostics.Trace.WriteLine(
+                $"NTFS retained-runlist extent sample: path={candidate.FullPath}, " +
+                $"vcn={extent.VirtualClusterNumber:N0}, lcn={extent.LogicalClusterNumber:N0}, " +
+                $"clusters={extent.ClusterCount:N0}, sampleBytes={sample.Length:N0}, " +
+                $"allZero={!nonZero}, markerHits={markerHitsForExtent:N0}, firstBytesHex={previewHex}.");
+
+            sampledBytes = checked(sampledBytes + sample.Length);
+            sampledExtentCount++;
+        }
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS retained-runlist extent sampling complete: path={candidate.FullPath}, " +
+            $"sampledExtents={sampledExtentCount:N0}, sampledBytes={sampledBytes:N0}, " +
+            $"allSamplesZero={allSamplesZero}, extentsWithMarker={extentsWithMarker:N0}, " +
+            $"markerHits={totalMarkerHits:N0}.");
     }
 
     private static string? FindMarkerEncodingAtStart(
