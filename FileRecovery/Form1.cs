@@ -3900,7 +3900,7 @@ public partial class Form1 : Form
 
                         try
                         {
-                            var carved = await Task.Run(
+                            var mp4CarvedOutput = await Task.Run(
                                 () => _ntfsDeepFileRecoveryService.Recover(
                                     carvingCandidate,
                                     destinationDirectory,
@@ -3910,7 +3910,7 @@ public partial class Form1 : Form
                                     candidate.FileSizeBytes),
                                 CancellationToken.None).ConfigureAwait(true);
 
-                            successes.Add(carved);
+                            successes.Add(mp4CarvedOutput);
                             continue;
                         }
                         catch (Exception carveError)
