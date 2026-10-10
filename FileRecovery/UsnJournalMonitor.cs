@@ -51,10 +51,12 @@ public sealed class UsnJournalMonitor : IDisposable
     // same NTFS deletion under different DeletionRecord IDs. Serialize by volume +
     // exact NTFS file reference and reuse a completed snapshot rather than rereading
     // freed clusters while Windows may already be reallocating them.
-    private readonly ConcurrentDictionary<string, object> _snapshotCaptureGates =
-        new(StringComparer.OrdinalIgnoreCase);
+    private const int CompletedSnapshotCacheLimit = 256;
+    private readonly object[] _snapshotCaptureGates =
+        Enumerable.Range(0, 64).Select(static _ => new object()).ToArray();
     private readonly ConcurrentDictionary<string, NtfsDeletionDataSnapshot> _completedSnapshotCache =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<string> _completedSnapshotCacheOrder = new();
 
     private const int RecentDeletedRecordLimit = 512;
     // On startup, inspect only a small tail of retained USN history. This can
@@ -948,7 +950,10 @@ public sealed class UsnJournalMonitor : IDisposable
         int maxBoundedDeleteSequenceAdvance = 8)
     {
         var captureKey = $"{volumeKey}|{fileReferenceNumber:X16}";
-        var gate = _snapshotCaptureGates.GetOrAdd(captureKey, static _ => new object());
+        var gateIndex =
+            (StringComparer.OrdinalIgnoreCase.GetHashCode(captureKey) & int.MaxValue) %
+            _snapshotCaptureGates.Length;
+        var gate = _snapshotCaptureGates[gateIndex];
 
         lock (gate)
         {
@@ -978,6 +983,13 @@ public sealed class UsnJournalMonitor : IDisposable
             if (deletion.NtfsDataSnapshot?.IsComplete == true)
             {
                 _completedSnapshotCache[captureKey] = deletion.NtfsDataSnapshot.Clone();
+                _completedSnapshotCacheOrder.Enqueue(captureKey);
+
+                while (_completedSnapshotCache.Count > CompletedSnapshotCacheLimit &&
+                       _completedSnapshotCacheOrder.TryDequeue(out var expiredKey))
+                {
+                    _completedSnapshotCache.TryRemove(expiredKey, out _);
+                }
             }
         }
     }
