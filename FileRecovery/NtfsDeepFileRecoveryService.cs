@@ -200,6 +200,7 @@ public sealed class NtfsDeepFileRecoveryService
                         physicalOffset,
                         extentOffset,
                         extentBytes,
+                        checked(volumeInfo.NumberSectors * (long)volumeInfo.BytesPerSector),
                         volumeInfo.BytesPerCluster,
                         knownFileSizeBytes,
                         volumeHandle,
@@ -624,6 +625,7 @@ public sealed class NtfsDeepFileRecoveryService
         long currentChunkPhysicalOffset,
         long freeExtentStart,
         long freeExtentLength,
+        long volumeLengthBytes,
         long bytesPerCluster,
         long knownFileSizeBytes,
         SafeFileHandle volumeHandle,
@@ -655,14 +657,21 @@ public sealed class NtfsDeepFileRecoveryService
             }
 
             var availableInExtent = freeExtentEnd - absoluteStart;
-            var maximumArchiveLength = Math.Min(
-                availableInExtent,
-                MaxMp4ArchiveBytes);
+            var availableInVolume = volumeLengthBytes - absoluteStart;
+
+            // If the original NTFS file size is known, allow the structural parser
+            // to inspect the exact physical span even when the current allocation
+            // bitmap splits that span into multiple extents. The signature itself
+            // must still begin inside a currently-free extent. Without a trusted
+            // original length, stay strictly within the free extent.
+            var maximumArchiveLength = knownFileSizeBytes > 0
+                ? Math.Min(availableInVolume, MaxMp4ArchiveBytes)
+                : Math.Min(availableInExtent, MaxMp4ArchiveBytes);
 
             if (knownFileSizeBytes > 0)
             {
                 if (knownFileSizeBytes > MaxMp4ArchiveBytes ||
-                    knownFileSizeBytes > availableInExtent)
+                    knownFileSizeBytes > availableInVolume)
                 {
                     continue;
                 }
@@ -744,15 +753,27 @@ public sealed class NtfsDeepFileRecoveryService
                 ],
                 cancellationToken);
 
-            if (allocation.Count != 1 ||
-                allocation[0].AllocatedClusterCount != 0 ||
-                allocation[0].FreeClusterCount != clusterCount)
+            var spanIsFullyFree =
+                allocation.Count == 1 &&
+                allocation[0].AllocatedClusterCount == 0 &&
+                allocation[0].FreeClusterCount == clusterCount;
+
+            if (!spanIsFullyFree && knownFileSizeBytes <= 0)
             {
                 System.Diagnostics.Trace.WriteLine(
-                    $"MP4 recovery rejected because its full span is no longer free: " +
-                    $"path={candidate.FullPath}, offset={absoluteStart:N0}, " +
-                    $"bytes={parsedArchiveLength:N0}.");
+                    $"MP4 recovery rejected because its full span is no longer free and " +
+                    $"the original length is unknown: path={candidate.FullPath}, " +
+                    $"offset={absoluteStart:N0}, bytes={parsedArchiveLength:N0}.");
                 continue;
+            }
+
+            if (!spanIsFullyFree)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"MP4 best-effort candidate crosses clusters marked allocated: " +
+                    $"path={candidate.FullPath}, offset={absoluteStart:N0}, " +
+                    $"bytes={parsedArchiveLength:N0}. Exact original length and box structure " +
+                    "validated, but parts of the media payload may have been overwritten.");
             }
 
             System.Diagnostics.Debug.WriteLine(
@@ -816,9 +837,13 @@ public sealed class NtfsDeepFileRecoveryService
                 BytesRecovered = parsedArchiveLength,
                 Evidence =
                     $"Deep NTFS carving recovered a {parsedArchiveLength:N0}-byte MP4/QuickTime " +
-                    "container from a single currently-free contiguous cluster extent. The " +
-                    "top-level ftyp/moov/mdat boxes and track structure were validated, but " +
-                    "the video was not decoded and its audio/video frames were not independently " +
+                    "container with the top-level ftyp/moov/mdat boxes and track structure validated. " +
+                    (spanIsFullyFree
+                        ? "The full container came from currently-free contiguous clusters. "
+                        : "The signature began in free space, but the container spans clusters " +
+                          "currently marked allocated; some video/audio payload bytes may have " +
+                          "been overwritten or corrupted. ") +
+                    "The video was not decoded and its audio/video frames were not independently " +
                     "verified. Open and play the recovered file, and compare SHA-256 when the " +
                     "original hash is available."
             };
