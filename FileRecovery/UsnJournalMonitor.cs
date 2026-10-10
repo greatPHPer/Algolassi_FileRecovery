@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using Microsoft.Win32.SafeHandles;
 
 namespace FileRecovery;
@@ -10,6 +11,8 @@ public sealed class UsnJournalMonitor : IDisposable
 {
     private const uint FsctlQueryUsnJournal = 0x000900F4;
     private const uint FsctlReadUsnJournal = 0x000900BB;
+    private const uint FsctlEnumUsnData = 0x000900B3;
+    private const uint FsctlCreateUsnJournal = 0x000900E7;
 
     private const uint GenericRead = 0x80000000;
     private const uint FileShareRead = 0x00000001;
@@ -18,9 +21,15 @@ public sealed class UsnJournalMonitor : IDisposable
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileReadAttributes = 0x00000080;
-    private const int ErrorJournalEntryDeleted = 1177;
+    private const int ErrorJournalDeleteInProgress = 1178;
+    private const int ErrorJournalNotActive = 1179;
+    private const int ErrorJournalEntryDeleted = 1181;
+    private const int ErrorFileNotFound = 2;
+    private const int ErrorHandleEof = 38;
 
     private const uint UsnReasonFileDelete = 0x00000200;
+    private const uint UsnReasonRenameOldName = 0x00001000;
+    private const uint FileAttributeDirectory = 0x00000010;
     private const int UsnRecordV2MinimumLength = 60;
 
     private readonly RecoverySettings _settings;
@@ -28,9 +37,41 @@ public sealed class UsnJournalMonitor : IDisposable
     private readonly object _gate = new();
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<ulong, string>> _parentPathCaches =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTime> _accessDeniedUntilUtc =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTime> _excludedVolumeLastCursorSaveUtc =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ulong> _excludedVolumeLoggedJournalIds =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<RecentDeletedRecord> _recentDeletedRecords = new();
+    private const long DeleteSnapshotMaxBytes = 16L * 1024L * 1024L;
+    private const long MaxStreamingDeleteSnapshotBytes = 2L * 1024 * 1024 * 1024;
+    private readonly NtfsDeletionSnapshotStore _snapshotStore = new();
+    // Only one live $LogFile fallback is allowed at a time. A burst of browser/editor
+    // deletions must not start multiple 640 MB journal parses concurrently.
+    private readonly SemaphoreSlim _historicalLogFileSnapshotGate = new(1, 1);
+
+    // Multiple live sources (USN, FileSystemWatcher and UI retries) can report the
+    // same NTFS deletion under different DeletionRecord IDs. Serialize by volume +
+    // exact NTFS file reference and reuse a completed snapshot rather than rereading
+    // freed clusters while Windows may already be reallocating them.
+    private const int CompletedSnapshotCacheLimit = 256;
+    private readonly object[] _snapshotCaptureGates =
+        Enumerable.Range(0, 64).Select(static _ => new object()).ToArray();
+    private readonly ConcurrentDictionary<string, NtfsDeletionDataSnapshot> _completedSnapshotCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<string> _completedSnapshotCacheOrder = new();
+
+    private const int RecentDeletedRecordLimit = 512;
+    // On startup, inspect only a small tail of retained USN history. This can
+    // capture recent pre-start deletions whose exact MFT generation still exists,
+    // while avoiding replay of an unbounded offline backlog on the live worker.
+    private const long MaxStartupCatchUpUsnBytes = 4L * 1024L * 1024L;
+    private const int RecentPreStartSnapshotMinutes = 5;
 
     private Task? _worker;
     private bool _started;
+    private DateTime _monitorStartedAtUtc;
 
     public event EventHandler<DeletionDetectedEventArgs>? DeletionDetected;
     public event EventHandler<string>? StatusChanged;
@@ -49,9 +90,434 @@ public sealed class UsnJournalMonitor : IDisposable
                 return;
             }
 
+            if (!IsAdministrator())
+            {
+                StatusChanged?.Invoke(
+                    this,
+                    "USN monitoring is disabled because administrator privileges are required. Run AlgoLassi File Recovery as Administrator to enable it.");
+                return;
+            }
+
+            try
+            {
+                WindowsPrivilege.EnableSeBackupPrivilege();
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke(
+                    this,
+                    $"USN monitoring could not enable SeBackupPrivilege: {ex.Message}");
+                return;
+            }
+
+            // Arm every NTFS journal before the FileSystemWatcher starts producing
+            // deletion records. This closes the startup race where a file could be
+            // Shift+Deleted before the background USN worker had established its
+            // first cursor, leaving the history row without an NTFS reference.
+            ArmInitialCursors();
+
+            // Deletions after this point may use the bounded sequence-transition
+            // fallback. A small startup USN catch-up can also snapshot recent
+            // pre-start deletions, but that path requires the exact original MFT
+            // generation and never accepts a reused/advanced sequence.
+            _monitorStartedAtUtc = DateTime.UtcNow;
+
             _started = true;
             _worker = Task.Run(MonitorAllVolumesAsync);
         }
+    }
+
+    private void ArmInitialCursors()
+    {
+        foreach (var drive in GetNtfsFixedDrives())
+        {
+            if (_cts.IsCancellationRequested)
+            {
+                return;
+            }
+
+            var volumeKey = drive.RootDirectory.FullName.TrimEnd(Path.DirectorySeparatorChar);
+
+            try
+            {
+                using var volumeHandle = CreateFile(
+                    $@"\\.\{volumeKey[..2]}",
+                    GenericRead,
+                    FileShareRead | FileShareWrite | FileShareDelete,
+                    IntPtr.Zero,
+                    OpenExisting,
+                    FileFlagBackupSemantics,
+                    IntPtr.Zero);
+
+                if (volumeHandle.IsInvalid)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+
+                if (!TryQueryJournal(volumeHandle, out var journal, out var queryError))
+                {
+                    if (queryError == ErrorFileNotFound ||
+                        queryError == ErrorJournalNotActive)
+                    {
+                        if (!TryCreateJournal(volumeHandle, volumeKey, out journal))
+                        {
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        continue;
+                    }
+                }
+
+                var hadPreviousCursor =
+                    _settings.UsnCursors.TryGetValue(volumeKey, out var previousCursor);
+
+                var previousNextUsn = hadPreviousCursor
+                    ? previousCursor!.NextUsn
+                    : 0L;
+
+                var sameJournalHasBacklog =
+                    hadPreviousCursor &&
+                    previousCursor!.JournalId == journal.JournalId &&
+                    previousNextUsn > 0 &&
+                    previousNextUsn < journal.NextUsn;
+
+                var previousCursorIsRetained =
+                    sameJournalHasBacklog &&
+                    previousNextUsn >= journal.FirstUsn &&
+                    previousNextUsn >= journal.LowestValidUsn;
+
+                // Resume from the saved cursor only when Windows previously returned it
+                // and the retained backlog is within the bounded catch-up budget. Do not
+                // invent a StartUsn by subtracting bytes from NextUsn: that value is merely
+                // inside the reported range and is not guaranteed to be a valid read cursor.
+                // If the cursor is invalid or the backlog exceeds the budget, start at the
+                // journal's own NextUsn and explicitly skip older backlog.
+                var startupNextUsn = journal.NextUsn;
+                if (sameJournalHasBacklog &&
+                    previousCursorIsRetained &&
+                    journal.NextUsn - previousNextUsn <= MaxStartupCatchUpUsnBytes)
+                {
+                    startupNextUsn = previousNextUsn;
+                }
+
+                var startupCursor = new VolumeJournalCursor
+                {
+                    JournalId = journal.JournalId,
+                    NextUsn = startupNextUsn
+                };
+
+                _settings.UsnCursors[volumeKey] = startupCursor;
+                _settings.Save();
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"USN monitor startup cursor: volume={volumeKey}, " +
+                    $"previousJournalId={(hadPreviousCursor ? previousCursor!.JournalId.ToString() : "(none)")}, " +
+                    $"previousNextUsn={(hadPreviousCursor ? previousNextUsn.ToString() : "(none)")}, " +
+                    $"startupNextUsn={startupNextUsn}, journalNextUsn={journal.NextUsn}, " +
+                    $"catchUpUsnBytes={Math.Max(0, journal.NextUsn - startupNextUsn):N0}, " +
+                    $"catchUpLimitBytes={MaxStartupCatchUpUsnBytes:N0}, " +
+                    $"previousCursorRetained={previousCursorIsRetained}, " +
+                    $"skippedOlderBacklog={(sameJournalHasBacklog && startupNextUsn > previousNextUsn)}.");
+
+                StatusChanged?.Invoke(
+                    this,
+                    sameJournalHasBacklog && startupNextUsn < journal.NextUsn
+                        ? $"USN monitoring armed for {volumeKey}; checking a bounded recent deletion backlog before continuing live monitoring. Use Scan NTFS Deleted Files for older history."
+                        : $"USN journal armed for {volumeKey}. New deletions will be tracked.");
+            }
+            catch (UnauthorizedAccessException)
+            {
+                ReportAccessDenied(volumeKey);
+            }
+            catch (Win32Exception ex) when (ex.NativeErrorCode == 5)
+            {
+                ReportAccessDenied(volumeKey);
+            }
+            catch (Exception ex)
+            {
+                StatusChanged?.Invoke(
+                    this,
+                    $"USN monitoring warning for {volumeKey}: {ex.Message}");
+            }
+        }
+    }
+
+    public IReadOnlyList<UsnDeletedFileRecord> ScanDeletedDirectory(
+        string targetDirectory,
+        bool includeSubdirectories,
+        CancellationToken cancellationToken = default,
+        Action<UsnDeletedFileRecord>? onDeletedRecordFound = null)
+    {
+        WindowsPrivilege.EnableSeBackupPrivilege();
+
+        if (!IsAdministrator())
+        {
+            throw new UnauthorizedAccessException(
+                "Administrator privileges are required for a historical NTFS deleted-file scan.");
+        }
+
+        var fullDirectory = Path.GetFullPath(targetDirectory);
+        var root = Path.GetPathRoot(fullDirectory);
+
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            throw new ArgumentException(
+                "The selected directory must be on a Windows volume.",
+                nameof(targetDirectory));
+        }
+
+        if (!string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Historical deleted-file scanning currently supports NTFS volumes only.");
+        }
+
+        // Use the historical USN journal directly for directory discovery.
+        // FSCTL_ENUM_USN_DATA is failing on this volume, while READ_USN_JOURNAL
+        // can stream the retained delete records from FirstUsn to NextUsn.
+        // This also preserves deletions whose MFT record has already fallen
+        // outside the current MFT valid-data length.
+        return ScanDeletedDirectoryFromUsnJournal(
+            root,
+            fullDirectory,
+            includeSubdirectories,
+            cancellationToken,
+            onDeletedRecordFound);
+    }
+
+    private IReadOnlyList<UsnDeletedFileRecord> ScanDeletedDirectoryFromUsnJournal(
+        string root,
+        string targetDirectory,
+        bool includeSubdirectories,
+        CancellationToken cancellationToken,
+        Action<UsnDeletedFileRecord>? onDeletedRecordFound)
+    {
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+
+        using var volumeHandle = CreateFile(
+            $@"\\.\\{volumeKey[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (volumeHandle.IsInvalid)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        if (!TryQueryJournal(volumeHandle, out var journal, out var queryError))
+        {
+            throw new Win32Exception(
+                queryError,
+                $"Could not query the USN journal for {volumeKey}.");
+        }
+
+        var normalizedDirectory = NormalizePath(targetDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar);
+
+        var cache = _parentPathCaches.GetOrAdd(
+            volumeKey,
+            _ => new ConcurrentDictionary<ulong, string>());
+
+        // A path can have many historical delete events because NTFS reuses an
+        // MFT segment and assigns a new sequence number each time the file is
+        // recreated. Keep only the newest historical deletion for each resolved
+        // full path so stale generations do not become separate MFT recovery
+        // targets later in the scan.
+        var latestResultByPath =
+            new Dictionary<string, UsnDeletedFileRecord>(
+                StringComparer.OrdinalIgnoreCase);
+
+        var nextUsn = journal.FirstUsn;
+        var batchesRead = 0L;
+        var deleteRecordsSeen = 0L;
+        var parentResolutions = 0L;
+        var directoryMatches = 0L;
+        var duplicatePathCollapses = 0L;
+
+        System.Diagnostics.Trace.WriteLine(
+            $"USN historical directory scan started: volume={volumeKey}, " +
+            $"targetDirectory={normalizedDirectory}, " +
+            $"includeSubdirectories={includeSubdirectories}, " +
+            $"firstUsn={journal.FirstUsn}, nextUsn={journal.NextUsn}, " +
+            $"journalId={journal.JournalId}.");
+
+        while (nextUsn < journal.NextUsn)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var records = ReadRecords(
+                volumeHandle,
+                journal.JournalId,
+                nextUsn,
+                out var returnedNextUsn,
+                UsnReasonFileDelete);
+
+            batchesRead++;
+
+            if (returnedNextUsn <= nextUsn)
+            {
+                break;
+            }
+
+            foreach (var record in records)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                    (record.FileAttributes & FileAttributeDirectory) != 0 ||
+                    string.IsNullOrWhiteSpace(record.FileName))
+                {
+                    continue;
+                }
+
+                deleteRecordsSeen++;
+
+                var directory = cache.TryGetValue(
+                    record.ParentFileReferenceNumber,
+                    out var knownDirectory)
+                    ? knownDirectory
+                    : null;
+
+                if (string.IsNullOrWhiteSpace(directory))
+                {
+                    directory = ResolveParentDirectory(
+                        volumeHandle,
+                        record.ParentFileReferenceNumber);
+
+                    parentResolutions++;
+
+                    if (!string.IsNullOrWhiteSpace(directory))
+                    {
+                        cache[record.ParentFileReferenceNumber] = directory;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(directory) ||
+                    !MatchesDirectory(
+                        directory,
+                        normalizedDirectory,
+                        includeSubdirectories))
+                {
+                    continue;
+                }
+
+                directoryMatches++;
+
+                var fullPath = NormalizePath(
+                    Path.Combine(directory, record.FileName));
+
+                if (RecoveryMonitoringExclusions.IsExcludedPath(fullPath))
+                {
+                    continue;
+                }
+
+                var candidate = new UsnDeletedFileRecord(
+                    fullPath,
+                    record.FileReferenceNumber,
+                    record.ParentFileReferenceNumber,
+                    record.FileName,
+                    directory,
+                    record.TimestampUtc);
+
+                try
+                {
+                    onDeletedRecordFound?.Invoke(candidate);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS historical deletion callback failed: " +
+                        $"path={candidate.FullPath}: {ex.GetType().Name}: {ex.Message}");
+                }
+
+                if (latestResultByPath.TryGetValue(
+                        fullPath,
+                        out var existing))
+                {
+                    // The journal is chronological, but compare timestamps explicitly
+                    // so this remains correct even if records arrive out of order.
+                    if (candidate.DeletedAtUtc <= existing.DeletedAtUtc)
+                    {
+                        duplicatePathCollapses++;
+                        continue;
+                    }
+
+                    duplicatePathCollapses++;
+                }
+
+                latestResultByPath[fullPath] = candidate;
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"USN historical directory MATCH: " +
+                    $"path={fullPath}, fileRef={record.FileReferenceNumber}, " +
+                    $"parentRef={record.ParentFileReferenceNumber}, " +
+                    $"deleteTime={record.TimestampUtc:O}.");
+            }
+
+            nextUsn = returnedNextUsn;
+
+            if (batchesRead == 1 || batchesRead % 16 == 0)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"USN historical directory scan progress: batches={batchesRead:N0}, " +
+                    $"nextUsn={nextUsn}, journalNext={journal.NextUsn}, " +
+                    $"deleteRecords={deleteRecordsSeen:N0}, " +
+                    $"parentResolutions={parentResolutions:N0}, " +
+                    $"directoryMatches={directoryMatches:N0}, " +
+                    $"uniquePaths={latestResultByPath.Count:N0}, " +
+                    $"duplicatePathCollapses={duplicatePathCollapses:N0}.");
+            }
+        }
+
+        var results = latestResultByPath.Values
+            .OrderByDescending(record => record.DeletedAtUtc)
+            .ToList();
+
+        System.Diagnostics.Trace.WriteLine(
+            $"USN historical directory scan summary: batches={batchesRead:N0}, " +
+            $"deleteRecords={deleteRecordsSeen:N0}, " +
+            $"parentResolutions={parentResolutions:N0}, " +
+            $"directoryMatches={directoryMatches:N0}, " +
+            $"uniquePaths={results.Count:N0}, " +
+            $"duplicatePathCollapses={duplicatePathCollapses:N0}, " +
+            $"nextUsn={nextUsn}, journalNext={journal.NextUsn}.");
+
+        return results;
+    }
+
+    private static bool MatchesDirectory(
+        string? candidate,
+        string targetDirectory,
+        bool includeSubdirectories)
+    {
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return false;
+        }
+
+        var left = NormalizePath(candidate)
+            .TrimEnd(Path.DirectorySeparatorChar);
+        var right = NormalizePath(targetDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar);
+
+        if (string.Equals(left, right, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return includeSubdirectories &&
+               left.StartsWith(
+                   right + Path.DirectorySeparatorChar,
+                   StringComparison.OrdinalIgnoreCase);
     }
 
     public void Stop()
@@ -81,6 +547,14 @@ public sealed class UsnJournalMonitor : IDisposable
 
     private async Task MonitorAllVolumesAsync()
     {
+        if (!IsAdministrator())
+        {
+            StatusChanged?.Invoke(
+                this,
+                "USN monitoring is disabled because administrator privileges are required. Run AlgoLassi File Recovery as Administrator to enable it.");
+            return;
+        }
+
         while (!_cts.IsCancellationRequested)
         {
             foreach (var drive in GetNtfsFixedDrives())
@@ -90,21 +564,29 @@ public sealed class UsnJournalMonitor : IDisposable
                     break;
                 }
 
+                var volumeKey = drive.RootDirectory.FullName.TrimEnd(Path.DirectorySeparatorChar);
+                if (_accessDeniedUntilUtc.TryGetValue(volumeKey, out var retryAfterUtc) &&
+                    retryAfterUtc > DateTime.UtcNow)
+                {
+                    continue;
+                }
+
                 try
                 {
                     ReadVolume(drive);
+                    _accessDeniedUntilUtc.TryRemove(volumeKey, out _);
                 }
                 catch (UnauthorizedAccessException)
                 {
-                    StatusChanged?.Invoke(this, $"USN monitoring for {drive.RootDirectory.FullName} requires administrator privileges.");
+                    ReportAccessDenied(volumeKey);
                 }
                 catch (Win32Exception ex) when (ex.NativeErrorCode == 5)
                 {
-                    StatusChanged?.Invoke(this, $"USN monitoring for {drive.RootDirectory.FullName} requires administrator privileges.");
+                    ReportAccessDenied(volumeKey);
                 }
                 catch (Exception ex)
                 {
-                    StatusChanged?.Invoke(this, $"USN monitoring warning for {drive.RootDirectory.FullName}: {ex.Message}");
+                    StatusChanged?.Invoke(this, $"USN monitoring warning for {volumeKey}: {ex.Message}");
                 }
             }
 
@@ -117,6 +599,26 @@ public sealed class UsnJournalMonitor : IDisposable
                 return;
             }
         }
+    }
+
+    private void ReportAccessDenied(string volumeKey)
+    {
+        _accessDeniedUntilUtc[volumeKey] = DateTime.UtcNow.AddSeconds(30);
+        StatusChanged?.Invoke(
+            this,
+            $"USN monitoring for {volumeKey} requires administrator privileges. Retrying in 30 seconds.");
+    }
+
+    private static bool IsAdministrator()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        if (identity is null)
+        {
+            return false;
+        }
+
+        var principal = new WindowsPrincipal(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
     private void ReadVolume(DriveInfo drive)
@@ -136,11 +638,61 @@ public sealed class UsnJournalMonitor : IDisposable
             throw new Win32Exception(Marshal.GetLastWin32Error());
         }
 
-        if (!TryQueryJournal(volumeHandle, out var journal))
+        if (!TryQueryJournal(volumeHandle, out var journal, out var queryError))
         {
+            if (queryError == ErrorFileNotFound ||
+                queryError == ErrorJournalNotActive)
+            {
+                if (!TryCreateJournal(volumeHandle, volumeKey, out journal))
+                {
+                    return;
+                }
+            }
+            else
+            {
+                return;
+            }
+        }
+
+        // Skip record processing for an entirely ignored volume. Keep the cursor
+        // current in memory, but throttle persistence and trace logging.
+        if (RecoveryMonitoringExclusions.IsExcludedPath(drive.RootDirectory.FullName))
+        {
+            _settings.UsnCursors[volumeKey] = new VolumeJournalCursor
+            {
+                JournalId = journal.JournalId,
+                NextUsn = journal.NextUsn
+            };
+
+            var nowUtc = DateTime.UtcNow;
+            var shouldLog =
+                !_excludedVolumeLoggedJournalIds.TryGetValue(volumeKey, out var loggedJournalId) ||
+                loggedJournalId != journal.JournalId;
+
+            _excludedVolumeLoggedJournalIds[volumeKey] = journal.JournalId;
+
+            var shouldSave =
+                !_excludedVolumeLastCursorSaveUtc.TryGetValue(volumeKey, out var lastSaveUtc) ||
+                nowUtc - lastSaveUtc >= TimeSpan.FromMinutes(1);
+
+            if (shouldSave)
+            {
+                _settings.Save();
+                _excludedVolumeLastCursorSaveUtc[volumeKey] = nowUtc;
+            }
+
+            if (shouldLog)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"USN monitor skipped excluded volume contents: " +
+                    $"volume={drive.RootDirectory.FullName}, cursor={journal.NextUsn}.");
+            }
+
             return;
         }
 
+        _excludedVolumeLastCursorSaveUtc.TryRemove(volumeKey, out _);
+        _excludedVolumeLoggedJournalIds.TryRemove(volumeKey, out _);
         var cache = _parentPathCaches.GetOrAdd(
             volumeKey,
             _ => new ConcurrentDictionary<ulong, string>());
@@ -176,9 +728,80 @@ public sealed class UsnJournalMonitor : IDisposable
         }
 
         var nextUsn = cursor.NextUsn;
-        while (!_cts.IsCancellationRequested && nextUsn < journal.NextUsn)
+        const int maxBatchesPerVolumePerCycle = 8;
+        var batchesRead = 0;
+
+        while (!_cts.IsCancellationRequested &&
+               nextUsn < journal.NextUsn &&
+               batchesRead < maxBatchesPerVolumePerCycle)
         {
-            var records = ReadRecords(volumeHandle, journal.JournalId, nextUsn, out var returnedNextUsn);
+            batchesRead++;
+
+            List<UsnRecord> records;
+            long returnedNextUsn;
+
+            try
+            {
+                records = ReadRecords(
+                    volumeHandle,
+                    journal.JournalId,
+                    nextUsn,
+                    out returnedNextUsn);
+            }
+            catch (Win32Exception ex) when (ex.NativeErrorCode == 87)
+            {
+                // An in-range number is not necessarily a StartUsn Windows will accept.
+                // Avoid retrying either the rejected cursor or a guessed numeric tail
+                // (NextUsn minus an arbitrary byte window). Re-query the journal and
+                // resume from the authoritative NextUsn returned by Windows so live
+                // monitoring can continue. This deliberately skips unprocessed backlog
+                // before that point and reports the possible gap to the user.
+                if (!TryQueryJournal(volumeHandle, out var refreshedJournal, out var refreshError))
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"USN error-87 recovery could not query current journal: " +
+                        $"volume={volumeKey}, requestedUsn={nextUsn}, " +
+                        $"journalId={journal.JournalId}, queryError={refreshError}.");
+
+                    StatusChanged?.Invoke(
+                        this,
+                        $"USN monitoring on {volumeKey} could not refresh the journal after error 87; retrying.");
+
+                    return;
+                }
+
+                var cursorStillRetained =
+                    cursor.JournalId == refreshedJournal.JournalId &&
+                    nextUsn >= refreshedJournal.FirstUsn &&
+                    nextUsn >= refreshedJournal.LowestValidUsn &&
+                    nextUsn <= refreshedJournal.NextUsn;
+
+                cursor.JournalId = refreshedJournal.JournalId;
+                cursor.NextUsn = refreshedJournal.NextUsn;
+                _settings.UsnCursors[volumeKey] = cursor;
+                _settings.Save();
+
+                var recoveryReason = cursorStillRetained
+                    ? "the prior cursor was within the reported range but Windows rejected it"
+                    : "the prior cursor or journal generation was outside the current retained range";
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"USN monitor re-armed after error 87: volume={volumeKey}, " +
+                    $"requestedUsn={nextUsn}, requestedJournalId={journal.JournalId}, " +
+                    $"currentJournalId={refreshedJournal.JournalId}, " +
+                    $"firstUsn={refreshedJournal.FirstUsn}, " +
+                    $"lowestValidUsn={refreshedJournal.LowestValidUsn}, " +
+                    $"currentNextUsn={refreshedJournal.NextUsn}, " +
+                    $"cursorStillRetained={cursorStillRetained}, " +
+                    $"resumeUsn={refreshedJournal.NextUsn}, action=resume-at-authoritative-journal-end.");
+
+                StatusChanged?.Invoke(
+                    this,
+                    $"USN monitoring on {volumeKey} re-armed after error 87: {recoveryReason}; " +
+                    "resuming at Windows-reported journal end. Older deletion events in the skipped backlog may be missed.");
+
+                return;
+            }
 
             if (returnedNextUsn <= nextUsn)
             {
@@ -194,9 +817,111 @@ public sealed class UsnJournalMonitor : IDisposable
                     continue;
                 }
 
-                var directory = cache.TryGetValue(record.ParentFileReferenceNumber, out var knownPath)
+                // Snapshot NTFS $DATA before resolving the parent directory.
+                // The parent lookup touches MFT metadata and can give MFT sequence
+                // reuse more time to invalidate a just-deleted record.
+                var cachedDirectory = cache.TryGetValue(
+                    record.ParentFileReferenceNumber,
+                    out var knownPath)
                     ? knownPath
-                    : ResolveParentDirectory(volumeHandle, record.ParentFileReferenceNumber);
+                    : null;
+
+                var initialDirectory = string.IsNullOrWhiteSpace(cachedDirectory)
+                    ? "(Parent directory unavailable)"
+                    : cachedDirectory;
+
+                var initialPath = string.IsNullOrWhiteSpace(cachedDirectory)
+                    ? record.FileName
+                    : Path.Combine(cachedDirectory, record.FileName);
+
+                // If the parent path is already cached, apply exclusions before touching
+                // the deleted file's MFT generation or $LogFile. This is especially
+                // important for AlgoLassi's own atomically replaced history/settings files:
+                // those USN delete records must not trigger expensive snapshot attempts.
+                if (!string.IsNullOrWhiteSpace(cachedDirectory) &&
+                    RecoveryMonitoringExclusions.IsExcludedPath(initialPath))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"USN monitor skipped excluded path before snapshot capture: " +
+                        $"path={initialPath}, fileRef={record.FileReferenceNumber}, " +
+                        $"parentRef={record.ParentFileReferenceNumber}.");
+                    continue;
+                }
+
+                var deletion = new DeletionRecord
+                {
+                    FileReferenceNumber = record.FileReferenceNumber,
+                    ParentFileReferenceNumber = record.ParentFileReferenceNumber,
+                    FullPath = NormalizePath(initialPath),
+                    FileName = record.FileName,
+                    DirectoryPath = initialDirectory,
+                    DeletedAtUtc = record.TimestampUtc,
+                    FileSizeBytes = null,
+                    RecoveryStrength = "Weak"
+                };
+
+                // Capture a live deletion before resolving its parent path: extra
+                // metadata reads can let NTFS advance the deleted MFT sequence.
+                //
+                // During startup catch-up, only a one-step sequence transition may be
+                // considered, and only through the reader's deleted-record, exact
+                // filename/parent, and timestamp guards. A larger change is rejected.
+  
+                var isLiveDeletion =
+                    record.TimestampUtc >= _monitorStartedAtUtc &&
+                    record.TimestampUtc <= DateTime.UtcNow.AddMinutes(1);
+
+                var isRecentPreStartDeletion =
+                    record.TimestampUtc < _monitorStartedAtUtc &&
+                    record.TimestampUtc >=
+                        _monitorStartedAtUtc.AddMinutes(-RecentPreStartSnapshotMinutes);
+
+                if (isLiveDeletion || isRecentPreStartDeletion)
+                {
+                    var captureLabel = isLiveDeletion
+                        ? "NTFS deletion-time capture-first"
+                        : "NTFS pre-start catch-up capture";
+
+                    var maxSequenceAdvance = isLiveDeletion ? 8 : 1;
+
+                    System.Diagnostics.Trace.WriteLine(
+                        $"{captureLabel}: " +
+                        $"path={record.FileName}, " +
+                        $"fileRef={record.FileReferenceNumber}, " +
+                        $"parentRef={record.ParentFileReferenceNumber}, " +
+                        $"deleteTime={record.TimestampUtc:O}, " +
+                        $"maxSequenceAdvance={maxSequenceAdvance}, " +
+                        $"identityGuard=deleted-record+filename+parent+timestamp.");
+
+                    CaptureNtfsDeletionSnapshot(
+                        deletion,
+                        volumeKey,
+                        record.FileReferenceNumber,
+                        record.ParentFileReferenceNumber,
+                        record.FileName,
+                        cachedDirectory ?? "(Parent directory unavailable)",
+                        allowBoundedDeleteTransition: true,
+                        maxBoundedDeleteSequenceAdvance: maxSequenceAdvance);
+
+                    if (deletion.NtfsDataSnapshot?.IsComplete == true)
+                    {
+                        System.Diagnostics.Trace.WriteLine(
+                            $"{captureLabel} SUCCESS: " +
+                            $"fileRef={record.FileReferenceNumber}, " +
+                            $"size={deletion.NtfsDataSnapshot.FileSizeBytes:N0}, " +
+                            $"sha256={deletion.NtfsDataSnapshot.Sha256 ?? "(none)"}.");
+                    }
+                    else
+                    {
+                        System.Diagnostics.Trace.WriteLine(
+                            $"{captureLabel} MISS: " +
+                            $"fileRef={record.FileReferenceNumber}, " +
+                            $"reason=exact-generation $DATA capture did not complete.");
+                    }
+                }
+
+                var directory = cachedDirectory ??
+                    ResolveParentDirectory(volumeHandle, record.ParentFileReferenceNumber);
 
                 if (!string.IsNullOrWhiteSpace(directory))
                 {
@@ -208,17 +933,29 @@ public sealed class UsnJournalMonitor : IDisposable
                     directory = "(Parent directory unavailable)";
                 }
 
-                var recordPath = Path.Combine(directory, record.FileName);
+                deletion.DirectoryPath = directory;
+                deletion.FullPath = NormalizePath(Path.Combine(directory, record.FileName));
 
-                var deletion = new DeletionRecord
+                if (RecoveryMonitoringExclusions.IsExcludedPath(deletion.FullPath))
                 {
-                    FullPath = recordPath,
-                    FileName = record.FileName,
-                    DirectoryPath = directory,
-                    DeletedAtUtc = record.TimestampUtc,
-                    FileSizeBytes = null,
-                    RecoveryStrength = "Weak"
-                };
+                    continue;
+                }
+
+                _recentDeletedRecords.Enqueue(
+                    new RecentDeletedRecord(
+                        record.FileReferenceNumber,
+                        record.ParentFileReferenceNumber,
+                        record.FileName,
+                        string.IsNullOrWhiteSpace(directory) ||
+                        directory.Equals("(Parent directory unavailable)", StringComparison.OrdinalIgnoreCase)
+                            ? null
+                            : directory,
+                        record.TimestampUtc));
+
+                while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+                       _recentDeletedRecords.TryDequeue(out _))
+                {
+                }
 
                 DeletionDetected?.Invoke(this, new DeletionDetectedEventArgs(deletion, historical: true));
             }
@@ -234,11 +971,323 @@ public sealed class UsnJournalMonitor : IDisposable
                 break;
             }
         }
+
+        if (!_cts.IsCancellationRequested &&
+            batchesRead >= maxBatchesPerVolumePerCycle &&
+            nextUsn < journal.NextUsn)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"USN monitor yielding {volumeKey} after {batchesRead} read batch(es); " +
+                $"cursor={nextUsn}, journalNext={journal.NextUsn}.");
+        }
     }
 
-    private static bool TryQueryJournal(SafeFileHandle volumeHandle, out JournalInfo journal)
+    private void CaptureNtfsDeletionSnapshot(
+        DeletionRecord deletion,
+        string volumeKey,
+        ulong fileReferenceNumber,
+        ulong parentFileReferenceNumber,
+        string fileName,
+        string directoryPath,
+        bool allowBoundedDeleteTransition = true,
+        int maxBoundedDeleteSequenceAdvance = 8)
+    {
+        var captureKey = $"{volumeKey}|{fileReferenceNumber:X16}";
+        var gateIndex =
+            (StringComparer.OrdinalIgnoreCase.GetHashCode(captureKey) & int.MaxValue) %
+            _snapshotCaptureGates.Length;
+        var gate = _snapshotCaptureGates[gateIndex];
+
+        lock (gate)
+        {
+            if (_completedSnapshotCache.TryGetValue(captureKey, out var cachedSnapshot))
+            {
+                deletion.NtfsDataSnapshot = cachedSnapshot.Clone();
+                deletion.FileSizeBytes = cachedSnapshot.FileSizeBytes;
+                deletion.RecoveryStrength = "Strong";
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS deletion snapshot reused: path={deletion.FullPath}, " +
+                    $"fileRef={fileReferenceNumber}, dataFile={cachedSnapshot.DataFileName}, " +
+                    $"sha256={cachedSnapshot.Sha256}.");
+                return;
+            }
+
+            CaptureNtfsDeletionSnapshotCore(
+                deletion,
+                volumeKey,
+                fileReferenceNumber,
+                parentFileReferenceNumber,
+                fileName,
+                directoryPath,
+                allowBoundedDeleteTransition,
+                maxBoundedDeleteSequenceAdvance);
+
+            if (deletion.NtfsDataSnapshot?.IsComplete == true)
+            {
+                _completedSnapshotCache[captureKey] = deletion.NtfsDataSnapshot.Clone();
+                _completedSnapshotCacheOrder.Enqueue(captureKey);
+
+                while (_completedSnapshotCache.Count > CompletedSnapshotCacheLimit &&
+                       _completedSnapshotCacheOrder.TryDequeue(out var expiredKey))
+                {
+                    _completedSnapshotCache.TryRemove(expiredKey, out _);
+                }
+            }
+        }
+    }
+
+    private void CaptureNtfsDeletionSnapshotCore(
+        DeletionRecord deletion,
+        string volumeKey,
+        ulong fileReferenceNumber,
+        ulong parentFileReferenceNumber,
+        string fileName,
+        string directoryPath,
+        bool allowBoundedDeleteTransition = true,
+        int maxBoundedDeleteSequenceAdvance = 8)
+    {
+        try
+        {
+            var expectedFullPath =
+                string.IsNullOrWhiteSpace(directoryPath) ||
+                directoryPath.Equals(
+                    "(Parent directory unavailable)",
+                    StringComparison.OrdinalIgnoreCase)
+                    ? null
+                    : NormalizePath(Path.Combine(directoryPath, fileName));
+
+            var root = volumeKey + Path.DirectorySeparatorChar;
+            var reader = new NtfsMftDataReader();
+
+            NtfsDataStreamInfo stream;
+            byte[] capturedData = [];
+            var streamedCapture = false;
+            var streamedAllZero = false;
+            string? streamedDataFileName = null;
+            string? streamedSha256 = null;
+            var expectedFileSizeBytes = deletion.FileSizeBytes ?? 0;
+            var isBoundedPreStartCapture =
+                allowBoundedDeleteTransition &&
+                maxBoundedDeleteSequenceAdvance == 1;
+
+            if (expectedFileSizeBytes > DeleteSnapshotMaxBytes &&
+                expectedFileSizeBytes <= MaxStreamingDeleteSnapshotBytes &&
+                reader.TryCaptureDeletedDataToSnapshotStore(
+                    root,
+                    fileReferenceNumber,
+                    parentFileReferenceNumber,
+                    fileName,
+                    expectedFullPath,
+                    _snapshotStore,
+                    deletion.Id,
+                    MaxStreamingDeleteSnapshotBytes,
+                    rejectAllZeroContent: isBoundedPreStartCapture,
+                    out stream,
+                    out streamedDataFileName,
+                    out streamedSha256,
+                    out streamedAllZero,
+                    expectedDeletedAtUtc: deletion.DeletedAtUtc,
+                    allowBoundedDeleteTransition: allowBoundedDeleteTransition,
+                    expectedFileSizeBytes: expectedFileSizeBytes,
+                    maxBoundedDeleteSequenceAdvance: maxBoundedDeleteSequenceAdvance))
+            {
+                streamedCapture = true;
+            }
+            else if (!reader.TryCaptureDeletedData(
+                         root,
+                         fileReferenceNumber,
+                         parentFileReferenceNumber,
+                         fileName,
+                         expectedFullPath,
+                         DeleteSnapshotMaxBytes,
+                         out stream,
+                         out capturedData,
+                         expectedDeletedAtUtc: deletion.DeletedAtUtc,
+                         allowBoundedDeleteTransition: allowBoundedDeleteTransition,
+                         expectedFileSizeBytes: expectedFileSizeBytes,
+                         maxBoundedDeleteSequenceAdvance: maxBoundedDeleteSequenceAdvance))
+            {
+                return;
+            }
+
+            var capturedByteCount = streamedCapture
+                ? stream.FileSizeBytes
+                : capturedData.LongLength;
+
+            deletion.FileSizeBytes =
+                stream.FileSizeBytes >= 0
+                    ? stream.FileSizeBytes
+                    : deletion.FileSizeBytes;
+
+            // A retained pre-start USN deletion may have a matching one-step MFT
+            // transition even after the original data clusters have been discarded
+            // (for example, by SSD TRIM). Do not label a non-empty all-zero buffer
+            // from this conservative catch-up path as a complete/strong snapshot.
+            // A genuinely all-zero file can exist, so preserve its metadata as a
+            // metadata-only result instead of treating the bytes as trustworthy.
+            var isAllZeroCapture = streamedCapture
+                ? capturedByteCount > 0 && streamedAllZero
+                : capturedData.Length > 0 &&
+                  capturedData.All(static value => value == 0);
+            var rejectAllZeroPreStartCapture =
+                isBoundedPreStartCapture &&
+                capturedByteCount == stream.FileSizeBytes &&
+                isAllZeroCapture;
+
+            var snapshot = new NtfsDeletionDataSnapshot
+            {
+                DataCaptured = false,
+                IsResident = stream.IsResident,
+                FileSizeBytes = stream.FileSizeBytes,
+                ValidDataLengthBytes = stream.ValidDataLengthBytes,
+                CapturedByteCount = capturedByteCount,
+                DataExtents = stream.Extents
+                    .Select(extent => new NtfsDataExtent
+                    {
+                        VirtualClusterNumber = extent.VirtualClusterNumber,
+                        ClusterCount = extent.ClusterCount,
+                        LogicalClusterNumber = extent.LogicalClusterNumber
+                    })
+                    .ToList(),
+                CapturedAtUtc = DateTime.UtcNow,
+                Evidence = rejectAllZeroPreStartCapture
+                    ? "Pre-start catch-up returned an all-zero buffer after a bounded MFT transition. " +
+                      "Original contents may have been discarded by storage TRIM or the current runlist " +
+                      "may no longer reference the original allocation; content was not marked captured."
+                    : capturedByteCount == stream.FileSizeBytes
+                        ? streamedCapture
+                            ? "NTFS $DATA was streamed to a durable snapshot when the USN deletion was observed."
+                            : "NTFS $DATA was captured immediately when the USN deletion was observed."
+                        : $"NTFS $DATA metadata was captured at deletion time, but content capture was limited to {DeleteSnapshotMaxBytes:N0} bytes."
+            };
+
+            if (rejectAllZeroPreStartCapture)
+            {
+                deletion.NtfsDataSnapshot = snapshot;
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS pre-start catch-up capture REJECTED all-zero content: " +
+                    $"path={deletion.FullPath}, fileRef={fileReferenceNumber}, " +
+                    $"size={capturedData.LongLength:N0}; metadata retained, no strong snapshot saved.");
+
+                return;
+            }
+
+            if (streamedCapture)
+            {
+                snapshot.DataCaptured = true;
+                snapshot.DataFileName = streamedDataFileName;
+                snapshot.Sha256 = streamedSha256 ?? string.Empty;
+                deletion.RecoveryStrength = "Strong";
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS streamed deletion snapshot saved: path={deletion.FullPath}, " +
+                    $"fileRef={fileReferenceNumber}, size={capturedByteCount:N0}, " +
+                    $"resident={stream.IsResident}, dataFile={streamedDataFileName}, " +
+                    $"sha256={streamedSha256}.");
+            }
+            else if (capturedData.LongLength == stream.FileSizeBytes &&
+                _snapshotStore.TrySave(
+                    deletion.Id,
+                    capturedData,
+                    out var dataFileName,
+                    out var sha256))
+            {
+                snapshot.DataCaptured = true;
+                snapshot.DataFileName = dataFileName;
+                snapshot.Sha256 = sha256;
+                deletion.RecoveryStrength = "Strong";
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS deletion snapshot saved: path={deletion.FullPath}, " +
+                    $"fileRef={fileReferenceNumber}, size={capturedData.LongLength:N0}, " +
+                    $"resident={stream.IsResident}, dataFile={dataFileName}.");
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS deletion snapshot metadata only: path={deletion.FullPath}, " +
+                    $"fileRef={fileReferenceNumber}, size={stream.FileSizeBytes:N0}, " +
+                    $"capturedBytes={capturedByteCount:N0}.");
+            }
+
+            deletion.NtfsDataSnapshot = snapshot;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS deletion snapshot failed: path={deletion.FullPath}, " +
+                $"fileRef={fileReferenceNumber}, error={ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private bool TryCreateJournal(
+        SafeFileHandle volumeHandle,
+        string volumeKey,
+        out JournalInfo journal)
     {
         journal = default;
+
+        var request = new CreateUsnJournalData
+        {
+            MaximumSize = 64UL * 1024UL * 1024UL,
+            AllocationDelta = 16UL * 1024UL * 1024UL
+        };
+
+        var input = StructureToBytes(request);
+
+        if (!DeviceIoControl(
+                volumeHandle,
+                FsctlCreateUsnJournal,
+                input,
+                (uint)input.Length,
+                null,
+                0,
+                out _,
+                IntPtr.Zero))
+        {
+            var error = Marshal.GetLastWin32Error();
+            StatusMessageForJournalFailure(volumeKey, error);
+            return false;
+        }
+
+        if (!TryQueryJournal(volumeHandle, out journal, out var queryError))
+        {
+            StatusMessageForJournalFailure(volumeKey, queryError);
+            return false;
+        }
+
+        StatusChanged?.Invoke(
+            this,
+            $"USN journal created and active on {volumeKey}.");
+
+        return true;
+    }
+
+    private void StatusMessageForJournalFailure(string volumeKey, int error)
+    {
+        if (error == 5)
+        {
+            StatusChanged?.Invoke(
+                this,
+                $"USN journal for {volumeKey} could not be created because administrator privileges are required.");
+        }
+        else if (error != 0)
+        {
+            StatusChanged?.Invoke(
+                this,
+                $"USN journal for {volumeKey} is unavailable (error {error}).");
+        }
+    }
+
+    private static bool TryQueryJournal(
+        SafeFileHandle volumeHandle,
+        out JournalInfo journal,
+        out int errorCode)
+    {
+        journal = default;
+        errorCode = 0;
         var output = new byte[64];
 
         if (!DeviceIoControl(
@@ -252,12 +1301,18 @@ public sealed class UsnJournalMonitor : IDisposable
                 IntPtr.Zero))
         {
             var error = Marshal.GetLastWin32Error();
-            if (error == 2 || error == 1178)
+            errorCode = error;
+
+            if (error == ErrorFileNotFound ||
+                error == ErrorJournalDeleteInProgress ||
+                error == ErrorJournalNotActive)
             {
                 return false;
             }
 
-            throw new Win32Exception(error);
+            throw new Win32Exception(
+                error,
+                $"FSCTL_QUERY_USN_JOURNAL failed (error {error}).");
         }
 
         if (bytesReturned < 60)
@@ -274,22 +1329,1721 @@ public sealed class UsnJournalMonitor : IDisposable
         return true;
     }
 
+    public bool TryResolveCachedRecentDeletedFile(
+        string fullPath,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        var normalizedTarget = NormalizePath(fullPath);
+
+        var cached = _recentDeletedRecords
+            .ToArray()
+            .OrderBy(item =>
+                Math.Abs((item.TimestampUtc - deletedAtUtc).TotalMilliseconds))
+            .FirstOrDefault(item =>
+            {
+                if (deletedAtUtc != default &&
+                    Math.Abs((item.TimestampUtc - deletedAtUtc).TotalMinutes) > 5)
+                {
+                    return false;
+                }
+
+                var candidatePath = item.DirectoryPath is null
+                    ? string.Empty
+                    : NormalizePath(Path.Combine(
+                        item.DirectoryPath,
+                        item.FileName));
+
+                return string.Equals(
+                    candidatePath,
+                    normalizedTarget,
+                    StringComparison.OrdinalIgnoreCase)
+                    || (item.DirectoryPath is null &&
+                        string.Equals(
+                            item.FileName,
+                            Path.GetFileName(normalizedTarget),
+                            StringComparison.OrdinalIgnoreCase));
+            });
+
+        if (cached.FileReferenceNumber == 0 ||
+            cached.ParentFileReferenceNumber == 0)
+        {
+            return false;
+        }
+
+        fileReferenceNumber = cached.FileReferenceNumber;
+        parentFileReferenceNumber = cached.ParentFileReferenceNumber;
+        return true;
+    }
+
+    public bool TryCaptureHistoricalDeletionSnapshot(
+        UsnDeletedFileRecord record,
+        out DeletionRecord deletion)
+    {
+        deletion = new DeletionRecord
+        {
+            FileReferenceNumber = record.FileReferenceNumber,
+            ParentFileReferenceNumber = record.ParentFileReferenceNumber,
+            FullPath = NormalizePath(record.FullPath),
+            FileName = record.FileName,
+            DirectoryPath = record.DirectoryPath,
+            DeletedAtUtc = record.DeletedAtUtc,
+            RecoveryStrength = "Weak"
+        };
+
+        if (string.IsNullOrWhiteSpace(record.FullPath) ||
+            string.IsNullOrWhiteSpace(record.FileName) ||
+            RecoveryMonitoringExclusions.IsExcludedPath(record.FullPath) ||
+            !IsAdministrator())
+        {
+            return false;
+        }
+
+        var root = Path.GetPathRoot(record.FullPath);
+        if (string.IsNullOrWhiteSpace(root) ||
+            !string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+
+        // A pre-start deletion can still be safely recovered when the exact deleted
+        // MFT generation is still physically present. The USN file reference contains
+        // the original sequence number, so this path must require an exact-generation
+        // MFT match and must NEVER accept the bounded sequence-transition fallback.
+        //
+        // This is materially different from accepting a later reused MFT record:
+        // ReadDefaultDataStream(..., allowBoundedDeleteTransition: false) validates the
+        // exact sequence/base reference before exposing the historical $DATA runlist.
+        CaptureNtfsDeletionSnapshot(
+            deletion,
+            volumeKey,
+            record.FileReferenceNumber,
+            record.ParentFileReferenceNumber,
+            record.FileName,
+            record.DirectoryPath,
+            allowBoundedDeleteTransition: false);
+
+        if (deletion.NtfsDataSnapshot is not null)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS historical exact-MFT snapshot: path={deletion.FullPath}, " +
+                $"fileRef={record.FileReferenceNumber}, " +
+                $"size={deletion.NtfsDataSnapshot.FileSizeBytes:N0}, " +
+                $"captured={deletion.NtfsDataSnapshot.IsComplete}, " +
+                $"snapshotFile={deletion.NtfsDataSnapshot.DataFileName ?? "(none)"}.");
+
+            if (deletion.NtfsDataSnapshot.IsComplete ||
+                deletion.NtfsDataSnapshot.FileSizeBytes > DeleteSnapshotMaxBytes)
+            {
+                return true;
+            }
+        }
+
+        // Do not parse the full circular $LogFile for every item returned by a
+        // historical directory scan. The $LogFile fallback is reserved for the
+        // live-deletion path and for explicit Targeted Historical recovery, where
+        // there is a single known file reference to investigate.
+        return false;
+    }
+
+    private bool TryCaptureHistoricalLogFileSnapshot(
+        DeletionRecord deletion,
+        string root,
+        ulong fileReferenceNumber,
+        CancellationToken cancellationToken)
+    {
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        var captureKey = $"{volumeKey}|{fileReferenceNumber:X16}";
+        var gateIndex =
+            (StringComparer.OrdinalIgnoreCase.GetHashCode(captureKey) & int.MaxValue) %
+            _snapshotCaptureGates.Length;
+
+        // The historical $LogFile capture must share the same identity lock as the
+        // MFT capture. Otherwise those two paths can read the released clusters at
+        // the same time and publish competing content for one deletion.
+        lock (_snapshotCaptureGates[gateIndex])
+        {
+            if (_completedSnapshotCache.TryGetValue(captureKey, out var cachedSnapshot))
+            {
+                deletion.NtfsDataSnapshot = cachedSnapshot.Clone();
+                deletion.FileSizeBytes = cachedSnapshot.FileSizeBytes;
+                deletion.RecoveryStrength = "Strong";
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile snapshot reused: path={deletion.FullPath}, " +
+                    $"fileRef={fileReferenceNumber}, dataFile={cachedSnapshot.DataFileName}, " +
+                    $"sha256={cachedSnapshot.Sha256}.");
+                return true;
+            }
+
+            var success = TryCaptureHistoricalLogFileSnapshotCore(
+                deletion,
+                root,
+                fileReferenceNumber,
+                cancellationToken);
+
+            if (success && deletion.NtfsDataSnapshot?.IsComplete == true)
+            {
+                _completedSnapshotCache[captureKey] = deletion.NtfsDataSnapshot.Clone();
+                _completedSnapshotCacheOrder.Enqueue(captureKey);
+
+                while (_completedSnapshotCache.Count > CompletedSnapshotCacheLimit &&
+                       _completedSnapshotCacheOrder.TryDequeue(out var expiredKey))
+                {
+                    _completedSnapshotCache.TryRemove(expiredKey, out _);
+                }
+            }
+
+            return success;
+        }
+    }
+
+    private bool TryCaptureHistoricalLogFileSnapshotCore(
+        DeletionRecord deletion,
+        string root,
+        ulong fileReferenceNumber,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var dataReader =
+                new NtfsLogFileHistoricalDataService();
+
+            // Preserve the size captured by FileSystemWatcher. For large files,
+            // use the streaming historical path so the size is not reset to zero
+            // just because the older byte-array path has a 16 MiB limit.
+            var knownSize = deletion.FileSizeBytes.GetValueOrDefault();
+
+            if (knownSize > DeleteSnapshotMaxBytes)
+            {
+                if (knownSize > MaxStreamingDeleteSnapshotBytes)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS $LogFile live snapshot: known size exceeds streaming limit; " +
+                        $"path={deletion.FullPath}, size={knownSize:N0}, " +
+                        $"limit={MaxStreamingDeleteSnapshotBytes:N0}.");
+                    return false;
+                }
+
+                if (!dataReader.TryRecoverFileDataToSnapshotStore(
+                        root,
+                        fileReferenceNumber,
+                        deletion.FileName,
+                        fileSizeBytes: knownSize,
+                        maxCaptureBytes: MaxStreamingDeleteSnapshotBytes,
+                        snapshotStore: _snapshotStore,
+                        recordId: deletion.Id,
+                        out var streamedDataFileName,
+                        out var streamedSha256,
+                        out var streamedEvidence,
+                        progress: null,
+                        cancellationToken: cancellationToken))
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS $LogFile live streaming snapshot lookup failed for " +
+                        $"{deletion.FullPath}: {streamedEvidence}");
+                    return false;
+                }
+
+                deletion.FileSizeBytes = knownSize;
+                deletion.RecoveryStrength = "Strong";
+                deletion.NtfsDataSnapshot = new NtfsDeletionDataSnapshot
+                {
+                    DataCaptured = true,
+                    IsResident = false,
+                    FileSizeBytes = knownSize,
+                    ValidDataLengthBytes = knownSize,
+                    CapturedByteCount = knownSize,
+                    DataFileName = streamedDataFileName,
+                    Sha256 = streamedSha256,
+                    CapturedAtUtc = DateTime.UtcNow,
+                    Evidence =
+                        "Captured immediately from a validated historical NTFS $LogFile runlist using " +
+                        "bounded-memory streaming. " + streamedEvidence
+                };
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile live STREAMING snapshot saved: " +
+                    $"path={deletion.FullPath}, fileRef={fileReferenceNumber}, " +
+                    $"size={knownSize:N0}, dataFile={streamedDataFileName}, " +
+                    $"sha256={streamedSha256}.");
+                return true;
+            }
+
+            if (knownSize < 0)
+            {
+                knownSize = 0;
+            }
+
+            if (!dataReader.TryRecoverFileData(
+                    root,
+                    fileReferenceNumber,
+                    deletion.FileName,
+                    fileSizeBytes: knownSize,
+                    maxCaptureBytes: DeleteSnapshotMaxBytes,
+                    out var recoveredData,
+                    out var dataEvidence,
+                    progress: null,
+                    cancellationToken: cancellationToken))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile live snapshot: data lookup failed for " +
+                    $"{deletion.FullPath}: {dataEvidence}");
+                return false;
+            }
+
+            if (recoveredData.LongLength <= 0 ||
+                recoveredData.LongLength > DeleteSnapshotMaxBytes)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile live snapshot: recovered size is outside the " +
+                    $"live snapshot limit for {deletion.FullPath}: {recoveredData.LongLength:N0}.");
+                return false;
+            }
+
+            if (!_snapshotStore.TrySave(
+                    deletion.Id,
+                    recoveredData,
+                    out var dataFileName,
+                    out var sha256))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile live snapshot: could not persist recovered data for " +
+                    $"{deletion.FullPath}.");
+                return false;
+            }
+
+            deletion.FileSizeBytes = recoveredData.LongLength;
+            deletion.RecoveryStrength = "Strong";
+            deletion.NtfsDataSnapshot = new NtfsDeletionDataSnapshot
+            {
+                DataCaptured = true,
+                IsResident = false,
+                FileSizeBytes = recoveredData.LongLength,
+                ValidDataLengthBytes = recoveredData.LongLength,
+                CapturedByteCount = recoveredData.LongLength,
+                DataFileName = dataFileName,
+                Sha256 = sha256,
+                CapturedAtUtc = DateTime.UtcNow,
+                Evidence =
+                    "Recovered immediately from the current NTFS $LogFile before the " +
+                    "circular journal could overwrite the deletion transaction. " +
+                    dataEvidence
+            };
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile live snapshot saved: " +
+                $"path={deletion.FullPath}, fileRef={fileReferenceNumber}, " +
+                $"size={recoveredData.LongLength:N0}, dataFile={dataFileName}, " +
+                $"sha256={sha256}.");
+
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile live snapshot cancelled: " +
+                $"{deletion.FullPath}: fileRef={fileReferenceNumber}.");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile live snapshot failed: " +
+                $"{deletion.FullPath}: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
+    public bool TryCaptureRecentDeletionSnapshot(
+        DeletionRecord deletion,
+        bool allowHistoricalLogFileFallback = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (deletion is null ||
+            string.IsNullOrWhiteSpace(deletion.FullPath) ||
+            RecoveryMonitoringExclusions.IsExcludedPath(deletion.FullPath) ||
+            string.IsNullOrWhiteSpace(deletion.FileName))
+        {
+            return false;
+        }
+
+        if (deletion.NtfsDataSnapshot?.IsComplete == true)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: skipping duplicate capture because a complete snapshot already exists: " +
+                $"path={deletion.FullPath}, fileRef={deletion.FileReferenceNumber}.");
+            return true;
+        }
+
+        if (deletion.DeletedAtUtc != default &&
+            _monitorStartedAtUtc != default &&
+            deletion.DeletedAtUtc < _monitorStartedAtUtc)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: skipped pre-start deletion path={deletion.FullPath}, " +
+                $"historyTime={deletion.DeletedAtUtc:O}, monitorStarted={_monitorStartedAtUtc:O}.");
+            return false;
+        }
+
+        var root = Path.GetPathRoot(deletion.FullPath);
+        if (string.IsNullOrWhiteSpace(root) ||
+            !string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS live deletion snapshot: starting path={deletion.FullPath}, " +
+            $"historyTime={deletion.DeletedAtUtc:O}.");
+
+        if (!TryResolveFreshDeletedFileFromJournalTail(
+                deletion.FullPath,
+                deletion.DeletedAtUtc,
+                out var fileReferenceNumber,
+                out var parentFileReferenceNumber))
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: no matching USN delete found for path={deletion.FullPath}.");
+            return false;
+        }
+
+        deletion.FileReferenceNumber = fileReferenceNumber;
+        deletion.ParentFileReferenceNumber = parentFileReferenceNumber;
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        var directoryPath = Path.GetDirectoryName(deletion.FullPath) ?? string.Empty;
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS live deletion snapshot: matched path={deletion.FullPath}, " +
+            $"fileRef={fileReferenceNumber}, parentRef={parentFileReferenceNumber}.");
+
+        CaptureNtfsDeletionSnapshot(
+            deletion,
+            volumeKey,
+            fileReferenceNumber,
+            parentFileReferenceNumber,
+            deletion.FileName,
+            directoryPath);
+
+        if (deletion.NtfsDataSnapshot?.IsComplete == true)
+        {
+            return true;
+        }
+
+        // A just-deleted text file can lose its exact MFT generation during the
+        // FileSystemWatcher/USN race. Preserve the file immediately from the current
+        // circular $LogFile before later NTFS activity can overwrite its transaction.
+        // Serialize this expensive fallback so deletion bursts cannot multiply the
+        // journal memory/IO footprint.
+        if (!Path.GetExtension(deletion.FileName).Equals(
+                ".txt",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // Fast live retries deliberately stop here. The $LogFile reconstruction
+        // below is expensive and must run at most once for a deletion event.
+        if (!allowHistoricalLogFileFallback)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: skipping $LogFile fallback for retry " +
+                $"path={deletion.FullPath}, fileRef={fileReferenceNumber}.");
+            return false;
+        }
+
+        if (!_historicalLogFileSnapshotGate.Wait(0))
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS $LogFile live snapshot deferred because another journal capture is active: " +
+                $"path={deletion.FullPath}, fileRef={fileReferenceNumber}.");
+            return false;
+        }
+
+        try
+        {
+            return TryCaptureHistoricalLogFileSnapshot(
+                deletion,
+                root,
+                fileReferenceNumber,
+                cancellationToken);
+        }
+        finally
+        {
+            _historicalLogFileSnapshotGate.Release();
+        }
+    }
+    public bool TryResolveRecentDeletedFile(
+        string fullPath,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        // Prefer records already observed by the background USN monitor.
+        if (TryResolveCachedRecentDeletedFile(
+                fullPath,
+                deletedAtUtc,
+                out fileReferenceNumber,
+                out parentFileReferenceNumber))
+        {
+            return true;
+        }
+
+        if (!IsAdministrator())
+        {
+            return false;
+        }
+
+        var normalizedTarget = NormalizePath(fullPath);
+        var root = Path.GetPathRoot(fullPath);
+        if (string.IsNullOrWhiteSpace(root) ||
+            !string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        using var volumeHandle = CreateFile(
+            $@"\\.\{volumeKey[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (volumeHandle.IsInvalid)
+        {
+            return false;
+        }
+
+        if (!TryQueryJournal(volumeHandle, out var journal, out _))
+        {
+            return false;
+        }
+
+        // StartUsn must be an actual USN from the journal; USNs are sequence
+        // numbers, not byte offsets. Prefer the monitor's last valid cursor;
+        // otherwise start at the first readable journal USN.
+        var searchStart = journal.FirstUsn;
+
+        if (_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) &&
+            cursor.JournalId == journal.JournalId &&
+            cursor.NextUsn >= journal.FirstUsn &&
+            cursor.NextUsn <= journal.NextUsn)
+        {
+            searchStart = cursor.NextUsn;
+        }
+
+        var nextUsn = searchStart;
+        var iterations = 0;
+
+        while (nextUsn < journal.NextUsn && iterations++ < 256)
+        {
+            var records = ReadRecords(
+                volumeHandle,
+                journal.JournalId,
+                nextUsn,
+                out var returnedNextUsn);
+
+            if (returnedNextUsn <= nextUsn)
+            {
+                break;
+            }
+
+            foreach (var record in records)
+            {
+                if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                    (record.FileAttributes & 0x10) != 0 ||
+                    string.IsNullOrWhiteSpace(record.FileName))
+                {
+                    continue;
+                }
+
+                var directory = ResolveParentDirectory(
+                    volumeHandle,
+                    record.ParentFileReferenceNumber);
+
+                if (string.IsNullOrWhiteSpace(directory))
+                {
+                    continue;
+                }
+
+                var candidatePath = NormalizePath(
+                    Path.Combine(directory, record.FileName));
+
+                if (!string.Equals(
+                        candidatePath,
+                        normalizedTarget,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                // The journal timestamp must be reasonably close to the deletion
+                // event being resolved. This prevents matching an older deletion
+                // of a file with the same name/path.
+                if (deletedAtUtc != default &&
+                    Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes) > 5)
+                {
+                    continue;
+                }
+
+                fileReferenceNumber = record.FileReferenceNumber;
+                parentFileReferenceNumber = record.ParentFileReferenceNumber;
+
+                _parentPathCaches.GetOrAdd(
+                    volumeKey,
+                    _ => new ConcurrentDictionary<ulong, string>())[record.ParentFileReferenceNumber] = directory;
+
+                return true;
+            }
+
+            nextUsn = returnedNextUsn;
+        }
+
+        return false;
+    }
+
+    public bool TryResolveHistoricalDeletionFromJournal(
+        string fullPath,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        var matches = ResolveHistoricalDeletionsFromJournal(
+            [(fullPath, deletedAtUtc)],
+            CancellationToken.None);
+
+        var match = matches.FirstOrDefault();
+        if (match is null)
+        {
+            return false;
+        }
+
+        fileReferenceNumber = match.FileReferenceNumber;
+        parentFileReferenceNumber = match.ParentFileReferenceNumber;
+        return true;
+    }
+
+    public IReadOnlyList<HistoricalUsnResolution> ResolveHistoricalDeletionsFromJournal(
+        IReadOnlyCollection<(string FullPath, DateTime DeletedAtUtc)> targets,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+
+        if (targets.Count == 0 || !IsAdministrator())
+        {
+            return [];
+        }
+
+        WindowsPrivilege.EnableSeBackupPrivilege();
+
+        var normalizedTargets = targets
+            .Where(target => !string.IsNullOrWhiteSpace(target.FullPath))
+            .Select(target => (
+                FullPath: NormalizePath(Path.GetFullPath(target.FullPath)),
+                FileName: Path.GetFileName(NormalizePath(target.FullPath)),
+                DeletedAtUtc: target.DeletedAtUtc))
+            .Where(target => !string.IsNullOrWhiteSpace(target.FileName))
+            .GroupBy(target => target.FullPath, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group
+                .OrderByDescending(target => target.DeletedAtUtc)
+                .First())
+            .ToList();
+
+        if (normalizedTargets.Count == 0)
+        {
+            return [];
+        }
+
+        var results = new List<HistoricalUsnResolution>();
+
+        foreach (var volumeGroup in normalizedTargets.GroupBy(
+                     target => Path.GetPathRoot(target.FullPath),
+                     StringComparer.OrdinalIgnoreCase))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var root = volumeGroup.Key;
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                continue;
+            }
+
+            try
+            {
+                if (!string.Equals(
+                        new DriveInfo(root).DriveFormat,
+                        "NTFS",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+            }
+            catch
+            {
+                continue;
+            }
+
+            var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+
+            using var volumeHandle = CreateFile(
+                $@"\\.\{volumeKey[..2]}",
+                GenericRead,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics,
+                IntPtr.Zero);
+
+            var queryError = 0;
+            if (volumeHandle.IsInvalid ||
+                !TryQueryJournal(volumeHandle, out var journal, out queryError))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"Historical USN lookup unavailable: volume={volumeKey}, error={queryError}.");
+                continue;
+            }
+
+            var pendingByName = volumeGroup
+                .GroupBy(
+                    target => target.FileName,
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.ToList(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            var remainingTargets = pendingByName.Values.Sum(list => list.Count);
+            var nextUsn = journal.FirstUsn;
+            var batchesRead = 0;
+
+            System.Diagnostics.Debug.WriteLine(
+                $"Historical USN lookup: volume={volumeKey}, targets={remainingTargets:N0}, " +
+                $"firstUsn={journal.FirstUsn}, nextUsn={journal.NextUsn}.");
+
+            while (remainingTargets > 0 &&
+                   nextUsn < journal.NextUsn)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var records = ReadRecords(
+                    volumeHandle,
+                    journal.JournalId,
+                    nextUsn,
+                    out var returnedNextUsn);
+
+                batchesRead++;
+
+                if (returnedNextUsn <= nextUsn)
+                {
+                    break;
+                }
+
+                foreach (var record in records)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if ((record.Reason & UsnReasonFileDelete) == 0 ||
+                        (record.FileAttributes & FileAttributeDirectory) != 0 ||
+                        string.IsNullOrWhiteSpace(record.FileName) ||
+                        !pendingByName.TryGetValue(record.FileName, out var nameTargets))
+                    {
+                        continue;
+                    }
+
+                    var targetMatches = nameTargets
+                        .Where(target =>
+                            target.DeletedAtUtc == default ||
+                            Math.Abs((record.TimestampUtc - target.DeletedAtUtc).TotalMinutes) <= 5)
+                        .ToList();
+
+                    if (targetMatches.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var directory = ResolveParentDirectory(
+                        volumeHandle,
+                        record.ParentFileReferenceNumber);
+
+                    if (string.IsNullOrWhiteSpace(directory))
+                    {
+                        continue;
+                    }
+
+                    var candidatePath = NormalizePath(
+                        Path.Combine(directory, record.FileName));
+
+                    var matchedTarget = targetMatches
+                        .Select(target => new
+                        {
+                            Target = target,
+                            DeltaMinutes = target.DeletedAtUtc == default
+                                ? 0
+                                : Math.Abs((record.TimestampUtc - target.DeletedAtUtc).TotalMinutes)
+                        })
+                        .Where(item =>
+                            string.Equals(
+                                item.Target.FullPath,
+                                candidatePath,
+                                StringComparison.OrdinalIgnoreCase))
+                        .OrderBy(item => item.DeltaMinutes)
+                        .Select(item => item.Target)
+                        .FirstOrDefault();
+
+                    if (string.IsNullOrWhiteSpace(matchedTarget.FullPath))
+                    {
+                        continue;
+                    }
+
+                    results.Add(
+                        new HistoricalUsnResolution(
+                            matchedTarget.FullPath,
+                            record.FileReferenceNumber,
+                            record.ParentFileReferenceNumber,
+                            record.TimestampUtc));
+
+                    nameTargets.Remove(matchedTarget);
+
+                    if (nameTargets.Count == 0)
+                    {
+                        pendingByName.Remove(record.FileName);
+                    }
+
+                    remainingTargets--;
+
+                    _parentPathCaches.GetOrAdd(
+                        volumeKey,
+                        _ => new ConcurrentDictionary<ulong, string>())
+                        [record.ParentFileReferenceNumber] = directory;
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"Historical USN match: target={matchedTarget.FullPath}, " +
+                        $"fileRef={record.FileReferenceNumber}, " +
+                        $"parentRef={record.ParentFileReferenceNumber}, " +
+                        $"deleteTime={record.TimestampUtc:O}.");
+
+                    if (remainingTargets == 0)
+                    {
+                        break;
+                    }
+                }
+
+                nextUsn = returnedNextUsn;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"Historical USN lookup complete: volume={volumeKey}, " +
+                $"resolved={volumeGroup.Count() - remainingTargets:N0}, " +
+                $"unresolved={remainingTargets:N0}, batches={batchesRead:N0}.");
+        }
+
+        return results;
+    }
+
+    public IReadOnlyList<UsnDeletedFileRecord> GetRecentDeletedFiles(
+        string targetDirectory,
+        bool includeSubdirectories,
+        TimeSpan maxAge)
+    {
+        var normalizedDirectory = NormalizePath(targetDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar);
+        var cutoffUtc = DateTime.UtcNow - maxAge;
+
+        return _recentDeletedRecords
+            .Where(record =>
+                record.TimestampUtc >= cutoffUtc &&
+                !string.IsNullOrWhiteSpace(record.DirectoryPath))
+            .Select(record =>
+            {
+                var fullPath = Path.Combine(
+                    record.DirectoryPath!,
+                    record.FileName);
+
+                return new UsnDeletedFileRecord(
+                    NormalizePath(fullPath),
+                    record.FileReferenceNumber,
+                    record.ParentFileReferenceNumber,
+                    record.FileName,
+                    record.DirectoryPath!,
+                    record.TimestampUtc);
+            })
+            .Where(record =>
+                MatchesDirectory(
+                    record.DirectoryPath,
+                    normalizedDirectory,
+                    includeSubdirectories))
+            .OrderByDescending(record => record.DeletedAtUtc)
+            .ToList();
+    }
+
+    private bool TryResolveFreshDeletedFileFromJournalTail(
+        string fullPath,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        if (TryResolveCachedRecentDeletedFile(
+                fullPath,
+                deletedAtUtc,
+                out fileReferenceNumber,
+                out parentFileReferenceNumber))
+        {
+            return true;
+        }
+
+        if (!IsAdministrator())
+        {
+            return false;
+        }
+
+        var root = Path.GetPathRoot(fullPath);
+        if (string.IsNullOrWhiteSpace(root) ||
+            !string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        using var volumeHandle = CreateFile(
+            $@"\\.\{volumeKey[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (volumeHandle.IsInvalid ||
+            !TryQueryJournal(volumeHandle, out var journal, out _))
+        {
+            return false;
+        }
+
+        // FSCTL_ENUM_USN_DATA enumerates current MFT records. A file that has
+        // already been deleted may therefore be absent even though its deletion
+        // is present in the USN journal. For the live snapshot path, read the
+        // actual USN journal using a cursor returned by a prior successful journal
+        // read. USNs are record sequence numbers, not byte offsets; subtracting
+        // an arbitrary recent-window size from NextUsn can land between records
+        // and cause FSCTL_READ_USN_JOURNAL to fail with ERROR_INVALID_PARAMETER.
+        const long maximumRecentBacklog = 1_000_000;
+        var lowUsn = journal.NextUsn;
+
+        if (_settings.UsnCursors.TryGetValue(volumeKey, out var savedCursor) &&
+            savedCursor.JournalId == journal.JournalId &&
+            savedCursor.NextUsn >= journal.FirstUsn &&
+            savedCursor.NextUsn >= journal.LowestValidUsn &&
+            savedCursor.NextUsn <= journal.NextUsn &&
+            journal.NextUsn - savedCursor.NextUsn <= maximumRecentBacklog)
+        {
+            // This is the exact continuation USN returned by FSCTL_READ_USN_JOURNAL,
+            // so it is a real journal cursor, not an estimated byte-range boundary.
+            lowUsn = savedCursor.NextUsn;
+        }
+
+        var normalizedTarget = NormalizePath(fullPath);
+        var targetFileName = Path.GetFileName(normalizedTarget);
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS live deletion snapshot: journal tail start={lowUsn}, " +
+            $"high={journal.NextUsn}, target={normalizedTarget}.");
+
+        var fallbackMatches = new List<(UsnRecord Record, string? Directory, double DeltaMinutes, bool IsFileDelete)>();
+
+        var nextUsn = lowUsn;
+        const int maxBatches = 64;
+
+        for (var batch = 0;
+             batch < maxBatches && nextUsn < journal.NextUsn;
+             batch++)
+        {
+            List<UsnRecord> records;
+            long returnedNextUsn;
+
+            try
+            {
+                records = ReadRecords(
+                    volumeHandle,
+                    journal.JournalId,
+                    nextUsn,
+                    out returnedNextUsn,
+                    UsnReasonFileDelete | UsnReasonRenameOldName);
+            }
+            catch (Win32Exception ex) when (ex.NativeErrorCode == 87)
+            {
+                // If Windows rejects even the saved monitor cursor, do not retry a
+                // fabricated numeric tail. Leave the read loop and use the bounded
+                // FSCTL_ENUM_USN_DATA fallback below.
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS live deletion snapshot: READ_USN_JOURNAL rejected cursor; " +
+                    $"falling back to bounded FSCTL_ENUM_USN_DATA. " +
+                    $"path={normalizedTarget}, startUsn={nextUsn}, journalNext={journal.NextUsn}, " +
+                    $"journalId={journal.JournalId}.");
+                break;
+            }
+
+            if (returnedNextUsn <= nextUsn)
+            {
+                break;
+            }
+
+            foreach (var record in records)
+            {
+                var isFileDelete =
+                    (record.Reason & UsnReasonFileDelete) != 0;
+                var isRenameOldName =
+                    (record.Reason & UsnReasonRenameOldName) != 0;
+
+                if ((!isFileDelete && !isRenameOldName) ||
+                    (record.FileAttributes & FileAttributeDirectory) != 0 ||
+                    !string.Equals(
+                        record.FileName,
+                        targetFileName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var timestampDeltaMinutes = deletedAtUtc == default
+                    ? 0
+                    : Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes);
+
+                if (deletedAtUtc != default &&
+                    timestampDeltaMinutes > 5)
+                {
+                    continue;
+                }
+
+                var directory = ResolveParentDirectory(
+                    volumeHandle,
+                    record.ParentFileReferenceNumber);
+
+                if (!string.IsNullOrWhiteSpace(directory))
+                {
+                    var candidatePath = NormalizePath(
+                        Path.Combine(directory, record.FileName));
+
+                    if (!string.Equals(
+                            candidatePath,
+                            normalizedTarget,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    fileReferenceNumber = record.FileReferenceNumber;
+                    parentFileReferenceNumber = record.ParentFileReferenceNumber;
+
+                    _recentDeletedRecords.Enqueue(
+                        new RecentDeletedRecord(
+                            fileReferenceNumber,
+                            parentFileReferenceNumber,
+                            record.FileName,
+                            directory,
+                            record.TimestampUtc));
+
+                    while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+                           _recentDeletedRecords.TryDequeue(out _))
+                    {
+                    }
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"NTFS live deletion snapshot: matched USN tail record " +
+                        $"path={candidatePath}, fileRef={fileReferenceNumber}, " +
+                        $"parentRef={parentFileReferenceNumber}, " +
+                        $"reason=0x{record.Reason:X8}, " +
+                        $"source={(isFileDelete ? "FileDelete" : "RenameOldName")}, " +
+                        $"usnTime={record.TimestampUtc:O}, " +
+                        $"deltaMinutes={timestampDeltaMinutes:0.###}.");
+
+                    return true;
+                }
+
+                // When the parent MFT record cannot be opened, retain a
+                // filename/timestamp candidate. This is particularly important
+                // for the RENAME_OLD_NAME record generated when Explorer moves
+                // a file into the Recycle Bin. Do not accept it immediately:
+                // only a single unambiguous candidate may be used as fallback.
+                fallbackMatches.Add(
+                    (record, null, timestampDeltaMinutes, isFileDelete));
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS live deletion snapshot: parent path unavailable for " +
+                    $"same-name USN candidate, fileRef={record.FileReferenceNumber}, " +
+                    $"parentRef={record.ParentFileReferenceNumber}, " +
+                    $"reason=0x{record.Reason:X8}, " +
+                    $"source={(isFileDelete ? "FileDelete" : "RenameOldName")}, " +
+                    $"usnTime={record.TimestampUtc:O}, " +
+                    $"deltaMinutes={timestampDeltaMinutes:0.###}.");
+            }
+
+            nextUsn = returnedNextUsn;
+        }
+
+        if (fallbackMatches.Count == 1)
+        {
+            var match = fallbackMatches[0].Record;
+            fileReferenceNumber = match.FileReferenceNumber;
+            parentFileReferenceNumber = match.ParentFileReferenceNumber;
+
+            _recentDeletedRecords.Enqueue(
+                new RecentDeletedRecord(
+                    fileReferenceNumber,
+                    parentFileReferenceNumber,
+                    match.FileName,
+                    null,
+                    match.TimestampUtc));
+
+            while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+                   _recentDeletedRecords.TryDequeue(out _))
+            {
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: accepted unique same-name USN fallback " +
+                $"fileRef={fileReferenceNumber}, parentRef={parentFileReferenceNumber}, " +
+                $"reason=0x{match.Reason:X8}, " +
+                $"source={(fallbackMatches[0].IsFileDelete ? "FileDelete" : "RenameOldName")}, " +
+                $"usnTime={match.TimestampUtc:O}, " +
+                $"deltaMinutes={fallbackMatches[0].DeltaMinutes:0.###}.");
+
+            return true;
+        }
+
+        if (fallbackMatches.Count > 1)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: rejected ambiguous same-name USN fallback " +
+                $"candidates={fallbackMatches.Count}, target={normalizedTarget}.");
+        }
+
+        // Match the proven recovery-time fallback: FSCTL_ENUM_USN_DATA accepts
+        // a LowUsn/HighUsn filter range, unlike READ_USN_JOURNAL's StartUsn, so a
+        // recent numeric boundary is safe here. It also lets this live-snapshot
+        // resolver try a bounded lookup when the monitor cursor has already reached
+        // the journal tail, without inventing a READ_USN_JOURNAL start position.
+        const long enumRecentUsnWindow = 10_000_000;
+        var enumLowUsn = Math.Max(journal.FirstUsn, journal.NextUsn - enumRecentUsnWindow);
+
+        if (TryResolveRecentUsnEnumData(
+                volumeHandle,
+                volumeKey,
+                enumLowUsn,
+                journal.NextUsn,
+                normalizedTarget,
+                deletedAtUtc,
+                out fileReferenceNumber,
+                out parentFileReferenceNumber))
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS live deletion snapshot: bounded FSCTL_ENUM_USN_DATA fallback matched " +
+                $"path={normalizedTarget}, fileRef={fileReferenceNumber}, " +
+                $"parentRef={parentFileReferenceNumber}, lowUsn={enumLowUsn}, highUsn={journal.NextUsn}.");
+            return true;
+        }
+
+        System.Diagnostics.Debug.WriteLine(
+            $"NTFS live deletion snapshot: journal tail and bounded enum search found no uniquely matching delete " +
+            $"for path={normalizedTarget}, start={lowUsn}, enumLow={enumLowUsn}, high={journal.NextUsn}.");
+
+        return false;
+    }
+
+    public bool TryResolveRecentDeletedFileBounded(
+        string fullPath,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        if (TryResolveCachedRecentDeletedFile(
+                fullPath,
+                deletedAtUtc,
+                out fileReferenceNumber,
+                out parentFileReferenceNumber))
+        {
+            return true;
+        }
+
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        if (!IsAdministrator())
+        {
+            return false;
+        }
+
+        var root = Path.GetPathRoot(fullPath);
+        if (string.IsNullOrWhiteSpace(root) ||
+            !string.Equals(
+                new DriveInfo(root).DriveFormat,
+                "NTFS",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        using var volumeHandle = CreateFile(
+            $@"\\.\{volumeKey[..2]}",
+            GenericRead,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics,
+            IntPtr.Zero);
+
+        if (volumeHandle.IsInvalid ||
+            !TryQueryJournal(volumeHandle, out var journal, out _))
+        {
+            return false;
+        }
+
+        var normalizedTarget = NormalizePath(fullPath);
+
+        // READ_USN_JOURNAL requires StartUsn to identify a journal position;
+        // it is not safe to manufacture a recent USN by subtracting from
+        // NextUsn. Use the monitor's actual cursor when it is a valid journal
+        // position, then fall back to bounded FSCTL_ENUM_USN_DATA over the
+        // recent USN range if the monitor cursor has already reached the tail.
+        var searchStart = journal.FirstUsn;
+
+        if (_settings.UsnCursors.TryGetValue(volumeKey, out var cursor) &&
+            cursor.JournalId == journal.JournalId &&
+            cursor.NextUsn >= journal.FirstUsn &&
+            cursor.NextUsn <= journal.NextUsn)
+        {
+            searchStart = cursor.NextUsn;
+        }
+
+        if (searchStart < journal.NextUsn)
+        {
+            var nextUsn = searchStart;
+            const int maxBatches = 8;
+
+            for (var batch = 0;
+                 batch < maxBatches &&
+                 nextUsn < journal.NextUsn;
+                 batch++)
+            {
+                var records = ReadRecords(
+                    volumeHandle,
+                    journal.JournalId,
+                    nextUsn,
+                    out var returnedNextUsn);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"Bounded USN lookup: target={normalizedTarget}, batch={batch + 1}, " +
+                    $"start={nextUsn}, journalNext={journal.NextUsn}, " +
+                    $"records={records.Count}, returnedNext={returnedNextUsn}.");
+
+                if (returnedNextUsn <= nextUsn)
+                {
+                    break;
+                }
+
+                foreach (var record in records)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"Bounded USN record: file={record.FileName}, " +
+                        $"fileRef={record.FileReferenceNumber}, " +
+                        $"parentRef={record.ParentFileReferenceNumber}, " +
+                        $"reason=0x{record.Reason:X8}, " +
+                        $"attributes=0x{record.FileAttributes:X8}, " +
+                        $"usnTime={record.TimestampUtc:O}, " +
+                        $"historyTime={deletedAtUtc:O}, " +
+                        $"target={normalizedTarget}.");
+
+                    if (TryMatchDeletedRecord(
+                            volumeHandle,
+                            volumeKey,
+                            record,
+                            normalizedTarget,
+                            deletedAtUtc,
+                            out fileReferenceNumber,
+                            out parentFileReferenceNumber))
+                    {
+                        return true;
+                    }
+                }
+
+                nextUsn = returnedNextUsn;
+            }
+        }
+
+        // The recovery-time bounded lookup is read-only with respect to the
+        // monitor cursor. If the background worker already consumed the journal
+        // tail, enumerate only the recent USN range without inventing a StartUsn.
+        const long recentUsnWindow = 10_000_000;
+        var lowUsn = Math.Max(
+            journal.FirstUsn,
+            journal.NextUsn - recentUsnWindow);
+
+        return TryResolveRecentUsnEnumData(
+            volumeHandle,
+            volumeKey,
+            lowUsn,
+            journal.NextUsn,
+            normalizedTarget,
+            deletedAtUtc,
+            out fileReferenceNumber,
+            out parentFileReferenceNumber);
+    }
+
+    private bool TryMatchDeletedRecord(
+        SafeFileHandle volumeHandle,
+        string volumeKey,
+        UsnRecord record,
+        string normalizedTarget,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        if ((record.Reason & UsnReasonFileDelete) == 0 ||
+            (record.FileAttributes & FileAttributeDirectory) != 0 ||
+            string.IsNullOrWhiteSpace(record.FileName))
+        {
+            return false;
+        }
+
+        var timestampDeltaMinutes = deletedAtUtc == default
+            ? 0
+            : Math.Abs((record.TimestampUtc - deletedAtUtc).TotalMinutes);
+
+        if (deletedAtUtc != default &&
+            timestampDeltaMinutes > 5)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"USN delete rejected by timestamp: name={record.FileName}, " +
+                $"usnTime={record.TimestampUtc:O}, historyTime={deletedAtUtc:O}, " +
+                $"deltaMinutes={timestampDeltaMinutes:0.###}, " +
+                $"target={normalizedTarget}.");
+            return false;
+        }
+
+        var cache = _parentPathCaches.GetOrAdd(
+            volumeKey,
+            _ => new ConcurrentDictionary<ulong, string>());
+
+        var directory = cache.TryGetValue(
+            record.ParentFileReferenceNumber,
+            out var knownPath)
+            ? knownPath
+            : ResolveParentDirectory(
+                volumeHandle,
+                record.ParentFileReferenceNumber);
+
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            cache[record.ParentFileReferenceNumber] = directory;
+        }
+
+        var targetFileName = Path.GetFileName(normalizedTarget);
+
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"USN delete parent path unavailable: name={record.FileName}, " +
+                $"parentRef={record.ParentFileReferenceNumber}, target={normalizedTarget}.");
+
+            if (!string.Equals(
+                    record.FileName,
+                    targetFileName,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"USN delete rejected by filename: record={record.FileName}, targetName={targetFileName}.");
+                return false;
+            }
+        }
+        else
+        {
+            var candidatePath = NormalizePath(
+                Path.Combine(directory, record.FileName));
+
+            var pathMatches = string.Equals(
+                candidatePath,
+                normalizedTarget,
+                StringComparison.OrdinalIgnoreCase);
+
+            System.Diagnostics.Debug.WriteLine(
+                $"USN delete candidate: name={record.FileName}, parentRef={record.ParentFileReferenceNumber}, " +
+                $"directory={directory}, candidate={candidatePath}, target={normalizedTarget}, " +
+                $"timestampDeltaMinutes={timestampDeltaMinutes:0.###}, pathMatches={pathMatches}.");
+
+            if (!pathMatches)
+            {
+                return false;
+            }
+        }
+
+        fileReferenceNumber = record.FileReferenceNumber;
+        parentFileReferenceNumber = record.ParentFileReferenceNumber;
+
+        _recentDeletedRecords.Enqueue(
+            new RecentDeletedRecord(
+                fileReferenceNumber,
+                parentFileReferenceNumber,
+                record.FileName,
+                directory,
+                record.TimestampUtc));
+
+        while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+               _recentDeletedRecords.TryDequeue(out _))
+        {
+        }
+
+        return true;
+    }
+
+    private bool TryMatchEnumeratedRecord(
+        SafeFileHandle volumeHandle,
+        string volumeKey,
+        ulong recordFileReferenceNumber,
+        ulong recordParentFileReferenceNumber,
+        uint reason,
+        uint fileAttributes,
+        DateTime timestampUtc,
+        string fileName,
+        string normalizedTarget,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        if ((reason & UsnReasonFileDelete) == 0 ||
+            (fileAttributes & FileAttributeDirectory) != 0 ||
+            string.IsNullOrWhiteSpace(fileName))
+        {
+            return false;
+        }
+
+        if (deletedAtUtc != default &&
+            Math.Abs((timestampUtc - deletedAtUtc).TotalMinutes) > 5)
+        {
+            return false;
+        }
+
+        // FSCTL_ENUM_USN_DATA is an MFT enumeration. Its returned USN record
+        // does not carry the change-journal Reason/TimeStamp fields, so this
+        // matcher must use identity/path data only.
+        if ((fileAttributes & FileAttributeDirectory) != 0 ||
+            string.IsNullOrWhiteSpace(fileName))
+        {
+            return false;
+        }
+
+        var cache = _parentPathCaches.GetOrAdd(
+            volumeKey,
+            _ => new ConcurrentDictionary<ulong, string>());
+
+        var directory = cache.TryGetValue(
+            recordParentFileReferenceNumber,
+            out var knownPath)
+            ? knownPath
+            : ResolveParentDirectory(
+                volumeHandle,
+                recordParentFileReferenceNumber);
+
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            cache[recordParentFileReferenceNumber] = directory;
+        }
+
+        var pathMatches = !string.IsNullOrWhiteSpace(directory) &&
+            string.Equals(
+                NormalizePath(Path.Combine(directory, fileName)),
+                normalizedTarget,
+                StringComparison.OrdinalIgnoreCase);
+
+        var fileNameMatches = string.Equals(
+            fileName,
+            Path.GetFileName(normalizedTarget),
+            StringComparison.OrdinalIgnoreCase);
+
+        if (!pathMatches && !fileNameMatches)
+        {
+            return false;
+        }
+
+        fileReferenceNumber = recordFileReferenceNumber;
+        parentFileReferenceNumber = recordParentFileReferenceNumber;
+
+        System.Diagnostics.Debug.WriteLine(
+            $"USN enum recovery match: name={fileName}, fileRef={recordFileReferenceNumber}, " +
+            $"parentRef={recordParentFileReferenceNumber}, reason=0x{reason:X8}, " +
+            $"pathMatched={pathMatches}.");
+
+        _recentDeletedRecords.Enqueue(
+            new RecentDeletedRecord(
+                fileReferenceNumber,
+                parentFileReferenceNumber,
+                fileName,
+                directory,
+                DateTime.UtcNow));
+
+        while (_recentDeletedRecords.Count > RecentDeletedRecordLimit &&
+               _recentDeletedRecords.TryDequeue(out _))
+        {
+        }
+
+        return true;
+    }
+
+    private bool TryResolveRecentUsnEnumData(
+        SafeFileHandle volumeHandle,
+        string volumeKey,
+        long lowUsn,
+        long highUsn,
+        string normalizedTarget,
+        DateTime deletedAtUtc,
+        out ulong fileReferenceNumber,
+        out ulong parentFileReferenceNumber)
+    {
+        fileReferenceNumber = 0;
+        parentFileReferenceNumber = 0;
+
+        if (lowUsn >= highUsn)
+        {
+            return false;
+        }
+
+        ulong startFileReferenceNumber = 0;
+        const int maxPages = 32;
+        var recordsSeen = 0L;
+        var targetNameMatches = 0L;
+
+        for (var page = 0; page < maxPages; page++)
+        {
+            var request = new MftEnumDataV0
+            {
+                StartFileReferenceNumber = startFileReferenceNumber,
+                LowUsn = lowUsn,
+                HighUsn = highUsn
+            };
+
+            var input = StructureToBytes(request);
+            var output = new byte[1024 * 1024];
+
+            if (!DeviceIoControl(
+                    volumeHandle,
+                    FsctlEnumUsnData,
+                    input,
+                    (uint)input.Length,
+                    output,
+                    (uint)output.Length,
+                    out var bytesReturned,
+                    IntPtr.Zero))
+            {
+                var error = Marshal.GetLastWin32Error();
+
+                if (error == ErrorHandleEof)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"Bounded USN enum reached EOF normally: page={page + 1}, " +
+                        $"recordsSeen={recordsSeen:N0}, targetNameMatches={targetNameMatches:N0}, " +
+                        $"lowUsn={lowUsn}, highUsn={highUsn}.");
+                    return false;
+                }
+
+                if (error == ErrorJournalDeleteInProgress ||
+                    error == ErrorJournalNotActive ||
+                    error == ErrorJournalEntryDeleted)
+                {
+                    return false;
+                }
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"Bounded USN enum fallback failed: error={error}, page={page + 1}, " +
+                    $"recordsSeen={recordsSeen:N0}, targetNameMatches={targetNameMatches:N0}, " +
+                    $"lowUsn={lowUsn}, highUsn={highUsn}.");
+                return false;
+            }
+
+            if (bytesReturned < sizeof(ulong))
+            {
+                return false;
+            }
+
+            var nextStart = BinaryPrimitives.ReadUInt64LittleEndian(
+                output.AsSpan(0, 8));
+
+            var offset = 8;
+
+            while (offset + 4 <= bytesReturned)
+            {
+                var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                    output.AsSpan(offset, 4));
+
+                if (recordLength < UsnRecordV2MinimumLength ||
+                    recordLength > bytesReturned - offset)
+                {
+                    break;
+                }
+
+                var recordSpan = output.AsSpan(
+                    offset,
+                    checked((int)recordLength));
+
+                var majorVersion = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(4, 2));
+
+                if (majorVersion == 2)
+                {
+                    var recordFileReferenceNumber =
+                        BinaryPrimitives.ReadUInt64LittleEndian(
+                            recordSpan.Slice(8, 8));
+                    var recordParentFileReferenceNumber =
+                        BinaryPrimitives.ReadUInt64LittleEndian(
+                            recordSpan.Slice(16, 8));
+                    var timestampFileTime =
+                        BinaryPrimitives.ReadInt64LittleEndian(
+                            recordSpan.Slice(32, 8));
+                    var reason =
+                        BinaryPrimitives.ReadUInt32LittleEndian(
+                            recordSpan.Slice(40, 4));
+                    var fileAttributes =
+                        BinaryPrimitives.ReadUInt32LittleEndian(
+                            recordSpan.Slice(52, 4));
+                    var nameLength =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            recordSpan.Slice(56, 2));
+                    var nameOffset =
+                        BinaryPrimitives.ReadUInt16LittleEndian(
+                            recordSpan.Slice(58, 2));
+
+                    if (nameOffset + nameLength <= recordSpan.Length)
+                    {
+                        _ = timestampFileTime;
+
+                        var name = System.Text.Encoding.Unicode.GetString(
+                            recordSpan.Slice(nameOffset, nameLength));
+
+                        recordsSeen++;
+
+                        if (string.Equals(
+                                name,
+                                Path.GetFileName(normalizedTarget),
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            targetNameMatches++;
+                        }
+
+                        DateTime timestampUtc;
+                        try
+                        {
+                            timestampUtc = DateTime.FromFileTimeUtc(timestampFileTime);
+                        }
+                        catch
+                        {
+                            timestampUtc = DateTime.MinValue;
+                        }
+
+                        if (TryMatchEnumeratedRecord(
+                                volumeHandle,
+                                volumeKey,
+                                recordFileReferenceNumber,
+                                recordParentFileReferenceNumber,
+                                reason,
+                                fileAttributes,
+                                timestampUtc,
+                                name,
+                                normalizedTarget,
+                                deletedAtUtc,
+                                out fileReferenceNumber,
+                                out parentFileReferenceNumber))
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                offset += checked((int)recordLength);
+            }
+
+            if (nextStart <= startFileReferenceNumber)
+            {
+                break;
+            }
+
+            startFileReferenceNumber = nextStart;
+
+            if (bytesReturned <= sizeof(ulong))
+            {
+                break;
+            }
+        }
+
+        System.Diagnostics.Debug.WriteLine(
+            $"Bounded USN enum exhausted page limit: pages={maxPages}, " +
+            $"recordsSeen={recordsSeen:N0}, targetNameMatches={targetNameMatches:N0}, " +
+            $"lowUsn={lowUsn}, highUsn={highUsn}.");
+
+        return false;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MftEnumDataV0
+    {
+        public ulong StartFileReferenceNumber;
+        public long LowUsn;
+        public long HighUsn;
+    }
+
+    private static string NormalizePath(string path) =>
+        path.Trim().Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+
     private static List<UsnRecord> ReadRecords(
         SafeFileHandle volumeHandle,
         ulong journalId,
         long startUsn,
-        out long nextUsn)
+        out long nextUsn,
+        uint reasonMask = UsnReasonFileDelete)
     {
+        // Use the V0 NTFS input layout. Modern NTFS volumes can return
+        // USN_RECORD_V3 records with 128-bit file IDs.
         var request = new ReadUsnJournalRequest
         {
             StartUsn = startUsn,
-            ReasonMask = UsnReasonFileDelete,
+            ReasonMask = reasonMask,
             ReturnOnlyOnClose = 0,
-            Timeout = 1,
-            BytesToWaitFor = 1,
-            UsnJournalId = journalId,
-            MinMajorVersion = 2,
-            MaxMajorVersion = 2
+            Timeout = 0,
+            BytesToWaitFor = 0,
+            UsnJournalId = journalId
         };
 
         var input = StructureToBytes(request);
@@ -308,12 +3062,16 @@ public sealed class UsnJournalMonitor : IDisposable
         {
             var error = Marshal.GetLastWin32Error();
 
-            if (error == ErrorJournalEntryDeleted)
+            if (error == ErrorJournalDeleteInProgress ||
+                error == ErrorJournalNotActive ||
+                error == ErrorJournalEntryDeleted)
             {
                 return [];
             }
 
-            throw new Win32Exception(error);
+            throw new Win32Exception(
+                error,
+                $"FSCTL_READ_USN_JOURNAL failed (error {error}) at USN {startUsn} for journal {journalId}.");
         }
 
         if (bytesReturned < sizeof(long))
@@ -321,59 +3079,138 @@ public sealed class UsnJournalMonitor : IDisposable
             return [];
         }
 
-        nextUsn = BinaryPrimitives.ReadInt64LittleEndian(output.AsSpan(0, 8));
+        nextUsn = BinaryPrimitives.ReadInt64LittleEndian(
+            output.AsSpan(0, 8));
 
         var records = new List<UsnRecord>();
         var offset = 8;
 
         while (offset + 4 <= bytesReturned)
         {
-            var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(output.AsSpan(offset, 4));
+            var recordLength = BinaryPrimitives.ReadUInt32LittleEndian(
+                output.AsSpan(offset, 4));
+
             if (recordLength < UsnRecordV2MinimumLength ||
                 recordLength > bytesReturned - offset)
             {
                 break;
             }
 
-            var recordSpan = output.AsSpan(offset, checked((int)recordLength));
-            var majorVersion = BinaryPrimitives.ReadUInt16LittleEndian(recordSpan.Slice(4, 2));
-            if (majorVersion != 2)
+            var recordSpan = output.AsSpan(
+                offset,
+                checked((int)recordLength));
+
+            var majorVersion = BinaryPrimitives.ReadUInt16LittleEndian(
+                recordSpan.Slice(4, 2));
+
+            ulong fileReference;
+            ulong parentReference;
+            long timestampFileTime;
+            uint reason;
+            uint fileAttributes;
+            ushort nameLength;
+            ushort nameOffset;
+
+            if (majorVersion == 2)
+            {
+                // USN_RECORD_V2
+                fileReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(8, 8));
+
+                parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(16, 8));
+
+                timestampFileTime = BinaryPrimitives.ReadInt64LittleEndian(
+                    recordSpan.Slice(32, 8));
+
+                reason = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(40, 4));
+
+                fileAttributes = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(52, 4));
+
+                nameLength = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(56, 2));
+
+                nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(58, 2));
+            }
+            else if (majorVersion == 3)
+            {
+                // USN_RECORD_V3
+                //
+                // FileReferenceNumber and ParentFileReferenceNumber are
+                // FILE_ID_128 values. On this NTFS volume the traditional
+                // NTFS MFT reference is in the lower 64 bits.
+                if (recordSpan.Length < 76)
+                {
+                    offset += checked((int)recordLength);
+                    continue;
+                }
+
+                // NTFS places its traditional 64-bit MFT file reference in
+                // the first 8 bytes of each FILE_ID_128. The remaining 8 bytes
+                // are the high half of the 128-bit identifier.
+                fileReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(8, 8));
+
+                parentReference = BinaryPrimitives.ReadUInt64LittleEndian(
+                    recordSpan.Slice(24, 8));
+
+                timestampFileTime = BinaryPrimitives.ReadInt64LittleEndian(
+                    recordSpan.Slice(48, 8));
+
+                reason = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(56, 4));
+
+                fileAttributes = BinaryPrimitives.ReadUInt32LittleEndian(
+                    recordSpan.Slice(68, 4));
+
+                nameLength = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(72, 2));
+
+                nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(
+                    recordSpan.Slice(74, 2));
+            }
+            else
+            {
+                // USN_RECORD_V4 or an unknown future version.
+                // Do not guess its layout.
+                offset += checked((int)recordLength);
+                continue;
+            }
+
+            if (nameLength == 0 ||
+                nameOffset + nameLength > recordSpan.Length ||
+                (nameLength & 1) != 0)
             {
                 offset += checked((int)recordLength);
                 continue;
             }
 
-            var fileReference = BinaryPrimitives.ReadUInt64LittleEndian(recordSpan.Slice(8, 8));
-            var parentReference = BinaryPrimitives.ReadUInt64LittleEndian(recordSpan.Slice(16, 8));
-            var timestampFileTime = BinaryPrimitives.ReadInt64LittleEndian(recordSpan.Slice(32, 8));
-            var reason = BinaryPrimitives.ReadUInt32LittleEndian(recordSpan.Slice(40, 4));
-            var fileAttributes = BinaryPrimitives.ReadUInt32LittleEndian(recordSpan.Slice(52, 4));
-            var nameLength = BinaryPrimitives.ReadUInt16LittleEndian(recordSpan.Slice(56, 2));
-            var nameOffset = BinaryPrimitives.ReadUInt16LittleEndian(recordSpan.Slice(58, 2));
+            var name = System.Text.Encoding.Unicode.GetString(
+                recordSpan.Slice(nameOffset, nameLength));
 
-            if (nameOffset + nameLength <= recordSpan.Length)
+            DateTime timestampUtc;
+
+            try
             {
-                var name = System.Text.Encoding.Unicode.GetString(
-                    recordSpan.Slice(nameOffset, nameLength));
+                timestampUtc = DateTime.FromFileTimeUtc(
+                    timestampFileTime);
+            }
+            catch
+            {
+                timestampUtc = DateTime.UtcNow;
+            }
 
-                DateTime timestampUtc;
-                try
-                {
-                    timestampUtc = DateTime.FromFileTimeUtc(timestampFileTime);
-                }
-                catch
-                {
-                    timestampUtc = DateTime.UtcNow;
-                }
-
-                records.Add(new UsnRecord(
+            records.Add(
+                new UsnRecord(
                     fileReference,
                     parentReference,
                     reason,
                     fileAttributes,
                     name,
                     timestampUtc));
-            }
 
             offset += checked((int)recordLength);
         }
@@ -443,12 +3280,15 @@ public sealed class UsnJournalMonitor : IDisposable
 
     private static string NormalizeFinalPath(string path)
     {
-        if (path.StartsWith(@"\\?\\UNC\\", StringComparison.OrdinalIgnoreCase))
+        // GetFinalPathNameByHandle returns device-style paths such as
+        // "\\?\E:\TestRecovery". Convert them to ordinary Win32 paths so
+        // they compare correctly with FileSystemWatcher/history paths.
+        if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
         {
             return @"\\" + path[8..];
         }
 
-        if (path.StartsWith(@"\\?\\", StringComparison.OrdinalIgnoreCase))
+        if (path.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
         {
             return path[4..];
         }
@@ -500,14 +3340,36 @@ public sealed class UsnJournalMonitor : IDisposable
     public void Dispose()
     {
         Stop();
+        _historicalLogFileSnapshotGate.Dispose();
         _cts.Dispose();
     }
+
+public sealed record UsnDeletedFileRecord(
+    string FullPath,
+    ulong FileReferenceNumber,
+    ulong ParentFileReferenceNumber,
+    string FileName,
+    string DirectoryPath,
+    DateTime DeletedAtUtc);
+
+public sealed record HistoricalUsnResolution(
+    string FullPath,
+    ulong FileReferenceNumber,
+    ulong ParentFileReferenceNumber,
+    DateTime DeletedAtUtc);
 
     private readonly record struct JournalInfo(
         ulong JournalId,
         long FirstUsn,
         long NextUsn,
         long LowestValidUsn);
+
+    private readonly record struct RecentDeletedRecord(
+        ulong FileReferenceNumber,
+        ulong ParentFileReferenceNumber,
+        string FileName,
+        string? DirectoryPath,
+        DateTime TimestampUtc);
 
     private readonly record struct UsnRecord(
         ulong FileReferenceNumber,
@@ -518,6 +3380,13 @@ public sealed class UsnJournalMonitor : IDisposable
         DateTime TimestampUtc);
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct CreateUsnJournalData
+    {
+        public ulong MaximumSize;
+        public ulong AllocationDelta;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct ReadUsnJournalRequest
     {
         public long StartUsn;
@@ -526,8 +3395,6 @@ public sealed class UsnJournalMonitor : IDisposable
         public ulong Timeout;
         public ulong BytesToWaitFor;
         public ulong UsnJournalId;
-        public ushort MinMajorVersion;
-        public ushort MaxMajorVersion;
     }
 
     [StructLayout(LayoutKind.Explicit, Size = 24)]
