@@ -2858,10 +2858,13 @@ public sealed class NtfsMftDataReader
                 volumeInfo.RootPath,
                 overlapped: false);
 
-            // Recovery-time lookup is used for retained historical/pre-start
-            // references. Never fall back to a later reused MFT generation here:
-            // the current $DATA stream can belong to a different file incarnation.
-            const bool allowBoundedDeleteTransition = false;
+            // A deleted reference can already be one NTFS sequence behind the
+            // released MFT record. Permit only a single-step transition at recovery
+            // time; ReadDefaultDataStream still requires the record to be deleted,
+            // the exact filename and parent/path to match, and FILE_NAME timestamps
+            // not to be materially later than the USN deletion. Do not use the wider
+            // live-capture transition allowance for historical recovery.
+            const bool allowBoundedDeleteTransition = true;
 
             stream = ReadDefaultDataStream(
                 volumeInfo,
@@ -2871,7 +2874,8 @@ public sealed class NtfsMftDataReader
                 expectedParentFileReferenceNumber,
                 expectedFullPath,
                 expectedDeletedAtUtc,
-                allowBoundedDeleteTransition);
+                allowBoundedDeleteTransition,
+                maxBoundedDeleteSequenceAdvance: 1);
 
             System.Diagnostics.Debug.WriteLine(
                 $"NTFS recovery-time $DATA lookup: fileRef={fileReferenceNumber}, " +
@@ -5042,7 +5046,14 @@ public sealed class NtfsMftDataReader
                         : Math.Abs(
                             (modificationTimeUtc - expectedDeletedAtUtc).TotalMinutes);
 
-                timestampMatches = timestampDeltaMinutes <= 5;
+                // FILE_NAME.LastModificationTime normally predates deletion.
+                // Requiring it to be within five minutes of the delete event rejects
+                // ordinary files that simply have not been edited recently. Retain a
+                // bounded future-clock-skew check instead: timestamps far after the
+                // USN deletion are evidence of a reused MFT generation.
+                timestampMatches =
+                    modificationTimeUtc != DateTime.MinValue &&
+                    modificationTimeUtc <= expectedDeletedAtUtc.AddMinutes(5);
 
                 if (timestampMatches)
                 {
