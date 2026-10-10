@@ -3893,7 +3893,7 @@ public partial class Form1 : Form
                             bytesScanned =>
                             {
                                 lblStatus.Text =
-                                    $"NTFS extent read failed; searching free space for " +
+                                    $"NTFS extent read failed; searching disk data for " +
                                     $"{candidate.Name}... " +
                                     $"{bytesScanned / (1024d * 1024d):0} MB scanned";
                             });
