@@ -316,9 +316,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        // Prefer a verified copy made while the file still existed. If the cache
-        // has a matching source version, attach it before attempting post-delete MFT
-        // reads so recovery uses the preserved bytes.
+        // Prefer a verified copy made while the file still existed.
         if (e.Record.NtfsDataSnapshot?.IsComplete != true)
         {
             try
@@ -339,23 +337,45 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
         }
 
-        // FileSystemWatcher normally gives us the first live event, but the
-        // USN monitor can be the first/only source when the watcher buffer is busy.
-        // A fresh USN delete (known file reference and very recent timestamp) must
-        // receive the same deletion-time snapshot treatment without turning an old
-        // historical directory scan into hundreds of expensive captures.
         var isFreshUsnDelete =
             e.Record.FileReferenceNumber.HasValue &&
             e.Record.ParentFileReferenceNumber.HasValue &&
             e.Record.DeletedAtUtc != default &&
             Math.Abs((DateTime.UtcNow - e.Record.DeletedAtUtc).TotalSeconds) <= 30;
 
-        if ((!e.Historical && !e.Record.FileReferenceNumber.HasValue || isFreshUsnDelete) &&
-            !string.IsNullOrWhiteSpace(e.Record.FullPath) &&
-            e.Record.NtfsDataSnapshot?.IsComplete != true)
+        var shouldAttemptImmediateSnapshot =
+            (!e.Historical && !e.Record.FileReferenceNumber.HasValue) ||
+            isFreshUsnDelete;
+
+        var deletionPath = e.Record.FullPath;
+
+        var hasUsableAbsolutePath =
+            !string.IsNullOrWhiteSpace(deletionPath) &&
+            Path.IsPathFullyQualified(deletionPath) &&
+            !deletionPath.StartsWith(
+                "(Parent directory unavailable)",
+                StringComparison.OrdinalIgnoreCase);
+
+        var snapshotIsIncomplete =
+            e.Record.NtfsDataSnapshot?.IsComplete != true;
+
+        if (shouldAttemptImmediateSnapshot &&
+            snapshotIsIncomplete &&
+            !hasUsableAbsolutePath)
         {
             System.Diagnostics.Debug.WriteLine(
-                $"NTFS immediate live path triggered: path={e.Record.FullPath}, " +
+                "NTFS immediate live path retry skipped: unresolved or invalid path. " +
+                $"path={deletionPath}, " +
+                $"fileRef={e.Record.FileReferenceNumber?.ToString() ?? "(unknown)"}, " +
+                $"parentRef={e.Record.ParentFileReferenceNumber?.ToString() ?? "(unknown)"}, " +
+                $"historical={e.Historical}.");
+        }
+        else if (shouldAttemptImmediateSnapshot &&
+                 hasUsableAbsolutePath &&
+                 snapshotIsIncomplete)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"NTFS immediate live path triggered: path={deletionPath}, " +
                 $"historyTime={e.Record.DeletedAtUtc:O}, " +
                 $"historical={e.Historical}, " +
                 $"fileRef={e.Record.FileReferenceNumber?.ToString() ?? "(unknown)"}, " +

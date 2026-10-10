@@ -39,6 +39,10 @@ public sealed class UsnJournalMonitor : IDisposable
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _accessDeniedUntilUtc =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTime> _excludedVolumeLastCursorSaveUtc =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ulong> _excludedVolumeLoggedJournalIds =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<RecentDeletedRecord> _recentDeletedRecords = new();
     private const long DeleteSnapshotMaxBytes = 16L * 1024L * 1024L;
     private const long MaxStreamingDeleteSnapshotBytes = 2L * 1024 * 1024 * 1024;
@@ -650,6 +654,45 @@ public sealed class UsnJournalMonitor : IDisposable
             }
         }
 
+        // Skip record processing for an entirely ignored volume. Keep the cursor
+        // current in memory, but throttle persistence and trace logging.
+        if (RecoveryMonitoringExclusions.IsExcludedPath(drive.RootDirectory.FullName))
+        {
+            _settings.UsnCursors[volumeKey] = new VolumeJournalCursor
+            {
+                JournalId = journal.JournalId,
+                NextUsn = journal.NextUsn
+            };
+
+            var nowUtc = DateTime.UtcNow;
+            var shouldLog =
+                !_excludedVolumeLoggedJournalIds.TryGetValue(volumeKey, out var loggedJournalId) ||
+                loggedJournalId != journal.JournalId;
+
+            _excludedVolumeLoggedJournalIds[volumeKey] = journal.JournalId;
+
+            var shouldSave =
+                !_excludedVolumeLastCursorSaveUtc.TryGetValue(volumeKey, out var lastSaveUtc) ||
+                nowUtc - lastSaveUtc >= TimeSpan.FromMinutes(1);
+
+            if (shouldSave)
+            {
+                _settings.Save();
+                _excludedVolumeLastCursorSaveUtc[volumeKey] = nowUtc;
+            }
+
+            if (shouldLog)
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"USN monitor skipped excluded volume contents: " +
+                    $"volume={drive.RootDirectory.FullName}, cursor={journal.NextUsn}.");
+            }
+
+            return;
+        }
+
+        _excludedVolumeLastCursorSaveUtc.TryRemove(volumeKey, out _);
+        _excludedVolumeLoggedJournalIds.TryRemove(volumeKey, out _);
         var cache = _parentPathCaches.GetOrAdd(
             volumeKey,
             _ => new ConcurrentDictionary<ulong, string>());
