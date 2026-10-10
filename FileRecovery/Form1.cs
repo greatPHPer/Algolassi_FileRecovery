@@ -4267,14 +4267,20 @@ public partial class Form1 : Form
                         // Progress<T> posts updates back to the captured UI synchronization
                         // context. Run the actual volume scan in the background so the
                         // Recovery Center remains responsive during large-volume reads.
+                        var largeTextStreamingMode =
+                            candidate.FileSizeBytes > 64L * 1024L * 1024L;
+
                         IProgress<long> forensicProgress = new Progress<long>(bytesScanned =>
                         {
                             if (!IsDisposed)
                             {
-                                lblStatus.Text =
-                                    $"Forensic full-volume scan for {candidate.Name}... " +
-                                    $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
-                                    $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
+                                lblStatus.Text = largeTextStreamingMode
+                                    ? $"Searching free NTFS extents for start marker in {candidate.Name}... " +
+                                      $"volume position {bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
+                                      $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB"
+                                    : $"Forensic full-volume scan for {candidate.Name}... " +
+                                      $"{bytesScanned / (1024d * 1024d * 1024d):0.00} / " +
+                                      $"{totalVolumeBytes / (1024d * 1024d * 1024d):0.00} GB scanned";
                             }
                         });
 
