@@ -361,6 +361,11 @@ public sealed class NtfsDeepFileRecoveryService
         out RecoveryResult recovery)
     {
         recovery = null!;
+        if (bytesPerCluster <= 0 || freeExtentLength <= 0)
+        {
+            return false;
+        }
+
         var freeExtentEnd = checked(freeExtentStart + freeExtentLength);
         var searchFrom = 0;
 
@@ -369,7 +374,7 @@ public sealed class NtfsDeepFileRecoveryService
                    searchFrom,
                    out var signatureOffset,
                    out var signatureLength,
-                   out var detectedFormat))
+                   out _))
         {
             cancellationToken.ThrowIfCancellationRequested();
             searchFrom = signatureOffset + 1;
@@ -790,6 +795,109 @@ public sealed class NtfsDeepFileRecoveryService
             else if (headerType == 1)
             {
                 return false;
+            }
+
+            var extraAreaLength = checked((int)extraAreaSize);
+            var typeSpecificEnd = headerBody.Length - extraAreaLength;
+            if (typeSpecificEnd < headerPosition)
+            {
+                return false;
+            }
+
+            // Validate the minimum type-specific fields as well as the common
+            // block header. This greatly reduces the chance that bytes inside a
+            // compressed payload accidentally mimic an end-of-archive header.
+            var typeSpecificSpan = headerBody.AsSpan(0, typeSpecificEnd);
+            switch (headerType)
+            {
+                case 1:
+                    if (!TryReadRarVint(
+                            typeSpecificSpan,
+                            ref headerPosition,
+                            out var archiveFlags))
+                    {
+                        return false;
+                    }
+
+                    if ((archiveFlags & 0x0002) != 0 &&
+                        !TryReadRarVint(
+                            typeSpecificSpan,
+                            ref headerPosition,
+                            out _))
+                    {
+                        return false;
+                    }
+
+                    break;
+
+                case 2:
+                case 3:
+                    if (!TryReadRarVint(
+                            typeSpecificSpan,
+                            ref headerPosition,
+                            out var fileFlags) ||
+                        !TryReadRarVint(
+                            typeSpecificSpan,
+                            ref headerPosition,
+                            out _) ||
+                        !TryReadRarVint(
+                            typeSpecificSpan,
+                            ref headerPosition,
+                            out _))
+                    {
+                        return false;
+                    }
+
+                    if ((fileFlags & 0x0002) != 0)
+                    {
+                        if (headerPosition > typeSpecificSpan.Length - 4)
+                        {
+                            return false;
+                        }
+
+                        headerPosition += 4;
+                    }
+
+                    if ((fileFlags & 0x0004) != 0)
+                    {
+                        if (headerPosition > typeSpecificSpan.Length - 4)
+                        {
+                            return false;
+                        }
+
+                        headerPosition += 4;
+                    }
+
+                    if (!TryReadRarVint(
+                            typeSpecificSpan,
+                            ref headerPosition,
+                            out _) ||
+                        !TryReadRarVint(
+                            typeSpecificSpan,
+                            ref headerPosition,
+                            out _) ||
+                        !TryReadRarVint(
+                            typeSpecificSpan,
+                            ref headerPosition,
+                            out var nameLength) ||
+                        nameLength > (ulong)(typeSpecificSpan.Length - headerPosition))
+                    {
+                        return false;
+                    }
+
+                    headerPosition += checked((int)nameLength);
+                    break;
+
+                case 5:
+                    if (!TryReadRarVint(
+                            typeSpecificSpan,
+                            ref headerPosition,
+                            out _))
+                    {
+                        return false;
+                    }
+
+                    break;
             }
 
             if (headerType == 5)
