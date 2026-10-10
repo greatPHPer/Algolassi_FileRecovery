@@ -1418,6 +1418,57 @@ public sealed class UsnJournalMonitor : IDisposable
         ulong fileReferenceNumber,
         CancellationToken cancellationToken)
     {
+        var volumeKey = root.TrimEnd(Path.DirectorySeparatorChar);
+        var captureKey = $"{volumeKey}|{fileReferenceNumber:X16}";
+        var gateIndex =
+            (StringComparer.OrdinalIgnoreCase.GetHashCode(captureKey) & int.MaxValue) %
+            _snapshotCaptureGates.Length;
+
+        // The historical $LogFile capture must share the same identity lock as the
+        // MFT capture. Otherwise those two paths can read the released clusters at
+        // the same time and publish competing content for one deletion.
+        lock (_snapshotCaptureGates[gateIndex])
+        {
+            if (_completedSnapshotCache.TryGetValue(captureKey, out var cachedSnapshot))
+            {
+                deletion.NtfsDataSnapshot = cachedSnapshot.Clone();
+                deletion.FileSizeBytes = cachedSnapshot.FileSizeBytes;
+                deletion.RecoveryStrength = "Strong";
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS $LogFile snapshot reused: path={deletion.FullPath}, " +
+                    $"fileRef={fileReferenceNumber}, dataFile={cachedSnapshot.DataFileName}, " +
+                    $"sha256={cachedSnapshot.Sha256}.");
+                return true;
+            }
+
+            var success = TryCaptureHistoricalLogFileSnapshotCore(
+                deletion,
+                root,
+                fileReferenceNumber,
+                cancellationToken);
+
+            if (success && deletion.NtfsDataSnapshot?.IsComplete == true)
+            {
+                _completedSnapshotCache[captureKey] = deletion.NtfsDataSnapshot.Clone();
+                _completedSnapshotCacheOrder.Enqueue(captureKey);
+
+                while (_completedSnapshotCache.Count > CompletedSnapshotCacheLimit &&
+                       _completedSnapshotCacheOrder.TryDequeue(out var expiredKey))
+                {
+                    _completedSnapshotCache.TryRemove(expiredKey, out _);
+                }
+            }
+
+            return success;
+        }
+    }
+
+    private bool TryCaptureHistoricalLogFileSnapshotCore(
+        DeletionRecord deletion,
+        string root,
+        ulong fileReferenceNumber,
+        CancellationToken cancellationToken)
+    {
         try
         {
             var dataReader =
