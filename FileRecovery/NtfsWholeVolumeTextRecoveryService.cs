@@ -381,6 +381,75 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         var retainedSnapshot = candidate.NtfsDataSnapshot;
         var retainedExtentCount = retainedSnapshot?.DataExtents.Count ?? 0;
 
+        // The marker-driven recovery entry point can receive a history candidate
+        // without a snapshot object even though the exact historical MFT reference
+        // is available. Before refusing due to a missing handoff, make one bounded,
+        // identity-validated lookup of that exact deleted reference. This is a single
+        // MFT/runlist lookup, not another volume scan.
+        if (retainedExtentCount == 0 &&
+            candidate.FileReferenceNumber != 0 &&
+            candidate.ParentFileReferenceNumber != 0)
+        {
+            var directReader = new NtfsMftDataReader();
+            var directFound = directReader.TryReadDataStreamForDeletedReference(
+                candidate.FullPath,
+                candidate.FileReferenceNumber,
+                candidate.ParentFileReferenceNumber,
+                candidate.Name,
+                candidate.FullPath,
+                candidate.LastUsnTimestampUtc,
+                out var directStream);
+
+            if (directFound &&
+                directStream.Found &&
+                !directStream.IsResident &&
+                directStream.FileSizeBytes == expectedLength &&
+                directStream.ValidDataLengthBytes >= expectedLength &&
+                directStream.Extents.Count > 0)
+            {
+                candidate.NtfsDataSnapshot = new NtfsDeletionDataSnapshot
+                {
+                    DataCaptured = false,
+                    IsResident = false,
+                    FileSizeBytes = directStream.FileSizeBytes,
+                    ValidDataLengthBytes = directStream.ValidDataLengthBytes,
+                    CapturedByteCount = 0,
+                    DataExtents = directStream.Extents
+                        .Select(extent => new NtfsDataExtent
+                        {
+                            VirtualClusterNumber = extent.VirtualClusterNumber,
+                            ClusterCount = extent.ClusterCount,
+                            LogicalClusterNumber = extent.LogicalClusterNumber
+                        })
+                        .ToList(),
+                    CapturedAtUtc = DateTime.UtcNow,
+                    Evidence =
+                        "Recovery-time MFT lookup revalidated the exact deleted file reference, " +
+                        "filename, parent/path and timestamp; the retained $DATA runlist is " +
+                        "metadata only and has not yet been validated against marker bytes."
+                };
+
+                retainedSnapshot = candidate.NtfsDataSnapshot;
+                retainedExtentCount = retainedSnapshot.DataExtents.Count;
+
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS large text recovery-time runlist reattached: path={candidate.FullPath}, " +
+                    $"fileRef={candidate.FileReferenceNumber}, parentRef={candidate.ParentFileReferenceNumber}, " +
+                    $"size={directStream.FileSizeBytes:N0}, validDataLength={directStream.ValidDataLengthBytes:N0}, " +
+                    $"extents={retainedExtentCount:N0}, evidence={directStream.Evidence}.");
+            }
+            else
+            {
+                System.Diagnostics.Trace.WriteLine(
+                    $"NTFS large text recovery-time runlist lookup MISS: path={candidate.FullPath}, " +
+                    $"fileRef={candidate.FileReferenceNumber}, parentRef={candidate.ParentFileReferenceNumber}, " +
+                    $"found={directFound && directStream.Found}, resident={directStream.IsResident}, " +
+                    $"streamSize={directStream.FileSizeBytes:N0}, expectedSize={expectedLength:N0}, " +
+                    $"validDataLength={directStream.ValidDataLengthBytes:N0}, extents={directStream.Extents.Count:N0}, " +
+                    $"evidence={directStream.Evidence}.");
+            }
+        }
+
         System.Diagnostics.Trace.WriteLine(
             $"NTFS large text runlist decision: path={candidate.FullPath}, " +
             $"snapshotPresent={retainedSnapshot is not null}, " +
