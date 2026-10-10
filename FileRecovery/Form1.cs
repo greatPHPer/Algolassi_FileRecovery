@@ -4118,6 +4118,8 @@ public partial class Form1 : Form
                     // let the user provide its exact original byte length before marker recovery.
                     // This is necessary for large streaming recovery, which must know the exact
                     // copy length; an unknown length cannot be safely inferred from plain text.
+                    var userSuppliedOriginalSize = false;
+
                     if (candidate.FileSizeBytes <= 0)
                     {
                         var enteredSize = Microsoft.VisualBasic.Interaction.InputBox(
@@ -4145,11 +4147,73 @@ public partial class Form1 : Form
                             }
 
                             candidate.FileSizeBytes = suppliedSizeBytes;
+                            userSuppliedOriginalSize = true;
                             System.Diagnostics.Trace.WriteLine(
                                 $"NTFS user-supplied original TXT size: path={candidate.FullPath}, " +
                                 $"bytes={suppliedSizeBytes:N0}; size was supplied for experimental recovery " +
                                 "and is not independently verified by NTFS metadata.");
                         }
+                    }
+
+                    if (userSuppliedOriginalSize &&
+                        candidate.FileReferenceNumber != 0 &&
+                        candidate.ParentFileReferenceNumber != 0)
+                    {
+                        var suppliedSizeLogProgress =
+                            new Progress<string>(message =>
+                                SetBusy(true, message));
+
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS $LogFile historical recovery retry after user-supplied size: " +
+                            $"path={candidate.FullPath}, " +
+                            $"fileRef={candidate.FileReferenceNumber}, " +
+                            $"expectedSize={candidate.FileSizeBytes:N0}.");
+
+                        var suppliedSizeHistoricalLogResult =
+                            await Task.Run(
+                                () =>
+                                {
+                                    var recovered =
+                                        TryRecoverFromHistoricalLogFileData(
+                                            candidate,
+                                            destinationDirectory,
+                                            suppliedSizeLogProgress,
+                                            CancellationToken.None,
+                                            out var recoveryResult);
+
+                                    return (Recovered: recovered, Result: recoveryResult);
+                                },
+                                CancellationToken.None)
+                                .ConfigureAwait(true);
+
+                        if (suppliedSizeHistoricalLogResult.Recovered)
+                        {
+                            successes.Add(suppliedSizeHistoricalLogResult.Result);
+                            continue;
+                        }
+
+                        System.Diagnostics.Trace.WriteLine(
+                            $"NTFS $LogFile known-size retry produced no recovery: " +
+                            $"path={candidate.FullPath}, " +
+                            $"fileRef={candidate.FileReferenceNumber}, " +
+                            $"expectedSize={candidate.FileSizeBytes:N0}.");
+                    }
+
+                    var shouldRunSizeOnlyTextScan = true;
+
+                    if (userSuppliedOriginalSize)
+                    {
+                        shouldRunSizeOnlyTextScan =
+                            System.Windows.Forms.MessageBox.Show(
+                                "The targeted historical NTFS $LogFile retry did not recover this file.\r\n\r\n" +
+                                "The experimental exact-size scan reads every currently free NTFS cluster. " +
+                                "An exact-length text match does not prove the contents belong to this deleted file, " +
+                                "and the scan may take a long time.\r\n\r\n" +
+                                "Start the experimental scan?",
+                                "Experimental exact-size text scan",
+                                System.Windows.Forms.MessageBoxButtons.YesNo,
+                                System.Windows.Forms.MessageBoxIcon.Warning) ==
+                            System.Windows.Forms.DialogResult.Yes;
                     }
 
                     // Experimental fallback for larger plain-text files: before asking the
@@ -4163,7 +4227,8 @@ public partial class Form1 : Form
 
                     var sizeOnlyTextScanExhausted = false;
 
-                    if (candidate.FileSizeBytes >= minSizeOnlyTextCarveBytes &&
+                    if (shouldRunSizeOnlyTextScan &&
+                        candidate.FileSizeBytes >= minSizeOnlyTextCarveBytes &&
                         candidate.FileSizeBytes <= maxSizeOnlyTextCarveBytes)
                     {
                         IProgress<long> sizeOnlyTextProgress = new Progress<long>(bytesScanned =>
