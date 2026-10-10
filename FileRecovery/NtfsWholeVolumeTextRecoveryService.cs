@@ -614,6 +614,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             candidate.Name);
 
         var completedSuccessfully = false;
+        var destinationCreated = false;
         try
         {
             using var output = new FileStream(
@@ -623,6 +624,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 FileShare.None,
                 IoBufferSize,
                 FileOptions.SequentialScan);
+            destinationCreated = true;
 
             long consumed = 0;
             while (consumed < expectedLength)
@@ -694,7 +696,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         }
         finally
         {
-            if (!completedSuccessfully)
+            if (!completedSuccessfully && destinationCreated)
             {
                 TryDelete(destinationPath);
             }
