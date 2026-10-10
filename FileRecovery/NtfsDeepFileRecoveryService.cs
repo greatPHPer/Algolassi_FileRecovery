@@ -1136,7 +1136,7 @@ public sealed class NtfsDeepFileRecoveryService
         extension.Equals(".pptx", StringComparison.OrdinalIgnoreCase) ||
         extension.Equals(".txt", StringComparison.OrdinalIgnoreCase);
 
-    private static bool TryCarve(
+    internal static bool TryCarve(
         string extension,
         byte[] buffer,
         long knownFileSizeBytes,
