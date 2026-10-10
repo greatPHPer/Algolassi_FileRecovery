@@ -47,6 +47,15 @@ public sealed class UsnJournalMonitor : IDisposable
     // deletions must not start multiple 640 MB journal parses concurrently.
     private readonly SemaphoreSlim _historicalLogFileSnapshotGate = new(1, 1);
 
+    // Multiple live sources (USN, FileSystemWatcher and UI retries) can report the
+    // same NTFS deletion under different DeletionRecord IDs. Serialize by volume +
+    // exact NTFS file reference and reuse a completed snapshot rather than rereading
+    // freed clusters while Windows may already be reallocating them.
+    private readonly ConcurrentDictionary<string, object> _snapshotCaptureGates =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, NtfsDeletionDataSnapshot> _completedSnapshotCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
     private const int RecentDeletedRecordLimit = 512;
     // On startup, inspect only a small tail of retained USN history. This can
     // capture recent pre-start deletions whose exact MFT generation still exists,
@@ -929,6 +938,51 @@ public sealed class UsnJournalMonitor : IDisposable
     }
 
     private void CaptureNtfsDeletionSnapshot(
+        DeletionRecord deletion,
+        string volumeKey,
+        ulong fileReferenceNumber,
+        ulong parentFileReferenceNumber,
+        string fileName,
+        string directoryPath,
+        bool allowBoundedDeleteTransition = true,
+        int maxBoundedDeleteSequenceAdvance = 8)
+    {
+        var captureKey = $"{volumeKey}|{fileReferenceNumber:X16}";
+        var gate = _snapshotCaptureGates.GetOrAdd(captureKey, static _ => new object());
+
+        lock (gate)
+        {
+            if (_completedSnapshotCache.TryGetValue(captureKey, out var cachedSnapshot))
+            {
+                deletion.NtfsDataSnapshot = cachedSnapshot.Clone();
+                deletion.FileSizeBytes = cachedSnapshot.FileSizeBytes;
+                deletion.RecoveryStrength = "Strong";
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"NTFS deletion snapshot reused: path={deletion.FullPath}, " +
+                    $"fileRef={fileReferenceNumber}, dataFile={cachedSnapshot.DataFileName}, " +
+                    $"sha256={cachedSnapshot.Sha256}.");
+                return;
+            }
+
+            CaptureNtfsDeletionSnapshotCore(
+                deletion,
+                volumeKey,
+                fileReferenceNumber,
+                parentFileReferenceNumber,
+                fileName,
+                directoryPath,
+                allowBoundedDeleteTransition,
+                maxBoundedDeleteSequenceAdvance);
+
+            if (deletion.NtfsDataSnapshot?.IsComplete == true)
+            {
+                _completedSnapshotCache[captureKey] = deletion.NtfsDataSnapshot.Clone();
+            }
+        }
+    }
+
+    private void CaptureNtfsDeletionSnapshotCore(
         DeletionRecord deletion,
         string volumeKey,
         ulong fileReferenceNumber,
