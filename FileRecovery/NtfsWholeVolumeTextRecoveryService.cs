@@ -773,12 +773,35 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                 expectedLength,
                 markerEncoding,
                 cancellationToken,
+                progress,
                 out var destinationPath))
         {
             throw new InvalidOperationException(
                 "The retained NTFS runlist contained the start marker, but the complete reconstructed file " +
                 "did not pass strict text validation. The incomplete output was removed; the whole-volume " +
                 "scan was skipped.");
+        }
+
+        // Recheck the volume bitmap after the full read. A concurrent allocation during
+        // streaming means the original extents may have changed while they were being read.
+        var finalAllocations = new NtfsVolumeBitmapReader().CheckExtents(
+            volumeHandle,
+            mappedExtents,
+            cancellationToken);
+
+        if (finalAllocations.Count != mappedExtents.Count ||
+            finalAllocations.Where((allocation, index) =>
+                    allocation.LogicalClusterNumber != mappedExtents[index].LogicalClusterNumber ||
+                    allocation.ClusterCount != mappedExtents[index].ClusterCount ||
+                    allocation.FreeClusterCount != allocation.ClusterCount ||
+                    allocation.AllocatedClusterCount != 0 ||
+                    allocation.Allocation != NtfsClusterAllocation.Free)
+                .Any())
+        {
+            TryDelete(destinationPath);
+            throw new InvalidOperationException(
+                "The NTFS volume bitmap changed while the retained extents were being read. " +
+                "The recovered output was removed because some original clusters may have been reused.");
         }
 
         progress?.Report(expectedLength);
@@ -905,6 +928,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         long expectedLength,
         string markerEncoding,
         CancellationToken cancellationToken,
+        IProgress<long>? progress,
         out string destinationPath)
     {
         destinationPath = string.Empty;
@@ -939,6 +963,7 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             destinationCreated = true;
 
             long consumed = 0;
+            var nextProgressReport = (long)ProgressIntervalBytes;
 
             foreach (var extent in extents)
             {
@@ -1014,6 +1039,12 @@ public sealed class NtfsWholeVolumeTextRecoveryService
                     output.Write(chunkBytes, 0, count);
                     consumed = checked(consumed + count);
                     consumedInExtent = checked(consumedInExtent + count);
+
+                    if (consumed >= nextProgressReport || consumed == expectedLength)
+                    {
+                        progress?.Report(consumed);
+                        nextProgressReport = checked(consumed + ProgressIntervalBytes);
+                    }
                 }
 
                 if (consumed >= expectedLength)
