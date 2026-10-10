@@ -17,6 +17,9 @@ public sealed class NtfsWholeVolumeTextRecoveryService
     private const int ProgressIntervalBytes = 128 * 1024 * 1024;
     private const int MaxMarkerBytes = 4096;
     private const int MaxRecoveredTextBytes = 64 * 1024 * 1024;
+    // Large known-size text recovery is streamed to disk and is marker-anchored.
+    // Keep an explicit bound so an incorrect metadata size cannot trigger unbounded I/O.
+    private const long MaxStreamedKnownLengthTextBytes = 2L * 1024L * 1024L * 1024L;
 
     public RecoveryResult Recover(
         RecoveryCandidate candidate,
@@ -96,6 +99,25 @@ public sealed class NtfsWholeVolumeTextRecoveryService
         }
 
         using var volumeHandle = CreateVolumeHandle(sourceRoot);
+
+        if (candidate.FileSizeBytes > MaxRecoveredTextBytes)
+        {
+            if (candidate.FileSizeBytes > MaxStreamedKnownLengthTextBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Streaming exact-size text recovery is limited to {MaxStreamedKnownLengthTextBytes:N0} bytes; " +
+                    $"this candidate reports {candidate.FileSizeBytes:N0} bytes.");
+            }
+
+            return RecoverLargeKnownLengthTextFromStartMarker(
+                candidate,
+                destinationDirectory,
+                markerVariants,
+                volumeInfo,
+                volumeHandle,
+                cancellationToken,
+                progress);
+        }
 
         var overlapLength = markerVariants.Max(item => item.Bytes.Length) - 1;
         var previousTail = Array.Empty<byte>();
@@ -326,6 +348,405 @@ public sealed class NtfsWholeVolumeTextRecoveryService
             $"The supplied text marker was not found anywhere in the NTFS volume. " +
             $"The forensic scan examined {scannedBytes:N0} byte(s) of the " +
             $"{totalVolumeBytes:N0}-byte volume.");
+    }
+
+    private RecoveryResult RecoverLargeKnownLengthTextFromStartMarker(
+        RecoveryCandidate candidate,
+        string destinationDirectory,
+        (string Encoding, byte[] Bytes)[] markerVariants,
+        NtfsVolumeInfo volumeInfo,
+        SafeFileHandle volumeHandle,
+        CancellationToken cancellationToken,
+        IProgress<long>? progress)
+    {
+        var expectedLength = candidate.FileSizeBytes;
+        if (expectedLength <= MaxRecoveredTextBytes ||
+            expectedLength > MaxStreamedKnownLengthTextBytes)
+        {
+            throw new InvalidOperationException(
+                "The candidate size is outside the supported large-text recovery range.");
+        }
+
+        var bytesPerCluster = checked((long)volumeInfo.BytesPerCluster);
+        if (bytesPerCluster <= 0)
+        {
+            throw new InvalidOperationException("The source volume reported an invalid cluster size.");
+        }
+
+        var volumeBitmap = new NtfsVolumeBitmapReader();
+        var totalVolumeBytes = checked(volumeInfo.TotalClusters * bytesPerCluster);
+        var overlapLength = markerVariants.Max(item => item.Bytes.Length) + 3;
+        long freeBytesVisited = 0;
+
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS large exact-size text carve started: candidate={candidate.FullPath}, " +
+            $"expectedBytes={expectedLength:N0}, markerMustStartFile=true, " +
+            $"maximumBytes={MaxStreamedKnownLengthTextBytes:N0}.");
+
+        progress?.Report(0);
+
+        foreach (var freeExtent in volumeBitmap.EnumerateFreeExtents(
+                     volumeHandle,
+                     volumeInfo,
+                     cancellationToken))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var extentStart = checked(freeExtent.LogicalClusterNumber * bytesPerCluster);
+            var extentLength = checked(freeExtent.ClusterCount * bytesPerCluster);
+            var extentEnd = checked(extentStart + extentLength);
+            freeBytesVisited = checked(freeBytesVisited + extentLength);
+
+            // The full candidate must fit inside one contiguous free extent. A fragmented
+            // file needs an NTFS runlist/history source; arbitrary free regions cannot safely
+            // be concatenated into a plausible-looking text file.
+            if (extentLength < expectedLength)
+            {
+                progress?.Report(Math.Min(totalVolumeBytes, extentEnd));
+                continue;
+            }
+
+            byte[] previousTail = [];
+            long extentBytesRead = 0;
+
+            while (extentBytesRead < extentLength)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var remainingInExtent = extentLength - extentBytesRead;
+                var bytesToRead = checked((int)Math.Min(IoBufferSize, remainingInExtent));
+                bytesToRead -= checked((int)(bytesToRead % bytesPerCluster));
+
+                if (bytesToRead <= 0)
+                {
+                    break;
+                }
+
+                var readOffset = checked(extentStart + extentBytesRead);
+                var buffer = new byte[bytesToRead];
+                ReadAt(volumeHandle, readOffset, buffer, cancellationToken);
+
+                var window = new byte[checked(previousTail.Length + buffer.Length)];
+                if (previousTail.Length > 0)
+                {
+                    Buffer.BlockCopy(previousTail, 0, window, 0, previousTail.Length);
+                }
+
+                Buffer.BlockCopy(buffer, 0, window, previousTail.Length, buffer.Length);
+                var windowAbsoluteOffset = checked(readOffset - previousTail.Length);
+                var earliestMarkerOffset = -1;
+                (string Encoding, byte[] Bytes)? earliestMarker = null;
+
+                foreach (var variant in markerVariants)
+                {
+                    var searchFrom = 0;
+
+                    while (searchFrom < window.Length)
+                    {
+                        var relative = window.AsSpan(searchFrom).IndexOf(variant.Bytes);
+                        if (relative < 0)
+                        {
+                            break;
+                        }
+
+                        var foundAt = checked(searchFrom + relative);
+                        var absoluteFoundAt = checked(windowAbsoluteOffset + foundAt);
+
+                        if ((!variant.Encoding.StartsWith("UTF-16", StringComparison.Ordinal) ||
+                             (absoluteFoundAt & 1L) == 0) &&
+                            (earliestMarkerOffset < 0 || foundAt < earliestMarkerOffset))
+                        {
+                            earliestMarkerOffset = foundAt;
+                            earliestMarker = variant;
+                        }
+
+                        searchFrom = checked(foundAt + 1);
+                        if (earliestMarkerOffset >= 0 && searchFrom >= earliestMarkerOffset)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                if (earliestMarker.HasValue && earliestMarkerOffset >= 0)
+                {
+                    var absoluteMarkerOffset = checked(windowAbsoluteOffset + earliestMarkerOffset);
+                    var candidateStart = absoluteMarkerOffset;
+                    var markerEncoding = earliestMarker.Value.Encoding;
+
+                    // Permit a BOM directly before the marker, so the marker can still
+                    // identify byte zero of a UTF-8 or UTF-16 text file.
+                    if (markerEncoding.Equals("UTF-8", StringComparison.OrdinalIgnoreCase) &&
+                        earliestMarkerOffset >= 3 &&
+                        window.AsSpan(earliestMarkerOffset - 3, 3).SequenceEqual(new byte[] { 0xEF, 0xBB, 0xBF }))
+                    {
+                        candidateStart -= 3;
+                    }
+                    else if (markerEncoding.Equals("UTF-16LE", StringComparison.OrdinalIgnoreCase) &&
+                             earliestMarkerOffset >= 2 &&
+                             window.AsSpan(earliestMarkerOffset - 2, 2).SequenceEqual(new byte[] { 0xFF, 0xFE }))
+                    {
+                        candidateStart -= 2;
+                    }
+                    else if (markerEncoding.Equals("UTF-16BE", StringComparison.OrdinalIgnoreCase) &&
+                             earliestMarkerOffset >= 2 &&
+                             window.AsSpan(earliestMarkerOffset - 2, 2).SequenceEqual(new byte[] { 0xFE, 0xFF }))
+                    {
+                        candidateStart -= 2;
+                    }
+
+                    // The large-file marker is deliberately required at the beginning.
+                    // An arbitrary marker somewhere inside a 1 GiB text file does not
+                    // reveal where its first byte belongs.
+                    var markerDisplacement = absoluteMarkerOffset - candidateStart;
+                    if (candidateStart < extentStart ||
+                        candidateStart % bytesPerCluster != 0 ||
+                        markerDisplacement > 3 ||
+                        candidateStart > extentEnd - expectedLength)
+                    {
+                        throw new InvalidOperationException(
+                            "The first matching text marker in free NTFS space did not identify a cluster-aligned " +
+                            "file start with enough contiguous free space for the known file size. For files over 64 MiB, " +
+                            "enter a distinctive marker from the very beginning of the deleted file.");
+                    }
+
+                    var firstCluster = candidateStart / bytesPerCluster;
+                    var lastClusterExclusive = checked(
+                        (candidateStart + expectedLength + bytesPerCluster - 1) / bytesPerCluster);
+                    var clusterCount = checked(lastClusterExclusive - firstCluster);
+                    var allocation = volumeBitmap.CheckExtents(
+                        volumeHandle,
+                        [
+                            new NtfsDataExtent
+                            {
+                                VirtualClusterNumber = 0,
+                                LogicalClusterNumber = firstCluster,
+                                ClusterCount = clusterCount
+                            }
+                        ],
+                        cancellationToken);
+
+                    if (allocation.Count != 1 ||
+                        allocation[0].AllocatedClusterCount != 0 ||
+                        allocation[0].FreeClusterCount != clusterCount)
+                    {
+                        throw new InvalidOperationException(
+                            "The marker was found, but the full known-size text range is not currently free in one contiguous NTFS extent.");
+                    }
+
+                    if (!TryStreamValidatedTextToDestination(
+                            candidate,
+                            destinationDirectory,
+                            volumeHandle,
+                            candidateStart,
+                            expectedLength,
+                            markerEncoding,
+                            cancellationToken,
+                            out var destinationPath))
+                    {
+                        throw new InvalidOperationException(
+                            "The marker was found at a possible file start, but the entire known-size range did not validate as text. " +
+                            "No recovered output was retained.");
+                    }
+
+                    System.Diagnostics.Trace.WriteLine(
+                        $"NTFS large exact-size text carve succeeded: candidate={candidate.FullPath}, " +
+                        $"startOffset={candidateStart:N0}, expectedBytes={expectedLength:N0}, " +
+                        $"destination={destinationPath}; content identity remains heuristic.");
+
+                    return new RecoveryResult
+                    {
+                        Success = true,
+                        SourcePath = candidate.FullPath,
+                        DestinationPath = destinationPath,
+                        BytesRecovered = expectedLength,
+                        Evidence =
+                            $"Recovered exactly {expectedLength:N0} bytes by streaming a marker-anchored text candidate " +
+                            "from one contiguous, currently-free NTFS extent. Every byte validated as strict UTF-8/ASCII " +
+                            "or the marker's UTF-16 encoding. Large plain-text files have no intrinsic end marker, so " +
+                            "this remains heuristic file-identity evidence; verify the recovered SHA-256 when possible."
+                    };
+                }
+
+                extentBytesRead = checked(extentBytesRead + buffer.Length);
+                progress?.Report(Math.Min(totalVolumeBytes, checked(readOffset + buffer.Length)));
+
+                previousTail = buffer.Length <= overlapLength
+                    ? buffer
+                    : buffer.AsSpan(buffer.Length - overlapLength).ToArray();
+            }
+        }
+
+        progress?.Report(totalVolumeBytes);
+        System.Diagnostics.Trace.WriteLine(
+            $"NTFS large exact-size text carve complete: candidate={candidate.FullPath}, " +
+            $"freeBytesVisited={freeBytesVisited:N0}, markerFound=false.");
+
+        throw new InvalidOperationException(
+            $"The start marker was not found in a currently-free NTFS extent large enough to hold the known " +
+            $"{expectedLength:N0}-byte file. The large-file text carver requires a distinctive marker from the " +
+            "very beginning of the file and one contiguous, currently-free extent.");
+    }
+
+    private static bool TryStreamValidatedTextToDestination(
+        RecoveryCandidate candidate,
+        string destinationDirectory,
+        SafeFileHandle volumeHandle,
+        long sourceOffset,
+        long expectedLength,
+        string markerEncoding,
+        CancellationToken cancellationToken,
+        out string destinationPath)
+    {
+        destinationPath = string.Empty;
+        var strictEncoding = markerEncoding switch
+        {
+            "UTF-16LE" => new System.Text.UnicodeEncoding(false, false, true),
+            "UTF-16BE" => new System.Text.UnicodeEncoding(true, false, true),
+            _ => new System.Text.UTF8Encoding(false, true)
+        };
+        var decoder = strictEncoding.GetDecoder();
+        var byteBuffer = new byte[IoBufferSize];
+        var charBuffer = new char[IoBufferSize];
+
+        var firstReadCount = checked((int)Math.Min(byteBuffer.Length, expectedLength));
+        if (markerEncoding.StartsWith("UTF-16", StringComparison.Ordinal))
+        {
+            firstReadCount -= firstReadCount % 2;
+        }
+
+        if (firstReadCount <= 0)
+        {
+            return false;
+        }
+
+        ReadAt(
+            volumeHandle,
+            sourceOffset,
+            byteBuffer.AsSpan(0, firstReadCount).ToArray(),
+            cancellationToken);
+
+        var firstBytes = new byte[firstReadCount];
+        ReadAt(volumeHandle, sourceOffset, firstBytes, cancellationToken);
+        if (firstReadCount < expectedLength &&
+            !LooksLikeStrictTextSample(firstBytes, strictEncoding))
+        {
+            return false;
+        }
+
+        destinationPath = RecoveryDestinationPolicy.CreateSafeFilePath(
+            candidate.FullPath,
+            destinationDirectory);
+
+        var completedSuccessfully = false;
+        try
+        {
+            using var output = new FileStream(
+                destinationPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                IoBufferSize,
+                FileOptions.SequentialScan);
+
+            long consumed = 0;
+            while (consumed < expectedLength)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var count = checked((int)Math.Min(byteBuffer.Length, expectedLength - consumed));
+                if (markerEncoding.StartsWith("UTF-16", StringComparison.Ordinal))
+                {
+                    count -= count % 2;
+                }
+
+                if (count <= 0)
+                {
+                    return false;
+                }
+
+                ReadAt(
+                    volumeHandle,
+                    checked(sourceOffset + consumed),
+                    byteBuffer,
+                    count,
+                    cancellationToken);
+
+                var flush = consumed + count == expectedLength;
+                try
+                {
+                    decoder.Convert(
+                        byteBuffer,
+                        0,
+                        count,
+                        charBuffer,
+                        0,
+                        charBuffer.Length,
+                        flush,
+                        out var bytesUsed,
+                        out var charsUsed,
+                        out var completed);
+
+                    if (bytesUsed != count || !completed)
+                    {
+                        return false;
+                    }
+
+                    for (var i = 0; i < charsUsed; i++)
+                    {
+                        var character = charBuffer[i];
+                        if (character is not ('\t' or '\r' or '\n') &&
+                            (char.IsControl(character) || character == '\uFFFD'))
+                        {
+                            return false;
+                        }
+                    }
+                }
+                catch (System.Text.DecoderFallbackException)
+                {
+                    return false;
+                }
+
+                output.Write(byteBuffer, 0, count);
+                consumed = checked(consumed + count);
+            }
+
+            output.Flush();
+            completedSuccessfully = true;
+        }
+        finally
+        {
+            if (!completedSuccessfully)
+            {
+                TryDelete(destinationPath);
+            }
+        }
+
+        return completedSuccessfully;
+    }
+
+    private static bool LooksLikeStrictTextSample(
+        byte[] sample,
+        System.Text.Encoding encoding)
+    {
+        try
+        {
+            var text = encoding.GetString(sample);
+            foreach (var character in text)
+            {
+                if (character is not ('\t' or '\r' or '\n') &&
+                    (char.IsControl(character) || character == '\uFFFD'))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        catch (System.Text.DecoderFallbackException)
+        {
+            return false;
+        }
     }
 
     public (bool Found, long Offset, string? Encoding, long ScannedBytes) FindMarkerOnVolume(
