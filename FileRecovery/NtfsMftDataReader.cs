@@ -2692,19 +2692,22 @@ public sealed class NtfsMftDataReader
                 stream,
                 volumeInfo.BytesPerCluster);
 
+            // C# does not permit a lambda to close over an out parameter.
+            // Capture the validated stream in a normal local before streaming.
+            var capturedStream = stream;
             var allZeroLocal = true;
             var saved = snapshotStore.TrySaveStreaming(
                 recordId,
                 stream.FileSizeBytes,
                 (output, hash) =>
                 {
-                    if (stream.IsResident)
+                    if (capturedStream.IsResident)
                     {
-                        var resident = stream.ResidentData ?? [];
-                        if (resident.LongLength != stream.FileSizeBytes)
+                        var resident = capturedStream.ResidentData ?? [];
+                        if (resident.LongLength != capturedStream.FileSizeBytes)
                         {
                             throw new InvalidDataException(
-                                $"Resident NTFS stream length mismatch: expected={stream.FileSizeBytes:N0}, " +
+                                $"Resident NTFS stream length mismatch: expected={capturedStream.FileSizeBytes:N0}, " +
                                 $"actual={resident.LongLength:N0}.");
                         }
 
@@ -2714,15 +2717,15 @@ public sealed class NtfsMftDataReader
                     }
                     else
                     {
-                        var remaining = stream.FileSizeBytes;
+                        var remaining = capturedStream.FileSizeBytes;
                         var remainingInitialized = Math.Min(
-                            stream.ValidDataLengthBytes > 0
-                                ? stream.ValidDataLengthBytes
-                                : stream.FileSizeBytes,
-                            stream.FileSizeBytes);
+                            capturedStream.ValidDataLengthBytes > 0
+                                ? capturedStream.ValidDataLengthBytes
+                                : capturedStream.FileSizeBytes,
+                            capturedStream.FileSizeBytes);
                         var expectedVcn = 0L;
 
-                        foreach (var extent in stream.Extents)
+                        foreach (var extent in capturedStream.Extents)
                         {
                             if (extent.ClusterCount <= 0 ||
                                 extent.VirtualClusterNumber != expectedVcn)
@@ -2785,7 +2788,7 @@ public sealed class NtfsMftDataReader
                     }
 
                     if (rejectAllZeroContent &&
-                        stream.FileSizeBytes > 0 &&
+                        capturedStream.FileSizeBytes > 0 &&
                         allZeroLocal)
                     {
                         throw new InvalidDataException(
