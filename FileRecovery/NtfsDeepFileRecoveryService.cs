@@ -331,11 +331,119 @@ public sealed class NtfsDeepFileRecoveryService
             previousChunk = [];
         }
 
-        progress?.Report(scannedBytes);
+        long fullVolumeScannedBytes = 0;
+
+        // Free-space carving can miss a deleted MP4 whose first cluster was
+        // subsequently marked allocated. If the original size is known, perform
+        // a final read-only scan across the raw volume and validate only exact-size
+        // MP4/QuickTime containers. This may find data in reused clusters, but
+        // any recovered file must be checked for overwritten/corrupt media payload.
+        var isMp4Container =
+            extension.Equals(".mp4", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".m4v", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".mov", StringComparison.OrdinalIgnoreCase);
+
+        if (isMp4Container &&
+            knownFileSizeBytes > 0 &&
+            knownFileSizeBytes <= MaxMp4ArchiveBytes)
+        {
+            var volumeLengthBytes = checked(
+                volumeInfo.NumberSectors * (long)volumeInfo.BytesPerSector);
+            byte[] previousVolumeChunk = [];
+
+            System.Diagnostics.Trace.WriteLine(
+                $"Deep NTFS MP4 raw-volume fallback started: candidate={candidate.FullPath}, " +
+                $"knownSize={knownFileSizeBytes:N0}, volumeBytes={volumeLengthBytes:N0}. " +
+                "This read-only pass includes allocated clusters.");
+
+            while (fullVolumeScannedBytes < volumeLengthBytes)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var physicalOffset = fullVolumeScannedBytes;
+                var bytesToRead = checked((int)Math.Min(
+                    MaxCarvedFileBytes,
+                    volumeLengthBytes - fullVolumeScannedBytes));
+                var buffer = new byte[bytesToRead];
+
+                ReadAt(
+                    volumeHandle,
+                    physicalOffset,
+                    buffer,
+                    cancellationToken);
+
+                fullVolumeScannedBytes = checked(
+                    fullVolumeScannedBytes + bytesToRead);
+                progress?.Report(checked(scannedBytes + fullVolumeScannedBytes));
+
+                var overlapLength = previousVolumeChunk.Length;
+                var scanWindow = new byte[checked(overlapLength + buffer.Length)];
+
+                if (overlapLength > 0)
+                {
+                    Buffer.BlockCopy(
+                        previousVolumeChunk,
+                        0,
+                        scanWindow,
+                        0,
+                        overlapLength);
+                }
+
+                Buffer.BlockCopy(
+                    buffer,
+                    0,
+                    scanWindow,
+                    overlapLength,
+                    buffer.Length);
+
+                var scanWindowOffset = checked(physicalOffset - overlapLength);
+
+                if (TryRecoverMp4FromScanWindow(
+                        scanWindow,
+                        scanWindowOffset,
+                        physicalOffset,
+                        0,
+                        volumeLengthBytes,
+                        volumeLengthBytes,
+                        volumeInfo.BytesPerCluster,
+                        knownFileSizeBytes,
+                        volumeHandle,
+                        bitmapReader,
+                        candidate,
+                        destinationDirectory,
+                        cancellationToken,
+                        out var rawVolumeMp4Recovery))
+                {
+                    System.Diagnostics.Trace.WriteLine(
+                        $"Deep NTFS MP4 raw-volume fallback succeeded: candidate={candidate.FullPath}, " +
+                        $"scanned={fullVolumeScannedBytes:N0}, " +
+                        $"destination={rawVolumeMp4Recovery.DestinationPath}.");
+                    return rawVolumeMp4Recovery;
+                }
+
+                previousVolumeChunk = buffer;
+            }
+
+            System.Diagnostics.Trace.WriteLine(
+                $"Deep NTFS MP4 raw-volume fallback complete: candidate={candidate.FullPath}, " +
+                $"volumeBytesScanned={fullVolumeScannedBytes:N0}, noValidHit=true.");
+        }
+
+        progress?.Report(checked(scannedBytes + fullVolumeScannedBytes));
 
         System.Diagnostics.Debug.WriteLine(
             $"Deep NTFS carve complete: candidate={candidate.FullPath}, " +
-            $"scanned={scannedBytes:N0}, extents={extentIndex:N0}, noValidHit=true.");
+            $"freeBytesScanned={scannedBytes:N0}, " +
+            $"rawVolumeBytesScanned={fullVolumeScannedBytes:N0}, " +
+            $"extents={extentIndex:N0}, noValidHit=true.");
+
+        if (fullVolumeScannedBytes > 0)
+        {
+            throw new InvalidOperationException(
+                $"No structurally valid {extension} file was found after scanning " +
+                $"{scannedBytes:N0} free-space byte(s) and {fullVolumeScannedBytes:N0} " +
+                "raw-volume byte(s), including clusters marked allocated.");
+        }
 
         throw new InvalidOperationException(
             $"No structurally valid {extension} file was found in the first " +
@@ -2604,7 +2712,7 @@ public sealed class NtfsDeepFileRecoveryService
             {
                 throw new Win32Exception(
                     Marshal.GetLastWin32Error(),
-                    $"Could not seek to free cluster offset {currentOffset:N0}.");
+                    $"Could not seek to volume offset {currentOffset:N0}.");
             }
 
             var chunkBuffer = bufferOffset == 0 && chunk == buffer.Length
@@ -2621,7 +2729,7 @@ public sealed class NtfsDeepFileRecoveryService
             {
                 throw new Win32Exception(
                     Marshal.GetLastWin32Error(),
-                    $"Could not read free cluster data at byte offset {currentOffset:N0}.");
+                    $"Could not read volume data at byte offset {currentOffset:N0}.");
             }
 
             if (!ReferenceEquals(chunkBuffer, buffer))
